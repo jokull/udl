@@ -541,13 +541,18 @@ func (d *Downloader) fail(id int64, msg string, cleanupDir ...string) error {
 	if err := d.db.UpdateDownloadError(id, msg); err != nil {
 		d.log.Error("failed to update download error", "id", id, "error", err)
 	}
-	// Record failure in history. Best-effort: look up the download for metadata.
+	// Record failure in history and blocklist the release.
+	// Best-effort: look up the download for metadata.
 	var dl database.Download
 	if err := d.db.QueryRow(
 		`SELECT category, media_id, title, nzb_name FROM downloads WHERE id = ?`, id,
 	).Scan(&dl.Category, &dl.MediaID, &dl.Title, &dl.NzbName); err == nil {
 		if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "failed", dl.NzbName, ""); err != nil {
 			d.log.Error("failed to record failure history", "id", id, "error", err)
+		}
+		// Auto-blocklist so re-search skips this release.
+		if err := d.db.AddBlocklist(dl.Category, dl.MediaID, dl.NzbName, msg); err != nil {
+			d.log.Error("failed to blocklist release", "id", id, "release", dl.NzbName, "error", err)
 		}
 	}
 	for _, dir := range cleanupDir {

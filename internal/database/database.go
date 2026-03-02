@@ -118,6 +118,15 @@ CREATE TABLE IF NOT EXISTS history (
     quality TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS blocklist (
+    id INTEGER PRIMARY KEY,
+    media_type TEXT NOT NULL,
+    media_id INTEGER NOT NULL,
+    release_title TEXT NOT NULL,
+    reason TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 `
 	_, err := db.Exec(schema)
 	if err != nil {
@@ -527,6 +536,76 @@ func (db *DB) ListHistory(limit int) ([]History, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Blocklist CRUD
+// ---------------------------------------------------------------------------
+
+// AddBlocklist adds a release title to the blocklist for a specific media item.
+func (db *DB) AddBlocklist(mediaType string, mediaID int64, releaseTitle, reason string) error {
+	_, err := db.Exec(
+		`INSERT INTO blocklist (media_type, media_id, release_title, reason) VALUES (?, ?, ?, ?)`,
+		mediaType, mediaID, releaseTitle, reason,
+	)
+	return err
+}
+
+// IsBlocklisted returns true if the release title is blocklisted for the given media item.
+func (db *DB) IsBlocklisted(mediaType string, mediaID int64, releaseTitle string) (bool, error) {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM blocklist WHERE media_type = ? AND media_id = ? AND release_title = ?`,
+		mediaType, mediaID, releaseTitle,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// ListBlocklist returns all blocklist entries, most recent first.
+func (db *DB) ListBlocklist() ([]BlocklistEntry, error) {
+	rows, err := db.Query(
+		`SELECT id, media_type, media_id, release_title, reason, created_at
+		 FROM blocklist ORDER BY created_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []BlocklistEntry
+	for rows.Next() {
+		var e BlocklistEntry
+		if err := rows.Scan(&e.ID, &e.MediaType, &e.MediaID, &e.ReleaseTitle, &e.Reason, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// RemoveBlocklist removes a single blocklist entry by ID.
+func (db *DB) RemoveBlocklist(id int64) error {
+	res, err := db.Exec(`DELETE FROM blocklist WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("blocklist entry %d not found", id)
+	}
+	return nil
+}
+
+// ClearBlocklist removes all blocklist entries and returns the number removed.
+func (db *DB) ClearBlocklist() (int64, error) {
+	res, err := db.Exec(`DELETE FROM blocklist`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ---------------------------------------------------------------------------
 // Remove operations
 // ---------------------------------------------------------------------------
 
@@ -706,6 +785,76 @@ func (db *DB) FindEpisode(seriesID int64, season, episode int) (*Episode, error)
 		return nil, err
 	}
 	return &ep, nil
+}
+
+// DownloadedMovies returns all movies with status 'downloaded'.
+func (db *DB) DownloadedMovies() ([]Movie, error) {
+	rows, err := db.Query(
+		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at
+		 FROM movies WHERE status = 'downloaded' ORDER BY added_at DESC`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var movies []Movie
+	for rows.Next() {
+		var m Movie
+		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt); err != nil {
+			return nil, err
+		}
+		movies = append(movies, m)
+	}
+	return movies, rows.Err()
+}
+
+// DownloadedEpisodes returns all episodes with status 'downloaded', including series info.
+func (db *DB) DownloadedEpisodes() ([]Episode, error) {
+	rows, err := db.Query(
+		`SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
+		        e.status, e.quality, e.file_path, s.title
+		 FROM episodes e
+		 JOIN series s ON s.id = e.series_id
+		 WHERE e.status = 'downloaded'
+		 ORDER BY s.title, e.season, e.episode`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var episodes []Episode
+	for rows.Next() {
+		var ep Episode
+		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
+			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.SeriesTitle); err != nil {
+			return nil, err
+		}
+		episodes = append(episodes, ep)
+	}
+	return episodes, rows.Err()
+}
+
+// GetDownload returns a single download by ID, or nil,nil if not found.
+func (db *DB) GetDownload(id int64) (*Download, error) {
+	var d Download
+	err := db.QueryRow(
+		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress,
+		        size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
+		 FROM downloads WHERE id = ?`, id,
+	).Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
+		&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
+		&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
 }
 
 // AllMovieFilePaths returns a map of file_path → movie ID for all movies with a non-NULL file_path.

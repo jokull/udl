@@ -90,6 +90,32 @@ func (c *Client) SearchMovie(query string) ([]Movie, error) {
 	return movies, nil
 }
 
+// SearchMovieYear searches TMDB for movies matching the query and year.
+// The year parameter is passed to the TMDB API to filter results.
+// If year is 0, it behaves identically to SearchMovie.
+func (c *Client) SearchMovieYear(query string, year int) ([]Movie, error) {
+	var opts map[string]string
+	if year > 0 {
+		opts = map[string]string{"year": strconv.Itoa(year)}
+	}
+	result, err := c.api.GetSearchMovies(query, opts)
+	if err != nil {
+		return nil, fmt.Errorf("tmdb: search movies %q year=%d: %w", query, year, err)
+	}
+	if result.SearchMoviesResults == nil {
+		return nil, nil
+	}
+	var movies []Movie
+	for _, r := range result.SearchMoviesResults.Results {
+		movies = append(movies, Movie{
+			TMDBID: int(r.ID),
+			Title:  r.Title,
+			Year:   parseYear(r.ReleaseDate),
+		})
+	}
+	return movies, nil
+}
+
 // GetMovie gets movie details including the IMDB ID.
 func (c *Client) GetMovie(tmdbID int) (*Movie, error) {
 	details, err := c.api.GetMovieDetails(tmdbID, nil)
@@ -109,6 +135,31 @@ func (c *Client) SearchTV(query string) ([]Series, error) {
 	result, err := c.api.GetSearchTVShow(query, nil)
 	if err != nil {
 		return nil, fmt.Errorf("tmdb: search tv %q: %w", query, err)
+	}
+	if result.SearchTVShowsResults == nil {
+		return nil, nil
+	}
+	var series []Series
+	for _, r := range result.SearchTVShowsResults.Results {
+		series = append(series, Series{
+			TMDBID: int(r.ID),
+			Title:  r.Name,
+			Year:   parseYear(r.FirstAirDate),
+		})
+	}
+	return series, nil
+}
+
+// SearchTVYear searches TMDB for TV series matching the query and first air date year.
+// If year is 0, it behaves identically to SearchTV.
+func (c *Client) SearchTVYear(query string, year int) ([]Series, error) {
+	var opts map[string]string
+	if year > 0 {
+		opts = map[string]string{"first_air_date_year": strconv.Itoa(year)}
+	}
+	result, err := c.api.GetSearchTVShow(query, opts)
+	if err != nil {
+		return nil, fmt.Errorf("tmdb: search tv %q year=%d: %w", query, year, err)
 	}
 	if result.SearchTVShowsResults == nil {
 		return nil, nil

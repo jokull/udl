@@ -19,14 +19,15 @@ type Result struct {
 	Res     string          // 2160p, 1080p, 720p, 480p (raw)
 	Group   string          // release group
 	IsTV    bool            // true if season/episode detected
+	Edition string          // "Directors Cut", "Extended", etc. (empty if none)
 }
 
 // Regex patterns compiled once at init time.
 var (
-	// S01E05, S01E05E06 (multi-ep), or season pack S01
-	sePattern = regexp.MustCompile(`(?i)\b[Ss](\d{1,2})[Ee](\d{1,3})(?:[Ee]\d{1,3})*\b`)
+	// S01E05, S01E05E06 (multi-ep), S2024E01 (year-as-season), or season pack S01
+	sePattern = regexp.MustCompile(`(?i)\b[Ss](\d{1,4})[Ee](\d{1,3})(?:[Ee]\d{1,3})*\b`)
 	// Season pack: S01 not followed by E
-	spPattern = regexp.MustCompile(`(?i)\b[Ss](\d{1,2})(?:[Ee]\d)?\b`)
+	spPattern = regexp.MustCompile(`(?i)\b[Ss](\d{1,4})(?:[Ee]\d)?\b`)
 	// Alternate format: 1x05
 	altSEPattern = regexp.MustCompile(`(?i)\b(\d{1,2})[xX](\d{2,3})\b`)
 
@@ -49,6 +50,11 @@ var (
 	// File extension to strip
 	extPattern = regexp.MustCompile(`\.[a-zA-Z]{2,4}$`)
 
+	// Noise and edition tokens that always appear after the title.
+	// These act as title terminators — anything from here onward is metadata.
+	editionPattern = regexp.MustCompile(`(?i)\b(?:The[.\s])?(Directors?[.\s]?Cut|Final[.\s]?Cut|Extended[.\s]?(?:Edition|Cut)?|Theatrical[.\s]?Cut|Unrated|IMAX|Criterion|Remastered|Special[.\s]?Edition)\b`)
+	noisePattern   = regexp.MustCompile(`(?i)\b(PROPER|REPACK|REAL|RERIP|INTERNAL|LIMITED|DC)\b`)
+
 	// Patterns that mark the end of the title. We collect the earliest
 	// position of any of these to slice the title.
 	titleBreakPatterns = []*regexp.Regexp{
@@ -59,6 +65,8 @@ var (
 		resPattern,
 		uhdPattern,
 		sourcePattern,
+		editionPattern,
+		noisePattern,
 	}
 )
 
@@ -97,20 +105,10 @@ func Parse(title string) Result {
 	}
 
 	// --- Year ---
-	// Find year candidates and pick the one that is NOT inside a S/E pattern.
-	for _, ym := range yearPattern.FindAllStringSubmatchIndex(title, -1) {
-		start := ym[0]
-		// Make sure this year isn't part of a S01E05-style pattern by checking
-		// that it's not immediately preceded by S, E, or x.
-		if start > 0 {
-			prev := title[start-1]
-			if prev == 'S' || prev == 's' || prev == 'E' || prev == 'e' || prev == 'x' || prev == 'X' {
-				continue
-			}
-		}
-		r.Year = mustInt(title[ym[2]:ym[3]])
-		break
-	}
+	// Find all year candidates, filtering out those inside S/E patterns.
+	// Prefer the last valid year that appears before quality/source tokens,
+	// which handles year-in-title cases like "2001.A.Space.Odyssey.1968.1080p".
+	r.Year = extractYear(title)
 
 	// --- Resolution ---
 	if m := resPattern.FindStringSubmatch(title); m != nil {
@@ -130,23 +128,123 @@ func Parse(title string) Result {
 	// --- Quality ---
 	r.Quality = combineQuality(r.Source, r.Res)
 
+	// --- Edition ---
+	if loc := editionPattern.FindStringIndex(title); loc != nil {
+		r.Edition = normalizeEdition(title[loc[0]:loc[1]])
+	}
+
 	// --- Title extraction ---
-	// The title is everything before the earliest "break" pattern match.
+	// The title is everything before the earliest "break" pattern match,
+	// with year-in-title awareness.
 	r.Title = extractTitle(title)
 
 	return r
 }
 
+// extractYear finds the best year from a release title.
+// When multiple year candidates exist, it picks the last one before any
+// quality/source token. This handles "2001.A.Space.Odyssey.1968.1080p"
+// correctly (year=1968, not 2001).
+func extractYear(title string) int {
+	// Find the position of the first quality/source metadata token.
+	// Note: edition and noise patterns are NOT included here because years
+	// commonly appear AFTER them (e.g. "Title.Directors.Cut.1982.1080p").
+	metaCutoff := len(title)
+	for _, p := range []*regexp.Regexp{resPattern, uhdPattern, sourcePattern, remuxPattern} {
+		if loc := p.FindStringIndex(title); loc != nil && loc[0] < metaCutoff {
+			metaCutoff = loc[0]
+		}
+	}
+	// Also use S01E01 position as cutoff (years after SE patterns are noise).
+	if loc := sePattern.FindStringIndex(title); loc != nil && loc[0] < metaCutoff {
+		metaCutoff = loc[0]
+	}
+
+	var candidates []struct {
+		year int
+		pos  int
+	}
+	for _, ym := range yearPattern.FindAllStringSubmatchIndex(title, -1) {
+		start := ym[0]
+		// Skip years inside S/E patterns.
+		if start > 0 {
+			prev := title[start-1]
+			if prev == 'S' || prev == 's' || prev == 'E' || prev == 'e' || prev == 'x' || prev == 'X' {
+				continue
+			}
+		}
+		if start < metaCutoff {
+			candidates = append(candidates, struct {
+				year int
+				pos  int
+			}{mustInt(title[ym[2]:ym[3]]), start})
+		}
+	}
+
+	if len(candidates) == 0 {
+		return 0
+	}
+	// Prefer the last year candidate (closest to the metadata boundary).
+	return candidates[len(candidates)-1].year
+}
+
 // extractTitle returns the cleaned title: everything before the first
 // detected metadata pattern (year, season/episode, quality keywords).
+// Handles year-in-title by using the same "last year before metadata" logic:
+// the title break is the position of the chosen year, not the first year.
 func extractTitle(title string) string {
-	earliest := len(title)
-
+	// First pass: find earliest non-year break pattern.
+	nonYearBreak := len(title)
 	for _, p := range titleBreakPatterns {
-		if loc := p.FindStringIndex(title); loc != nil {
-			if loc[0] < earliest {
-				earliest = loc[0]
+		if p == yearPattern {
+			continue // handle years separately
+		}
+		if loc := p.FindStringIndex(title); loc != nil && loc[0] < nonYearBreak {
+			nonYearBreak = loc[0]
+		}
+	}
+
+	// Find year candidates before the non-year break.
+	var yearPositions []int
+	for _, ym := range yearPattern.FindAllStringSubmatchIndex(title, -1) {
+		start := ym[0]
+		if start > 0 {
+			prev := title[start-1]
+			if prev == 'S' || prev == 's' || prev == 'E' || prev == 'e' || prev == 'x' || prev == 'X' {
+				continue
 			}
+		}
+		if start < nonYearBreak {
+			yearPositions = append(yearPositions, start)
+		}
+	}
+
+	// Choose the break position.
+	earliest := nonYearBreak
+	if len(yearPositions) > 0 {
+		// Use the last year position as the break (handles year-in-title).
+		lastYearPos := yearPositions[len(yearPositions)-1]
+		if lastYearPos < earliest {
+			earliest = lastYearPos
+		}
+
+		// Special case: if the title before the last year is empty or very
+		// short (< 2 chars after cleaning), the year is part of the title
+		// (e.g. "1917.2019.1080p" → title="1917", year=2019).
+		rawBefore := title[:lastYearPos]
+		rawBefore = strings.ReplaceAll(rawBefore, ".", " ")
+		rawBefore = strings.ReplaceAll(rawBefore, "_", " ")
+		rawBefore = strings.TrimSpace(rawBefore)
+		if len(rawBefore) < 2 && len(yearPositions) == 1 {
+			// Single year at the start IS the title — use next break instead.
+			earliest = nonYearBreak
+		} else if len(rawBefore) < 2 && len(yearPositions) > 1 {
+			// Multiple years, title before last one is too short.
+			// The first "years" are part of the title. Include them.
+			// e.g., "2001.A.Space.Odyssey.1968" → last year pos is 1968's pos.
+			// rawBefore would be "2001 A Space Odyssey" — that's fine, > 2 chars.
+			// But for edge case "2012.2009.1080p" → break at 2009.
+			earliest = lastYearPos
 		}
 	}
 
@@ -159,6 +257,13 @@ func extractTitle(title string) string {
 	// Collapse multiple spaces and trim.
 	raw = strings.Join(strings.Fields(raw), " ")
 	return raw
+}
+
+// normalizeEdition cleans an edition match into a readable form.
+func normalizeEdition(s string) string {
+	s = strings.ReplaceAll(s, ".", " ")
+	s = strings.Join(strings.Fields(s), " ")
+	return s
 }
 
 // normalizeSource maps various source representations to a canonical form.

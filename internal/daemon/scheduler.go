@@ -166,6 +166,12 @@ func (s *Scheduler) RunRSSSync() error {
 				continue
 			}
 
+			// Skip blocklisted releases.
+			if blocked, _ := s.db.IsBlocklisted("episode", mediaID, release.Title); blocked {
+				s.log.Debug("rss sync: skipping blocklisted release", "title", release.Title)
+				continue
+			}
+
 			// Check for duplicate active downloads.
 			active, err := s.db.HasActiveDownload("episode", mediaID)
 			if err != nil {
@@ -376,7 +382,8 @@ var multiSpaceRe = regexp.MustCompile(`\s+`)
 // normalize cleans a title for fuzzy matching: lowercase, strip punctuation,
 // collapse whitespace, and trim.
 func normalize(title string) string {
-	s := strings.Map(unicode.ToLower, title)
+	s := foldDiacritics(title)
+	s = strings.Map(unicode.ToLower, s)
 	s = punctuationRe.ReplaceAllString(s, " ")
 	s = multiSpaceRe.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)

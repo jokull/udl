@@ -148,6 +148,12 @@ func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, er
 			continue
 		}
 
+		// Skip blocklisted releases.
+		if blocked, _ := s.db.IsBlocklisted(ctx.Category, ctx.MediaID, sr.Release.Title); blocked {
+			s.log.Debug("skipping blocklisted release", "title", sr.Release.Title)
+			continue
+		}
+
 		active, err := s.db.HasActiveDownload(ctx.Category, ctx.MediaID)
 		if err != nil {
 			return false, fmt.Errorf("check active download: %w", err)
@@ -393,19 +399,50 @@ var cleanTitleStopWords = map[string]bool{
 	"and": true, "or": true, "of": true,
 }
 
-// cleanTitle strips a title down to pure lowercase alphanumeric for exact matching.
-// Ports Radarr's CleanMovieTitle approach: strip diacritics, remove non-alphanumeric,
-// remove stop words from middle positions, lowercase.
-func cleanTitle(title string) string {
-	// Strip diacritics: NFD decompose, remove combining marks, NFC recompose.
-	s := norm.NFD.String(title)
+// transliterations maps standalone Unicode letters that NFD cannot decompose
+// to their ASCII equivalents. Same approach as Sonarr's AdditionalDiacriticsProvider
+// and Radarr's ReplaceGermanUmlauts.
+var transliterations = map[rune]string{
+	'ð': "d", 'Ð': "D",
+	'þ': "th", 'Þ': "Th",
+	'æ': "ae", 'Æ': "AE",
+	'ß': "ss",
+	'ł': "l", 'Ł': "L",
+	'ø': "o", 'Ø': "O",
+}
+
+// foldDiacritics replaces non-decomposable letters via a manual map, then
+// strips combining marks via NFD decomposition. Handles macrons (ō→o),
+// Icelandic (ð→d, þ→th, æ→ae), German (ß→ss), etc.
+func foldDiacritics(s string) string {
+	// Step 1: Replace standalone letters that NFD can't decompose.
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if rep, ok := transliterations[r]; ok {
+			b.WriteString(rep)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+
+	// Step 2: NFD decompose → strip combining marks → NFC recompose.
+	s = norm.NFD.String(b.String())
 	s = strings.Map(func(r rune) rune {
-		if unicode.Is(unicode.Mn, r) { // Mn = Mark, Nonspacing (combining marks)
+		if unicode.Is(unicode.Mn, r) {
 			return -1
 		}
 		return r
 	}, s)
-	s = norm.NFC.String(s)
+	return norm.NFC.String(s)
+}
+
+// cleanTitle strips a title down to pure lowercase alphanumeric for exact matching.
+// Ports Radarr's CleanMovieTitle approach: strip diacritics, remove non-alphanumeric,
+// remove stop words from middle positions, lowercase.
+func cleanTitle(title string) string {
+	// Fold diacritics and transliterate non-ASCII letters.
+	s := foldDiacritics(title)
 
 	s = strings.ToLower(s)
 

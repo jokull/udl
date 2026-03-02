@@ -105,6 +105,146 @@ func TestParse(t *testing.T) {
 				IsTV:    false,
 			},
 		},
+		// --- Edge cases: year-in-title ---
+		{
+			input: "2001.A.Space.Odyssey.1968.1080p.BluRay-GROUP",
+			want: Result{
+				Title:   "2001 A Space Odyssey",
+				Year:    1968,
+				Season:  -1,
+				Episode: -1,
+				Quality: quality.Bluray1080p,
+				Source:  "BluRay",
+				Res:     "1080p",
+				Group:   "GROUP",
+			},
+		},
+		{
+			input: "1917.2019.1080p.BluRay-GROUP",
+			want: Result{
+				Title:   "1917",
+				Year:    2019,
+				Season:  -1,
+				Episode: -1,
+				Quality: quality.Bluray1080p,
+				Source:  "BluRay",
+				Res:     "1080p",
+				Group:   "GROUP",
+			},
+		},
+		{
+			input: "2012.2009.1080p.BluRay-GROUP",
+			want: Result{
+				Title:   "2012",
+				Year:    2009,
+				Season:  -1,
+				Episode: -1,
+				Quality: quality.Bluray1080p,
+				Source:  "BluRay",
+				Res:     "1080p",
+				Group:   "GROUP",
+			},
+		},
+		// --- Edge cases: noise tokens ---
+		{
+			input: "Movie.Name.PROPER.REPACK.2024.1080p.WEB-DL-GROUP",
+			want: Result{
+				Title:   "Movie Name",
+				Year:    2024,
+				Season:  -1,
+				Episode: -1,
+				Quality: quality.WEBDL1080p,
+				Source:  "WEB-DL",
+				Res:     "1080p",
+				Group:   "GROUP",
+			},
+		},
+		// --- Edge cases: edition tags ---
+		{
+			input: "Blade.Runner.The.Final.Cut.1982.1080p.BluRay-GROUP",
+			want: Result{
+				Title:   "Blade Runner",
+				Year:    1982,
+				Season:  -1,
+				Episode: -1,
+				Quality: quality.Bluray1080p,
+				Source:  "BluRay",
+				Res:     "1080p",
+				Group:   "GROUP",
+				Edition: "The Final Cut",
+			},
+		},
+		{
+			input: "Alien.Directors.Cut.1979.1080p.BluRay-GROUP",
+			want: Result{
+				Title:   "Alien",
+				Year:    1979,
+				Season:  -1,
+				Episode: -1,
+				Quality: quality.Bluray1080p,
+				Source:  "BluRay",
+				Res:     "1080p",
+				Group:   "GROUP",
+				Edition: "Directors Cut",
+			},
+		},
+		// --- Edge cases: TV with year ---
+		{
+			input: "The.Flash.2014.S01E01.720p.HDTV-GROUP",
+			want: Result{
+				Title:   "The Flash",
+				Year:    2014,
+				Season:  1,
+				Episode: 1,
+				Quality: quality.HDTV720p,
+				Source:  "HDTV",
+				Res:     "720p",
+				Group:   "GROUP",
+				IsTV:    true,
+			},
+		},
+		// --- Edge cases: season pack ---
+		{
+			input: "Some.Show.S01.1080p.WEB-DL-GROUP",
+			want: Result{
+				Title:   "Some Show",
+				Season:  1,
+				Episode: -1,
+				Quality: quality.WEBDL1080p,
+				Source:  "WEB-DL",
+				Res:     "1080p",
+				Group:   "GROUP",
+				IsTV:    true,
+			},
+		},
+		// --- Edge cases: year-as-season (Plex annual shows) ---
+		{
+			input: "Big.Fat.Quiz.S2024E02.Big.Fat.Quiz.of.the.Year.WEBDL-1080p.mkv",
+			want: Result{
+				Title:   "Big Fat Quiz",
+				Season:  2024,
+				Episode: 2,
+				Quality: quality.WEBDL1080p,
+				Source:  "WEB-DL",
+				Res:     "1080p",
+				Group:   "1080p",
+				IsTV:    true,
+			},
+		},
+		// --- Edge cases: non-standard titles ---
+		{
+			input: "Se7en.1995.1080p.BluRay.REMUX-GROUP",
+			want: Result{
+				Title:   "Se7en",
+				Year:    1995,
+				Season:  -1,
+				Episode: -1,
+				Quality: quality.Remux1080p,
+				Source:  "REMUX",
+				Res:     "1080p",
+				Group:   "GROUP",
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -137,6 +277,9 @@ func TestParse(t *testing.T) {
 			}
 			if got.IsTV != tc.want.IsTV {
 				t.Errorf("IsTV: got %v, want %v", got.IsTV, tc.want.IsTV)
+			}
+			if got.Edition != tc.want.Edition {
+				t.Errorf("Edition: got %q, want %q", got.Edition, tc.want.Edition)
 			}
 		})
 	}

@@ -85,3 +85,13 @@ type History struct {
 	Quality  sql.NullString
 	CreatedAt time.Time
 }
+
+// BlocklistEntry represents a release that should not be downloaded again.
+type BlocklistEntry struct {
+	ID           int64
+	MediaType    string
+	MediaID      int64
+	ReleaseTitle string
+	Reason       string
+	CreatedAt    time.Time
+}
