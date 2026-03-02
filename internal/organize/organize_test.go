@@ -25,7 +25,7 @@ func TestMoviePath(t *testing.T) {
 			year:  2024,
 			q:     quality.WEBDL1080p,
 			ext:   ".mkv",
-			want:  "/media/Dune Part Two (2024)/Dune Part Two (2024) [WEBDL-1080p].mkv",
+			want:  "/media/Dune Part Two (2024)/Dune.Part.Two.2024.WEBDL-1080p.mkv",
 		},
 		{
 			name:  "movie with 4K quality",
@@ -34,7 +34,7 @@ func TestMoviePath(t *testing.T) {
 			year:  2023,
 			q:     quality.Bluray2160p,
 			ext:   ".mkv",
-			want:  "/data/Oppenheimer (2023)/Oppenheimer (2023) [Bluray-2160p].mkv",
+			want:  "/data/Oppenheimer (2023)/Oppenheimer.2023.Bluray-2160p.mkv",
 		},
 		{
 			name:  "movie with colon in title",
@@ -43,7 +43,7 @@ func TestMoviePath(t *testing.T) {
 			year:  1996,
 			q:     quality.Bluray1080p,
 			ext:   ".mp4",
-			want:  "/media/Mission Impossible (1996)/Mission Impossible (1996) [Bluray-1080p].mp4",
+			want:  "/media/Mission Impossible (1996)/Mission.Impossible.1996.Bluray-1080p.mp4",
 		},
 		{
 			name:  "movie with unknown quality",
@@ -52,7 +52,7 @@ func TestMoviePath(t *testing.T) {
 			year:  1999,
 			q:     quality.Unknown,
 			ext:   ".avi",
-			want:  "/media/The Matrix (1999)/The Matrix (1999) [Unknown].avi",
+			want:  "/media/The Matrix (1999)/The.Matrix.1999.Unknown.avi",
 		},
 	}
 
@@ -89,7 +89,7 @@ func TestEpisodePath(t *testing.T) {
 			epTitle: "Hello, Ms. Cobel",
 			q:       quality.WEBDL1080p,
 			ext:     ".mkv",
-			want:    "/media/Severance (2022)/Season 02/Severance - S02E01 - Hello, Ms. Cobel [WEBDL-1080p].mkv",
+			want:    "/media/Severance (2022)/Season 02/Severance.S02E01.Hello.Ms.Cobel.WEBDL-1080p.mkv",
 		},
 		{
 			name:    "episode without title",
@@ -101,7 +101,7 @@ func TestEpisodePath(t *testing.T) {
 			epTitle: "",
 			q:       quality.HDTV720p,
 			ext:     ".mkv",
-			want:    "/media/Breaking Bad (2008)/Season 05/Breaking Bad - S05E16 [HDTV-720p].mkv",
+			want:    "/media/Breaking Bad (2008)/Season 05/Breaking.Bad.S05E16.HDTV-720p.mkv",
 		},
 		{
 			name:    "episode with colons in series name",
@@ -113,7 +113,7 @@ func TestEpisodePath(t *testing.T) {
 			epTitle: "Context Is for Kings",
 			q:       quality.WEBDL2160p,
 			ext:     ".mkv",
-			want:    "/data/Star Trek Discovery (2017)/Season 01/Star Trek Discovery - S01E03 - Context Is for Kings [WEBDL-2160p].mkv",
+			want:    "/data/Star Trek Discovery (2017)/Season 01/Star.Trek.Discovery.S01E03.Context.Is.for.Kings.WEBDL-2160p.mkv",
 		},
 		{
 			name:    "single digit season and episode",
@@ -125,7 +125,7 @@ func TestEpisodePath(t *testing.T) {
 			epTitle: "Pilot",
 			q:       quality.DVD,
 			ext:     ".avi",
-			want:    "/media/The Office (2005)/Season 01/The Office - S01E01 - Pilot [DVD].avi",
+			want:    "/media/The Office (2005)/Season 01/The.Office.S01E01.Pilot.DVD.avi",
 		},
 	}
 
@@ -149,24 +149,24 @@ func TestSubtitlePath(t *testing.T) {
 	}{
 		{
 			name:      "english SRT alongside MKV",
-			mediaPath: "/media/Show (2022)/Season 01/Show - S01E01 - Title [WEBDL-1080p].mkv",
+			mediaPath: "/media/Show (2022)/Season 01/Show.S01E01.Title.WEBDL-1080p.mkv",
 			lang:      "en",
 			subExt:    ".srt",
-			want:      "/media/Show (2022)/Season 01/Show - S01E01 - Title [WEBDL-1080p].en.srt",
+			want:      "/media/Show (2022)/Season 01/Show.S01E01.Title.WEBDL-1080p.en.srt",
 		},
 		{
 			name:      "spanish ASS alongside MP4",
-			mediaPath: "/media/Film (2023)/Film (2023) [Bluray-1080p].mp4",
+			mediaPath: "/media/Film (2023)/Film.2023.Bluray-1080p.mp4",
 			lang:      "es",
 			subExt:    ".ass",
-			want:      "/media/Film (2023)/Film (2023) [Bluray-1080p].es.ass",
+			want:      "/media/Film (2023)/Film.2023.Bluray-1080p.es.ass",
 		},
 		{
 			name:      "forced english subtitle",
-			mediaPath: "/media/Film (2023)/Film (2023) [WEBDL-2160p].mkv",
+			mediaPath: "/media/Film (2023)/Film.2023.WEBDL-2160p.mkv",
 			lang:      "en",
 			subExt:    ".srt",
-			want:      "/media/Film (2023)/Film (2023) [WEBDL-2160p].en.srt",
+			want:      "/media/Film (2023)/Film.2023.WEBDL-2160p.en.srt",
 		},
 	}
 

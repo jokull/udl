@@ -72,7 +72,7 @@ Existing Sonarr/Radarr/NZBGet runs natively via Homebrew on this Mac:
 ## Conventions
 
 - **Quality profiles:** 720p, 1080p (default), 4k, remux — each sets min/preferred/upgrade_until
-- **File naming is hardcoded** — `Movie (Year) [Quality].ext`, `Show - S01E01 - Title [Quality].ext`
+- **File naming is hardcoded** — folders use spaces, filenames use dots: `Movie.Year.Quality.ext`, `Show.S01E01.Title.Quality.ext`
 - **No torrents, no web UI, no custom naming templates** — these are permanent scope exclusions
 - **Title matching:** `cleanTitle()` in searcher.go strips to pure alphanumeric lowercase (Radarr's approach), exact equality. `normalize()` in scheduler.go is looser for RSS TV matching.
 - **Year validation:** movie searches reject releases with wrong parsed year

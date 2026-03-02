@@ -17,18 +17,20 @@ no configurable folder structures, no "custom formats". The tool knows the right
 
 ## Filesystem Convention (non-negotiable)
 
+Folders use spaces (human-readable), filenames use dots (scene-style).
+
 ```
 {library_root}/
 ├── tv/
 │   └── {Series Name} ({Year})/
 │       └── Season {00}/
-│           └── {Series Name} - S{00}E{00} - {Episode Title} [{Quality}].{ext}
+│           └── {Series.Name}.S{00}E{00}.{Episode.Title}.{Quality}.{ext}
 └── movies/
     └── {Movie Name} ({Year})/
-        └── {Movie Name} ({Year}) [{Quality}].{ext}
+        └── {Movie.Name}.{Year}.{Quality}.{ext}
 ```
 
-Quality tags: `[SDTV]`, `[HDTV-720p]`, `[WEBDL-1080p]`, `[Bluray-1080p]`, `[WEBDL-2160p]`, etc.
+Quality tags: `SDTV`, `HDTV-720p`, `WEBDL-1080p`, `Bluray-1080p`, `WEBDL-2160p`, etc.
 
 No user-configurable naming. No tokens. This is the way.
 

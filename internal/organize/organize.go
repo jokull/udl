@@ -49,16 +49,16 @@ var problematicChars = strings.NewReplacer(
 )
 
 // MoviePath returns the canonical path for a movie file.
-// Example: "/library/movies/Dune Part Two (2024)/Dune Part Two (2024) [WEBDL-1080p].mkv"
+// Example: "/library/movies/Dune Part Two (2024)/Dune.Part.Two.2024.WEBDL-1080p.mkv"
 func MoviePath(root, title string, year int, q quality.Quality, ext string) string {
 	title = SanitizeTitle(title)
 	folder := fmt.Sprintf("%s (%d)", title, year)
-	filename := fmt.Sprintf("%s (%d) [%s]%s", title, year, q.String(), ext)
+	filename := fmt.Sprintf("%s.%d.%s%s", dotSeparated(title), year, q.String(), ext)
 	return filepath.Join(root, folder, filename)
 }
 
 // EpisodePath returns the canonical path for a TV episode file.
-// Example: "/library/tv/Severance (2022)/Season 02/Severance - S02E01 - Hello, Ms. Cobel [WEBDL-1080p].mkv"
+// Example: "/library/tv/Severance (2022)/Season 02/Severance.S02E01.Hello.Ms.Cobel.WEBDL-1080p.mkv"
 func EpisodePath(root, series string, year, season, episode int, epTitle string, q quality.Quality, ext string) string {
 	series = SanitizeTitle(series)
 	epTitle = SanitizeTitle(epTitle)
@@ -67,16 +67,16 @@ func EpisodePath(root, series string, year, season, episode int, epTitle string,
 
 	var filename string
 	if epTitle != "" {
-		filename = fmt.Sprintf("%s - S%02dE%02d - %s [%s]%s", series, season, episode, epTitle, q.String(), ext)
+		filename = fmt.Sprintf("%s.S%02dE%02d.%s.%s%s", dotSeparated(series), season, episode, dotSeparated(epTitle), q.String(), ext)
 	} else {
-		filename = fmt.Sprintf("%s - S%02dE%02d [%s]%s", series, season, episode, q.String(), ext)
+		filename = fmt.Sprintf("%s.S%02dE%02d.%s%s", dotSeparated(series), season, episode, q.String(), ext)
 	}
 
 	return filepath.Join(root, seriesFolder, seasonFolder, filename)
 }
 
 // SubtitlePath returns the path for a subtitle file alongside its media file.
-// Example: "TV/Show (2022)/Season 01/Show - S01E01 - Title [WEBDL-1080p].en.srt"
+// Example: "TV/Show (2022)/Season 01/Show.S01E01.Title.WEBDL-1080p.en.srt"
 func SubtitlePath(mediaPath, lang, subExt string) string {
 	ext := filepath.Ext(mediaPath)
 	base := strings.TrimSuffix(mediaPath, ext)
@@ -142,8 +142,15 @@ func IsSubtitleFile(path string) bool {
 	return subtitleExtensions[ext]
 }
 
-// SanitizeTitle cleans a title for use in filenames.
+// SanitizeTitle cleans a title for use in folder names.
 // Removes characters that are problematic on filesystems: / \ : * ? " < > |
 func SanitizeTitle(title string) string {
 	return strings.TrimSpace(problematicChars.Replace(title))
+}
+
+// dotSeparated converts a space-separated title to dot-separated for filenames.
+// Strips commas and periods since dots are the separator character.
+func dotSeparated(title string) string {
+	title = strings.NewReplacer(",", "", ".", "").Replace(title)
+	return strings.Join(strings.Fields(title), ".")
 }
