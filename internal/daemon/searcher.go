@@ -3,9 +3,11 @@ package daemon
 import (
 	"fmt"
 	"log/slog"
+	"net/mail"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"golang.org/x/text/unicode/norm"
@@ -47,10 +49,12 @@ type GrabContext struct {
 
 // ScoredRelease is a Newznab release with parsed metadata and quality score.
 type ScoredRelease struct {
-	Release newznab.Release
-	Parsed  parser.Result
-	Quality quality.Quality
-	Score   int // higher is better
+	Release         newznab.Release
+	Parsed          parser.Result
+	Quality         quality.Quality
+	Score           int    // higher is better
+	Rejected        bool   // set by scoreRelease or GrabBest
+	RejectionReason string // human-readable rejection reason
 }
 
 // SearchMovieReleases queries all indexers for a movie by IMDB ID, falling back
@@ -92,7 +96,7 @@ func (s *Searcher) SearchMovieReleases(imdbID, expectedTitle string, expectedYea
 		}
 
 		for _, rel := range releases {
-			scored := scoreRelease(rel, s.cfg.Prefs)
+			scored := scoreRelease(rel, s.cfg)
 			if scored.Quality == quality.Unknown {
 				continue
 			}
@@ -129,7 +133,7 @@ func (s *Searcher) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredR
 		s.log.Info("search episode results", "indexer", client.Name,
 			"tvdb", tvdbID, "season", season, "episode", episode, "count", len(releases))
 		for _, rel := range releases {
-			scored := scoreRelease(rel, s.cfg.Prefs)
+			scored := scoreRelease(rel, s.cfg)
 			if scored.Quality == quality.Unknown {
 				continue
 			}
@@ -140,17 +144,138 @@ func (s *Searcher) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredR
 	return all, nil
 }
 
+// sizeRange defines min/max byte limits for a quality tier within a category.
+type sizeRange struct {
+	min int64
+	max int64
+}
+
+// sizeLimits maps "category:quality_group" to byte ranges.
+var sizeLimits = map[string]sizeRange{
+	"movie:sd":      {200 * 1024 * 1024, 5 * 1024 * 1024 * 1024},
+	"movie:720p":    {500 * 1024 * 1024, 10 * 1024 * 1024 * 1024},
+	"movie:1080p":   {1 * 1024 * 1024 * 1024, 25 * 1024 * 1024 * 1024},
+	"movie:2160p":   {3 * 1024 * 1024 * 1024, 80 * 1024 * 1024 * 1024},
+	"movie:remux":   {15 * 1024 * 1024 * 1024, 100 * 1024 * 1024 * 1024},
+	"episode:sd":    {50 * 1024 * 1024, 2 * 1024 * 1024 * 1024},
+	"episode:720p":  {100 * 1024 * 1024, 4 * 1024 * 1024 * 1024},
+	"episode:1080p": {200 * 1024 * 1024, 8 * 1024 * 1024 * 1024},
+	"episode:2160p": {500 * 1024 * 1024, 20 * 1024 * 1024 * 1024},
+}
+
+// qualityGroup maps a Quality tier to a size-limit group key.
+func qualityGroup(q quality.Quality) string {
+	switch {
+	case q <= quality.DVD:
+		return "sd"
+	case q <= quality.Bluray720p:
+		return "720p"
+	case q <= quality.Bluray1080p:
+		return "1080p"
+	case q <= quality.Bluray2160p:
+		return "2160p"
+	default:
+		return "remux"
+	}
+}
+
+// formatBytes returns a human-readable size string.
+func formatBytes(b int64) string {
+	const gb = 1024 * 1024 * 1024
+	const mb = 1024 * 1024
+	if b >= gb {
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
+	}
+	return fmt.Sprintf("%d MB", b/mb)
+}
+
+// sizeAcceptable checks whether a release size is within the expected range.
+// Returns (true, "") if acceptable, or (false, reason) if not.
+// Unknown sizes (sizeBytes <= 0) always pass.
+func sizeAcceptable(category string, q quality.Quality, sizeBytes int64) (bool, string) {
+	if sizeBytes <= 0 {
+		return true, ""
+	}
+	key := category + ":" + qualityGroup(q)
+	limits, ok := sizeLimits[key]
+	if !ok {
+		return true, ""
+	}
+	if sizeBytes < limits.min {
+		return false, fmt.Sprintf("size %s below minimum %s for %s %s", formatBytes(sizeBytes), formatBytes(limits.min), qualityGroup(q), category)
+	}
+	if sizeBytes > limits.max {
+		return false, fmt.Sprintf("size %s above maximum %s for %s %s", formatBytes(sizeBytes), formatBytes(limits.max), qualityGroup(q), category)
+	}
+	return true, ""
+}
+
+// releaseAge parses the PubDate (RFC 2822) and returns the age in days.
+// Returns -1 on parse failure.
+func releaseAge(pubDate string) int {
+	if pubDate == "" {
+		return -1
+	}
+	t, err := mail.ParseDate(pubDate)
+	if err != nil {
+		return -1
+	}
+	days := int(time.Since(t).Hours() / 24)
+	if days < 0 {
+		return 0
+	}
+	return days
+}
+
 // GrabBest picks the best acceptable release and enqueues it for download.
 // Returns true if a release was grabbed.
 func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, error) {
+	rejCount := 0
+	grabbed := false
+
 	for _, sr := range releases {
-		if !s.cfg.Prefs.ShouldGrab(sr.Quality, ctx.Existing) {
+		// Skip releases rejected by scoreRelease (raw disc, must-not-contain).
+		if sr.Rejected {
+			s.log.Debug("rejected by scoring", "title", sr.Release.Title, "reason", sr.RejectionReason)
+			rejCount++
 			continue
+		}
+
+		if !s.cfg.Prefs.ShouldGrab(sr.Quality, ctx.Existing) {
+			s.log.Debug("rejected by quality prefs", "title", sr.Release.Title, "quality", sr.Quality)
+			rejCount++
+			continue
+		}
+
+		// Size validation.
+		if ok, reason := sizeAcceptable(ctx.Category, sr.Quality, sr.Release.Size); !ok {
+			s.log.Debug("rejected by size", "title", sr.Release.Title, "reason", reason)
+			rejCount++
+			continue
+		}
+
+		// Usenet retention check.
+		if s.cfg.Usenet.RetentionDays > 0 {
+			age := releaseAge(sr.Release.PubDate)
+			if age >= 0 && age > s.cfg.Usenet.RetentionDays {
+				reason := fmt.Sprintf("article age %dd exceeds retention %dd", age, s.cfg.Usenet.RetentionDays)
+				s.log.Debug("rejected by retention", "title", sr.Release.Title, "reason", reason)
+				rejCount++
+				continue
+			}
 		}
 
 		// Skip blocklisted releases.
 		if blocked, _ := s.db.IsBlocklisted(ctx.Category, ctx.MediaID, sr.Release.Title); blocked {
-			s.log.Debug("skipping blocklisted release", "title", sr.Release.Title)
+			s.log.Debug("rejected by blocklist", "title", sr.Release.Title)
+			rejCount++
+			continue
+		}
+
+		// Already-imported history check.
+		if imported, _ := s.db.IsCompletedInHistory(ctx.Category, ctx.MediaID, sr.Release.Title); imported {
+			s.log.Debug("rejected as already imported", "title", sr.Release.Title)
+			rejCount++
 			continue
 		}
 
@@ -165,11 +290,12 @@ func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, er
 
 		// Check if a Plex friend already has this — download from them instead.
 		if s.plex != nil {
-			grabbed, plexErr := s.grabFromPlex(ctx)
+			plexGrabbed, plexErr := s.grabFromPlex(ctx)
 			if plexErr != nil {
 				s.log.Debug("plex grab failed, falling through to usenet", "title", ctx.Title, "error", plexErr)
-			} else if grabbed {
-				return true, nil
+			} else if plexGrabbed {
+				grabbed = true
+				break
 			}
 		}
 
@@ -186,13 +312,17 @@ func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, er
 		s.log.Info("grabbed release",
 			"title", sr.Release.Title,
 			"quality", sr.Quality,
+			"score", sr.Score,
 			"category", ctx.Category,
 			"media_id", ctx.MediaID,
 			"download_id", dlID,
 		)
-		return true, nil
+		grabbed = true
+		break
 	}
-	return false, nil
+
+	s.log.Info("release evaluation", "total", len(releases), "rejected", rejCount, "grabbed", grabbed)
+	return grabbed, nil
 }
 
 // grabFromPlex checks Plex friends for the media and enqueues an HTTP download
@@ -363,17 +493,52 @@ func (s *Searcher) SearchWantedEpisodes() error {
 	return nil
 }
 
+// rawDiscRe matches release titles for raw Bluray disc images (not playable media files).
+var rawDiscRe = regexp.MustCompile(`(?i)\b(COMPLETE\.?BLURAY|AVC\.?REMUX|BDREMUX|DISC\d*|ISO|BDISO)\b`)
+
+// defaultMustNotContain is applied when the config list is empty.
+var defaultMustNotContain = []string{"CAM", "HDTS", "TELECINE"}
+
 // scoreRelease parses a release title and assigns a quality score.
-func scoreRelease(rel newznab.Release, prefs quality.Prefs) ScoredRelease {
+// Rejects raw disc releases, must-not-contain patterns, and applies preferred word bonuses.
+func scoreRelease(rel newznab.Release, cfg *config.Config) ScoredRelease {
 	parsed := parser.Parse(rel.Title)
 	q := parsed.Quality
+	prefs := cfg.Prefs
+
+	sr := ScoredRelease{
+		Release: rel,
+		Parsed:  parsed,
+		Quality: q,
+	}
+
+	// Reject raw disc releases.
+	if rawDiscRe.MatchString(rel.Title) {
+		sr.Rejected = true
+		sr.RejectionReason = "raw disc release"
+		return sr
+	}
+
+	// Must-not-contain filter.
+	mustNot := cfg.Quality.MustNotContain
+	if len(mustNot) == 0 {
+		mustNot = defaultMustNotContain
+	}
+	titleUpper := strings.ToUpper(rel.Title)
+	for _, word := range mustNot {
+		if strings.Contains(titleUpper, strings.ToUpper(word)) {
+			sr.Rejected = true
+			sr.RejectionReason = fmt.Sprintf("must_not_contain: %s", word)
+			return sr
+		}
+	}
 
 	score := int(q) * 100 // base score from quality tier
 	if q == prefs.Preferred {
 		score += 50 // bonus for preferred quality
 	}
 	// Prefer larger files within the same quality (better bitrate).
-	// Cap at +100 (10GB) so massive COMPLETE.BLURAY releases don't dominate.
+	// Cap at +100 (10GB) so massive releases don't dominate.
 	if rel.Size > 0 {
 		sizeBonus := int(rel.Size / (1024 * 1024 * 100)) // +1 per 100MB
 		if sizeBonus > 100 {
@@ -382,12 +547,15 @@ func scoreRelease(rel newznab.Release, prefs quality.Prefs) ScoredRelease {
 		score += sizeBonus
 	}
 
-	return ScoredRelease{
-		Release: rel,
-		Parsed:  parsed,
-		Quality: q,
-		Score:   score,
+	// Preferred words bonus: +200 per match.
+	for _, word := range cfg.Quality.PreferredWords {
+		if strings.Contains(titleUpper, strings.ToUpper(word)) {
+			score += 200
+		}
 	}
+
+	sr.Score = score
+	return sr
 }
 
 // nonAlphanumRe matches any character that is not a letter or digit.

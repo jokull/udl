@@ -52,15 +52,18 @@ type Paths struct {
 // set min/preferred/upgrade_until individually. Profile takes precedence
 // if set; individual values override profile fields when both are present.
 type QualityConfig struct {
-	Profile      string `toml:"profile"`       // "720p", "1080p", "4k", "remux"
-	Min          string `toml:"min"`
-	Preferred    string `toml:"preferred"`
-	UpgradeUntil string `toml:"upgrade_until"`
+	Profile        string   `toml:"profile"`         // "720p", "1080p", "4k", "remux"
+	Min            string   `toml:"min"`
+	Preferred      string   `toml:"preferred"`
+	UpgradeUntil   string   `toml:"upgrade_until"`
+	MustNotContain []string `toml:"must_not_contain"` // reject releases containing these (case-insensitive)
+	PreferredWords []string `toml:"preferred_words"`  // bonus score for releases containing these
 }
 
 // Usenet groups the provider list.
 type Usenet struct {
-	Providers []Provider `toml:"providers"`
+	Providers     []Provider `toml:"providers"`
+	RetentionDays int        `toml:"retention_days"` // 0 = disabled
 }
 
 // Provider is a single Usenet server.

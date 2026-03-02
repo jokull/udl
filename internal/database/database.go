@@ -508,6 +508,20 @@ func (db *DB) AddHistory(mediaType string, mediaID int64, title, event, source, 
 	return err
 }
 
+// IsCompletedInHistory returns true if a release with the given title was
+// previously completed for the specified media item.
+func (db *DB) IsCompletedInHistory(mediaType string, mediaID int64, releaseTitle string) (bool, error) {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM history WHERE media_type = ? AND media_id = ? AND source = ? AND event = 'completed'`,
+		mediaType, mediaID, releaseTitle,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // ListHistory returns recent history events, most recent first.
 // limit controls how many rows to return (0 = default 50).
 func (db *DB) ListHistory(limit int) ([]History, error) {

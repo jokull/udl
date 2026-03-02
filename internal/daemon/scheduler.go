@@ -2,9 +2,9 @@ package daemon
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -14,6 +14,7 @@ import (
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/plex"
+	"github.com/jokull/udl/internal/quality"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
@@ -135,6 +136,8 @@ func (s *Scheduler) runSearchSweep() {
 
 // RunRSSSync performs one RSS sync cycle for TV episodes only.
 // Movies are handled by the search sweep, not RSS.
+// RSS releases are scored, grouped by matched episode, and passed through
+// GrabBest which applies all viability checks (size, retention, blocklist, etc.).
 func (s *Scheduler) RunRSSSync() error {
 	for _, client := range s.indexers {
 		releases, err := client.RSS()
@@ -145,13 +148,26 @@ func (s *Scheduler) RunRSSSync() error {
 
 		s.log.Info("rss sync: fetched releases", "indexer", client.Name, "count", len(releases))
 
+		// Group scored releases by matched episode ID.
+		type episodeGroup struct {
+			mediaID  int64
+			title    string
+			season   int
+			episode  int
+			releases []ScoredRelease
+		}
+		groups := make(map[int64]*episodeGroup)
+
 		for _, release := range releases {
-			parsed := parser.Parse(release.Title)
-			if parsed.Title == "" || !parsed.IsTV {
+			scored := scoreRelease(release, s.cfg)
+			if scored.Quality == quality.Unknown {
+				continue
+			}
+			if scored.Parsed.Title == "" || !scored.Parsed.IsTV {
 				continue // RSS is TV-only; skip movies and unparseable titles
 			}
 
-			mediaID, err := s.matchTV(parsed)
+			mediaID, err := s.matchTV(scored.Parsed)
 			if err != nil {
 				s.log.Error("rss sync: match error", "title", release.Title, "error", err)
 				continue
@@ -160,70 +176,45 @@ func (s *Scheduler) RunRSSSync() error {
 				continue
 			}
 
-			// Check quality preferences.
-			existing := existingQualityFromDB(s.db, "episode", mediaID)
-			if !s.cfg.Prefs.ShouldGrab(parsed.Quality, existing) {
-				continue
-			}
-
-			// Skip blocklisted releases.
-			if blocked, _ := s.db.IsBlocklisted("episode", mediaID, release.Title); blocked {
-				s.log.Debug("rss sync: skipping blocklisted release", "title", release.Title)
-				continue
-			}
-
-			// Check for duplicate active downloads.
-			active, err := s.db.HasActiveDownload("episode", mediaID)
-			if err != nil {
-				s.log.Error("rss sync: check active download", "error", err)
-				continue
-			}
-			if active {
-				continue
-			}
-
-			// Check if a Plex friend has this episode — download from them.
-			if s.plex != nil {
-				found, match, plexErr := s.plex.HasEpisode(parsed.Title, parsed.Season, parsed.Episode, s.cfg.Prefs.Min)
-				if plexErr != nil {
-					s.log.Debug("rss sync: plex check failed", "title", release.Title, "error", plexErr)
-				} else if found && match != nil {
-					info, infoErr := s.plex.GetDownloadInfo(*match)
-					if infoErr != nil {
-						s.log.Debug("rss sync: plex download info failed", "error", infoErr)
-					} else {
-						sourceName := fmt.Sprintf("plex:%s", match.ServerName)
-						dlID, addErr := s.db.AddDownloadWithSource(
-							info.URL, sourceName, parsed.Title, "episode", mediaID, info.Size, "plex",
-						)
-						if addErr != nil {
-							s.log.Error("rss sync: add plex download failed", "error", addErr)
-						} else {
-							s.log.Info("rss sync: grabbed from plex friend",
-								"title", release.Title,
-								"server", match.ServerName,
-								"quality", match.Quality,
-								"download_id", dlID,
-							)
-							continue
-						}
-					}
+			g, ok := groups[mediaID]
+			if !ok {
+				g = &episodeGroup{
+					mediaID: mediaID,
+					title:   scored.Parsed.Title,
+					season:  scored.Parsed.Season,
+					episode: scored.Parsed.Episode,
 				}
+				groups[mediaID] = g
 			}
+			g.releases = append(g.releases, scored)
+		}
 
-			// Create download entry.
-			dlID, err := s.db.AddDownload(release.Link, release.Title, parsed.Title, "episode", mediaID, release.Size)
+		// For each episode group, sort by score and call GrabBest.
+		for _, g := range groups {
+			sort.Slice(g.releases, func(i, j int) bool {
+				return g.releases[i].Score > g.releases[j].Score
+			})
+
+			existing := existingQualityFromDB(s.db, "episode", g.mediaID)
+			grabbed, err := s.searcher.GrabBest(g.releases, GrabContext{
+				Category: "episode",
+				MediaID:  g.mediaID,
+				Title:    g.title,
+				Season:   g.season,
+				Episode:  g.episode,
+				Existing: existing,
+			})
 			if err != nil {
-				s.log.Error("rss sync: add download failed", "title", release.Title, "error", err)
+				s.log.Error("rss sync: grab failed", "title", g.title, "error", err)
 				continue
 			}
-
-			s.log.Info("rss sync: grabbed episode",
-				"title", release.Title,
-				"quality", parsed.Quality,
-				"media_id", mediaID,
-				"download_id", dlID,
-			)
+			if grabbed {
+				s.log.Info("rss sync: grabbed episode",
+					"title", g.title,
+					"season", g.season,
+					"episode", g.episode,
+				)
+			}
 		}
 	}
 
