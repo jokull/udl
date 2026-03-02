@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // ProviderConfig holds connection details for a Usenet provider.
@@ -20,11 +21,26 @@ type ProviderConfig struct {
 
 // Pool manages a pool of NNTP connections to a single provider.
 type Pool struct {
-	config ProviderConfig
-	conns  chan *Conn
-	mu     sync.Mutex
-	active int
-	log    *slog.Logger
+	config           ProviderConfig
+	conns            chan *Conn
+	mu               sync.Mutex
+	active           int
+	consecutiveFails int
+	backoffUntil     time.Time
+	log              *slog.Logger
+}
+
+// backoffDuration returns the backoff duration for the given number of consecutive failures.
+func backoffDuration(fails int) time.Duration {
+	durations := []time.Duration{5, 15, 30, 60, 120, 300}
+	idx := fails - 1
+	if idx < 0 {
+		return 0
+	}
+	if idx >= len(durations) {
+		idx = len(durations) - 1
+	}
+	return durations[idx] * time.Second
 }
 
 // NewPool creates a connection pool for a provider.
@@ -38,8 +54,17 @@ func NewPool(config ProviderConfig, log *slog.Logger) *Pool {
 }
 
 // Get returns an available connection, creating one if needed and under the limit.
-// Blocks if all connections are in use.
+// Blocks if all connections are in use. Returns an error if the pool is in backoff.
 func (p *Pool) Get() (*Conn, error) {
+	// Check backoff before attempting anything.
+	p.mu.Lock()
+	if time.Now().Before(p.backoffUntil) {
+		remaining := time.Until(p.backoffUntil)
+		p.mu.Unlock()
+		return nil, fmt.Errorf("pool %s: in backoff for %v", p.config.Name, remaining.Truncate(time.Second))
+	}
+	p.mu.Unlock()
+
 	for {
 		// Try to grab an idle connection without blocking.
 		select {
@@ -62,6 +87,13 @@ func (p *Pool) Get() (*Conn, error) {
 			if err != nil {
 				p.mu.Lock()
 				p.active--
+				p.consecutiveFails++
+				p.backoffUntil = time.Now().Add(backoffDuration(p.consecutiveFails))
+				p.log.Warn("provider connection failed, entering backoff",
+					"provider", p.config.Name,
+					"consecutive_fails", p.consecutiveFails,
+					"backoff", backoffDuration(p.consecutiveFails),
+				)
 				p.mu.Unlock()
 				return nil, err
 			}
@@ -79,11 +111,17 @@ func (p *Pool) Get() (*Conn, error) {
 	}
 }
 
-// Put returns a connection to the pool.
+// Put returns a connection to the pool. Resets backoff on success since the provider is healthy.
 func (p *Pool) Put(conn *Conn) {
 	if conn == nil {
 		return
 	}
+	p.mu.Lock()
+	if p.consecutiveFails > 0 {
+		p.consecutiveFails = 0
+		p.backoffUntil = time.Time{}
+	}
+	p.mu.Unlock()
 	select {
 	case p.conns <- conn:
 	default:

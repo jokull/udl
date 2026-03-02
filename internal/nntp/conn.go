@@ -90,10 +90,16 @@ func (c *Conn) Auth(username, password string) error {
 	return nil
 }
 
+const bodyTimeout = 60 * time.Second
+
 // Body fetches the body of an article by message ID.
 // Returns the raw body as an io.Reader. The caller must read fully before
 // issuing the next command on this connection.
+// Sets a 60s read deadline to prevent stuck workers.
 func (c *Conn) Body(messageID string) (io.Reader, error) {
+	c.conn.SetDeadline(time.Now().Add(bodyTimeout))
+	defer c.conn.SetDeadline(time.Time{})
+
 	// Ensure message ID is wrapped in angle brackets.
 	if !strings.HasPrefix(messageID, "<") {
 		messageID = "<" + messageID + ">"

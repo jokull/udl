@@ -16,6 +16,7 @@ import (
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/plex"
+	"github.com/jokull/udl/internal/postprocess"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
@@ -659,6 +660,11 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	// Start scheduler (RSS for TV + search sweep for movies + TMDB refresh).
 	sched := NewScheduler(cfg, db, indexers, tc, plexClient, log)
 	sched.Start(ctx)
+
+	// Check for par2cmdline availability.
+	if !postprocess.HasPar2() {
+		log.Warn("par2cmdline not found -- PAR2 repair unavailable. Install: brew install par2cmdline")
+	}
 
 	// Start downloader (queue processing).
 	dl := NewDownloader(cfg, db, log)

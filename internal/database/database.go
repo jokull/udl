@@ -385,8 +385,27 @@ func (db *DB) HasActiveDownload(category string, mediaID int64) (bool, error) {
 	return count > 0, nil
 }
 
+// WithTx executes fn within a database transaction.
+// If fn returns an error, the transaction is rolled back.
+func (db *DB) WithTx(fn func(tx *sql.Tx) error) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	if err := fn(tx); err != nil {
+		tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 // UpdateDownloadStatus updates a download's status.
+// Sets started_at when transitioning to "downloading".
 func (db *DB) UpdateDownloadStatus(id int64, status string) error {
+	if status == "downloading" {
+		_, err := db.Exec(`UPDATE downloads SET status = ?, started_at = CURRENT_TIMESTAMP WHERE id = ?`, status, id)
+		return err
+	}
 	_, err := db.Exec(`UPDATE downloads SET status = ? WHERE id = ?`, status, id)
 	return err
 }

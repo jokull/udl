@@ -3,6 +3,7 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
@@ -24,11 +27,17 @@ import (
 	"github.com/jokull/udl/internal/quality"
 )
 
+// DownloadEngine abstracts the NNTP download engine for testing.
+type DownloadEngine interface {
+	Download(ctx context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress)) ([]string, error)
+	Close()
+}
+
 // Downloader picks items from the download queue and processes them.
 type Downloader struct {
 	cfg      *config.Config
 	db       *database.DB
-	engine   *nntp.Engine
+	engine   DownloadEngine
 	indexers []*newznab.Client
 	log      *slog.Logger
 	stop     chan struct{}
@@ -67,6 +76,18 @@ func NewDownloader(cfg *config.Config, db *database.DB, log *slog.Logger) *Downl
 	}
 }
 
+// NewDownloaderWithEngine creates a Downloader with a custom DownloadEngine.
+// Used in tests to inject a fake engine that doesn't require real NNTP providers.
+func NewDownloaderWithEngine(cfg *config.Config, db *database.DB, engine DownloadEngine, log *slog.Logger) *Downloader {
+	return &Downloader{
+		cfg:    cfg,
+		db:     db,
+		engine: engine,
+		log:    log,
+		stop:   make(chan struct{}),
+	}
+}
+
 // Start begins processing downloads. Non-blocking — runs in a background goroutine.
 // Polls the database for queued downloads every few seconds.
 // On startup, resets any downloads stuck in 'downloading' from a previous run.
@@ -74,6 +95,13 @@ func (d *Downloader) Start(ctx context.Context) {
 	// Reset stale downloads from previous daemon runs.
 	if _, err := d.db.Exec(`UPDATE downloads SET status = 'queued' WHERE status = 'downloading'`); err != nil {
 		d.log.Error("failed to reset stale downloads", "error", err)
+	}
+
+	// Clean up stale .udl-tmp files from interrupted imports.
+	if d.cfg != nil {
+		if n := organize.CleanStaleTmpFiles(d.cfg.Library.Movies, d.cfg.Library.TV); n > 0 {
+			d.log.Warn("cleaned stale .udl-tmp files from previous crash", "count", n)
+		}
 	}
 
 	go func() {
@@ -98,8 +126,48 @@ func (d *Downloader) Stop() {
 	d.engine.Close()
 }
 
+// checkDiskSpace verifies that there's enough free space at path for the download.
+// Requires 2x the download size plus 1GB margin for post-processing.
+// Returns nil if size is unknown (0) or if the check can't be performed.
+func checkDiskSpace(path string, requiredBytes int64) error {
+	if requiredBytes <= 0 {
+		return nil // size unknown, skip check
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return nil // can't check, proceed
+	}
+	available := int64(stat.Bavail) * int64(stat.Bsize)
+	needed := requiredBytes*2 + 1<<30 // 2x size + 1GB margin
+	if available < needed {
+		return fmt.Errorf("insufficient disk space: %d MB available, need ~%d MB",
+			available>>20, needed>>20)
+	}
+	return nil
+}
+
+// resetStuckDownloads resets downloads stuck in "downloading" state for >2 hours.
+// This catches downloads orphaned by daemon crashes or killed processes.
+func (d *Downloader) resetStuckDownloads() {
+	res, err := d.db.Exec(`
+		UPDATE downloads SET status = 'queued', error_msg = 'reset: stuck in downloading state'
+		WHERE status = 'downloading'
+		  AND started_at IS NOT NULL
+		  AND started_at < datetime('now', '-2 hours')
+	`)
+	if err != nil {
+		d.log.Error("reset stuck downloads query failed", "error", err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		d.log.Warn("reset stuck downloads", "count", n)
+	}
+}
+
 // processQueue fetches pending downloads and processes the first queued one.
 func (d *Downloader) processQueue(ctx context.Context) {
+	d.resetStuckDownloads()
+
 	downloads, err := d.db.PendingDownloads()
 	if err != nil {
 		d.log.Error("failed to fetch pending downloads", "error", err)
@@ -135,6 +203,13 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 		return fmt.Errorf("update status to downloading: %w", err)
 	}
 
+	// Check disk space before starting.
+	if dl.SizeBytes.Valid {
+		if err := checkDiskSpace(d.cfg.Paths.Incomplete, dl.SizeBytes.Int64); err != nil {
+			return d.fail(dl.ID, err.Error())
+		}
+	}
+
 	dlURL := dl.NzbURL.String
 	if dlURL == "" {
 		return d.fail(dl.ID, "plex download has no URL")
@@ -143,23 +218,23 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 	// Create a temporary file for the download.
 	downloadDir := filepath.Join(d.cfg.Paths.Incomplete, fmt.Sprintf("plex-%d", dl.ID))
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create download dir: %v", err))
+		return d.fail(dl.ID, fmt.Sprintf("create download dir: %v", err), downloadDir)
 	}
 
 	// Stream the file from the Plex server.
 	req, err := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create request: %v", err))
+		return d.fail(dl.ID, fmt.Sprintf("create request: %v", err), downloadDir)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("plex download: %v", err))
+		return d.fail(dl.ID, fmt.Sprintf("plex download: %v", err), downloadDir)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return d.fail(dl.ID, fmt.Sprintf("plex download: HTTP %d", resp.StatusCode))
+		return d.fail(dl.ID, fmt.Sprintf("plex download: HTTP %d", resp.StatusCode), downloadDir)
 	}
 
 	// Determine filename — use Content-Disposition or fall back to a generic name.
@@ -172,7 +247,7 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 
 	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create temp file: %v", err))
+		return d.fail(dl.ID, fmt.Sprintf("create temp file: %v", err), downloadDir)
 	}
 
 	// Stream with progress updates.
@@ -184,7 +259,7 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 		if n > 0 {
 			if _, writeErr := tmpFile.Write(buf[:n]); writeErr != nil {
 				tmpFile.Close()
-				return d.fail(dl.ID, fmt.Sprintf("write: %v", writeErr))
+				return d.fail(dl.ID, fmt.Sprintf("write: %v", writeErr), downloadDir)
 			}
 			downloaded += int64(n)
 			if totalSize > 0 {
@@ -197,14 +272,14 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 				break
 			}
 			tmpFile.Close()
-			return d.fail(dl.ID, fmt.Sprintf("read: %v", readErr))
+			return d.fail(dl.ID, fmt.Sprintf("read: %v", readErr), downloadDir)
 		}
 	}
 	tmpFile.Close()
 
 	// Atomic rename from .part to final.
 	if err := os.Rename(tmpPath, finalTmpPath); err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("rename: %v", err))
+		return d.fail(dl.ID, fmt.Sprintf("rename: %v", err), downloadDir)
 	}
 
 	// Import to library — same logic as Usenet downloads.
@@ -222,11 +297,11 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 	case "movie":
 		movie, err := d.db.GetMovie(dl.MediaID)
 		if err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("get movie %d: %v", dl.MediaID, err))
+			return d.fail(dl.ID, fmt.Sprintf("get movie %d: %v", dl.MediaID, err), downloadDir)
 		}
 		dstPath = organize.MoviePath(d.cfg.Library.Movies, movie.Title, movie.Year, q, mediaExt)
 		if err := organize.Import(finalTmpPath, dstPath); err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("import movie: %v", err))
+			return d.fail(dl.ID, fmt.Sprintf("import movie: %v", err), downloadDir)
 		}
 		if err := d.db.UpdateMovieStatus(movie.ID, "downloaded", q.String(), dstPath); err != nil {
 			d.log.Error("failed to update movie status", "id", movie.ID, "error", err)
@@ -235,11 +310,11 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 	case "episode":
 		ep, err := d.db.GetEpisode(dl.MediaID)
 		if err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("get episode %d: %v", dl.MediaID, err))
+			return d.fail(dl.ID, fmt.Sprintf("get episode %d: %v", dl.MediaID, err), downloadDir)
 		}
 		series, err := d.db.GetSeries(ep.SeriesID)
 		if err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("get series %d: %v", ep.SeriesID, err))
+			return d.fail(dl.ID, fmt.Sprintf("get series %d: %v", ep.SeriesID, err), downloadDir)
 		}
 		epTitle := ""
 		if ep.Title.Valid {
@@ -250,22 +325,30 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 			ep.Season, ep.Episode, epTitle, q, mediaExt,
 		)
 		if err := organize.Import(finalTmpPath, dstPath); err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("import episode: %v", err))
+			return d.fail(dl.ID, fmt.Sprintf("import episode: %v", err), downloadDir)
 		}
 		if err := d.db.UpdateEpisodeStatus(ep.ID, "downloaded", q.String(), dstPath); err != nil {
 			d.log.Error("failed to update episode status", "id", ep.ID, "error", err)
 		}
 
 	default:
-		return d.fail(dl.ID, fmt.Sprintf("unknown category: %s", dl.Category))
+		return d.fail(dl.ID, fmt.Sprintf("unknown category: %s", dl.Category), downloadDir)
 	}
 
-	// Completed.
-	if err := d.db.UpdateDownloadStatus(dl.ID, "completed"); err != nil {
-		d.log.Error("failed to update download to completed", "id", dl.ID, "error", err)
-	}
-	if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "completed", dl.NzbName, q.String()); err != nil {
-		d.log.Error("failed to record history", "id", dl.ID, "error", err)
+	// Complete: update download + history in a single transaction.
+	if err := d.db.WithTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE downloads SET status = 'completed' WHERE id = ?`, dl.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO history (media_type, media_id, title, event, source, quality) VALUES (?, ?, ?, 'completed', ?, ?)`,
+			dl.Category, dl.MediaID, dl.Title, dl.NzbName, q.String(),
+		); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		d.log.Error("failed to record completion", "id", dl.ID, "error", err)
 	}
 	if err := os.RemoveAll(downloadDir); err != nil {
 		d.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
@@ -284,7 +367,14 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 		return fmt.Errorf("update status to downloading: %w", err)
 	}
 
-	// 2. Fetch NZB bytes from the download's nzb_url.
+	// 2. Check disk space before starting.
+	if dl.SizeBytes.Valid {
+		if err := checkDiskSpace(d.cfg.Paths.Incomplete, dl.SizeBytes.Int64); err != nil {
+			return d.fail(dl.ID, err.Error())
+		}
+	}
+
+	// 3. Fetch NZB bytes from the download's nzb_url.
 	nzbURL := dl.NzbURL.String
 	if nzbURL == "" {
 		return d.fail(dl.ID, "download has no NZB URL")
@@ -304,7 +394,7 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 	// 4. Create download directory under incomplete.
 	downloadDir := filepath.Join(d.cfg.Paths.Incomplete, strconv.FormatInt(dl.ID, 10))
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create download dir: %v", err))
+		return d.fail(dl.ID, fmt.Sprintf("create download dir: %v", err), downloadDir)
 	}
 
 	// 5. NNTP Download with progress callback.
@@ -323,7 +413,7 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 		if strings.Contains(err.Error(), "segments failed") {
 			d.log.Warn("some segments failed, proceeding to PAR2 repair", "id", dl.ID, "error", err)
 		} else {
-			return d.fail(dl.ID, fmt.Sprintf("NNTP download: %v", err))
+			return d.fail(dl.ID, fmt.Sprintf("NNTP download: %v", err), downloadDir)
 		}
 	}
 
@@ -335,13 +425,13 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 	// 7. Post-process: PAR2 verify/repair, RAR extract, cleanup, identify files.
 	result, err := postprocess.Process(downloadDir, d.log)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("post-processing: %v", err))
+		return d.fail(dl.ID, fmt.Sprintf("post-processing: %v", err), downloadDir)
 	}
 	if !result.Success {
-		return d.fail(dl.ID, fmt.Sprintf("post-processing failed: %s", result.Error))
+		return d.fail(dl.ID, fmt.Sprintf("post-processing failed: %s", result.Error), downloadDir)
 	}
 	if len(result.MediaFiles) == 0 {
-		return d.fail(dl.ID, "no media files found after post-processing")
+		return d.fail(dl.ID, "no media files found after post-processing", downloadDir)
 	}
 
 	// 8. Import: move files to library.
@@ -357,12 +447,12 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 	case "movie":
 		movie, err := d.db.GetMovie(dl.MediaID)
 		if err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("get movie %d: %v", dl.MediaID, err))
+			return d.fail(dl.ID, fmt.Sprintf("get movie %d: %v", dl.MediaID, err), downloadDir)
 		}
 		dstPath = organize.MoviePath(d.cfg.Library.Movies, movie.Title, movie.Year, q, mediaExt)
 
 		if err := organize.Import(mainMedia, dstPath); err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("import movie: %v", err))
+			return d.fail(dl.ID, fmt.Sprintf("import movie: %v", err), downloadDir)
 		}
 
 		// Import subtitles alongside the media file.
@@ -382,11 +472,11 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 	case "episode":
 		ep, err := d.db.GetEpisode(dl.MediaID)
 		if err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("get episode %d: %v", dl.MediaID, err))
+			return d.fail(dl.ID, fmt.Sprintf("get episode %d: %v", dl.MediaID, err), downloadDir)
 		}
 		series, err := d.db.GetSeries(ep.SeriesID)
 		if err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("get series %d: %v", ep.SeriesID, err))
+			return d.fail(dl.ID, fmt.Sprintf("get series %d: %v", ep.SeriesID, err), downloadDir)
 		}
 
 		epTitle := ""
@@ -399,7 +489,7 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 		)
 
 		if err := organize.Import(mainMedia, dstPath); err != nil {
-			return d.fail(dl.ID, fmt.Sprintf("import episode: %v", err))
+			return d.fail(dl.ID, fmt.Sprintf("import episode: %v", err), downloadDir)
 		}
 
 		// Import subtitles.
@@ -417,20 +507,26 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 		}
 
 	default:
-		return d.fail(dl.ID, fmt.Sprintf("unknown category: %s", dl.Category))
+		return d.fail(dl.ID, fmt.Sprintf("unknown category: %s", dl.Category), downloadDir)
 	}
 
-	// 9. Update download status to "completed".
-	if err := d.db.UpdateDownloadStatus(dl.ID, "completed"); err != nil {
-		d.log.Error("failed to update download to completed", "id", dl.ID, "error", err)
+	// 9. Complete: update download + media status + history in a single transaction.
+	if err := d.db.WithTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE downloads SET status = 'completed' WHERE id = ?`, dl.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO history (media_type, media_id, title, event, source, quality) VALUES (?, ?, ?, 'completed', ?, ?)`,
+			dl.Category, dl.MediaID, dl.Title, dl.NzbName, q.String(),
+		); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		d.log.Error("failed to record completion", "id", dl.ID, "error", err)
 	}
 
-	// 10. Record history event.
-	if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "completed", dl.NzbName, q.String()); err != nil {
-		d.log.Error("failed to record history", "id", dl.ID, "error", err)
-	}
-
-	// 11. Cleanup: remove the download directory from incomplete.
+	// 10. Cleanup: remove the download directory from incomplete.
 	if err := os.RemoveAll(downloadDir); err != nil {
 		d.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
 	}
@@ -440,7 +536,8 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 }
 
 // fail marks the download as failed, records a history event, and returns an error.
-func (d *Downloader) fail(id int64, msg string) error {
+// If cleanupDir is provided and non-empty, the directory is removed to prevent disk space leaks.
+func (d *Downloader) fail(id int64, msg string, cleanupDir ...string) error {
 	if err := d.db.UpdateDownloadError(id, msg); err != nil {
 		d.log.Error("failed to update download error", "id", id, "error", err)
 	}
@@ -451,6 +548,13 @@ func (d *Downloader) fail(id int64, msg string) error {
 	).Scan(&dl.Category, &dl.MediaID, &dl.Title, &dl.NzbName); err == nil {
 		if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "failed", dl.NzbName, ""); err != nil {
 			d.log.Error("failed to record failure history", "id", id, "error", err)
+		}
+	}
+	for _, dir := range cleanupDir {
+		if dir != "" {
+			if err := os.RemoveAll(dir); err != nil {
+				d.log.Warn("cleanup incomplete dir failed", "dir", dir, "error", err)
+			}
 		}
 	}
 	return fmt.Errorf("download %d: %s", id, msg)

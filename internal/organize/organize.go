@@ -102,7 +102,9 @@ func Import(src, dst string) error {
 	return copyAndDelete(src, dst)
 }
 
-// copyAndDelete copies src to dst then removes src.
+// copyAndDelete copies src to dst atomically then removes src.
+// Writes to a .udl-tmp file, fsyncs, then renames to prevent
+// corrupt library files on crash.
 func copyAndDelete(src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -110,24 +112,50 @@ func copyAndDelete(src, dst string) error {
 	}
 	defer srcFile.Close()
 
-	dstFile, err := os.Create(dst)
+	tmpDst := dst + ".udl-tmp"
+	dstFile, err := os.Create(tmpDst)
 	if err != nil {
-		return fmt.Errorf("organize: create dst %s: %w", dst, err)
+		return fmt.Errorf("organize: create tmp %s: %w", tmpDst, err)
 	}
-	defer dstFile.Close()
 
 	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		dstFile.Close()
+		os.Remove(tmpDst)
 		return fmt.Errorf("organize: copy %s -> %s: %w", src, dst, err)
 	}
-
-	// Close both files before removing src.
-	srcFile.Close()
+	if err := dstFile.Sync(); err != nil {
+		dstFile.Close()
+		os.Remove(tmpDst)
+		return fmt.Errorf("organize: fsync %s: %w", tmpDst, err)
+	}
 	dstFile.Close()
 
-	if err := os.Remove(src); err != nil {
-		return fmt.Errorf("organize: remove src %s: %w", src, err)
+	if err := os.Rename(tmpDst, dst); err != nil {
+		os.Remove(tmpDst)
+		return fmt.Errorf("organize: rename %s -> %s: %w", tmpDst, dst, err)
 	}
+
+	os.Remove(src)
 	return nil
+}
+
+// CleanStaleTmpFiles removes leftover .udl-tmp files from a directory tree.
+// Called on daemon startup to clean up from previous crashes.
+func CleanStaleTmpFiles(roots ...string) int {
+	var cleaned int
+	for _, root := range roots {
+		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if !info.IsDir() && strings.HasSuffix(path, ".udl-tmp") {
+				os.Remove(path)
+				cleaned++
+			}
+			return nil
+		})
+	}
+	return cleaned
 }
 
 // IsMediaFile returns true for common video file extensions.

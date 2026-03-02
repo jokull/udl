@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -321,37 +322,54 @@ func (e *Engine) downloadSegment(ctx context.Context, preferredPool *Pool, messa
 	return nil, fmt.Errorf("segment %s: all providers failed: %w", messageID, err)
 }
 
+// isArticleNotFound returns true for permanent NNTP 430 "no such article" errors.
+func isArticleNotFound(err error) bool {
+	return strings.Contains(err.Error(), "430")
+}
+
 // fetchFromPool fetches a single article body from a pool and returns
 // the body as an io.Reader for yEnc decoding.
+// Retries up to 3 times for transient errors (timeouts, connection resets).
+// Does not retry permanent errors like NNTP 430 (article not found).
 func (e *Engine) fetchFromPool(ctx context.Context, pool *Pool, messageID string) (io.Reader, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
+	var lastErr error
+	for range 3 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 
-	conn, err := pool.Get()
-	if err != nil {
-		return nil, err
-	}
+		conn, err := pool.Get()
+		if err != nil {
+			lastErr = err
+			break // pool-level error (backoff, etc.), don't retry
+		}
 
-	body, err := conn.Body(messageID)
-	if err != nil {
-		// Connection may be broken; discard it.
-		pool.Return(conn)
-		return nil, err
-	}
+		body, err := conn.Body(messageID)
+		if err != nil {
+			// Connection may be broken; discard it.
+			pool.Return(conn)
+			lastErr = err
+			if isArticleNotFound(err) {
+				break // permanent error, don't retry
+			}
+			continue // transient error, retry with new connection
+		}
 
-	// Read the entire body into memory. NNTP article segments are typically
-	// 500KB-750KB of yEnc-encoded data, so this is fine.
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, body); err != nil {
+		// Read the entire body into memory. NNTP article segments are typically
+		// 500KB-750KB of yEnc-encoded data, so this is fine.
+		var buf bytes.Buffer
+		if _, err := io.Copy(&buf, body); err != nil {
+			pool.Put(conn)
+			lastErr = fmt.Errorf("read body: %w", err)
+			continue // transient, retry
+		}
+
 		pool.Put(conn)
-		return nil, fmt.Errorf("read body: %w", err)
+		return &buf, nil
 	}
-
-	pool.Put(conn)
-	return &buf, nil
+	return nil, lastErr
 }
 
 // Close closes all provider pools.
