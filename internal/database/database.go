@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS history (
     id INTEGER PRIMARY KEY,
     media_type TEXT NOT NULL,
     media_id INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
     event TEXT NOT NULL,
     source TEXT,
     quality TEXT,
@@ -125,6 +126,13 @@ CREATE TABLE IF NOT EXISTS history (
 
 	// Add tvdb_id to series if migrating from older schema.
 	db.Exec("ALTER TABLE series ADD COLUMN tvdb_id INTEGER")
+
+	// Add title column to history if migrating from older schema.
+	db.Exec("ALTER TABLE history ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+
+	// Add last_refreshed_at to series if migrating from older schema.
+	db.Exec("ALTER TABLE series ADD COLUMN last_refreshed_at TEXT")
+
 	return nil
 }
 
@@ -218,7 +226,7 @@ func (db *DB) AddSeries(tmdbID, tvdbID int, imdbID, title string, year int) (int
 // ListSeries returns all series ordered by added_at descending.
 func (db *DB) ListSeries() ([]Series, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at
+		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at, last_refreshed_at
 		 FROM series ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -230,7 +238,7 @@ func (db *DB) ListSeries() ([]Series, error) {
 	for rows.Next() {
 		var s Series
 		if err := rows.Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year,
-			&s.Status, &s.AddedAt); err != nil {
+			&s.Status, &s.AddedAt, &s.LastRefreshedAt); err != nil {
 			return nil, err
 		}
 		list = append(list, s)
@@ -252,8 +260,32 @@ func (db *DB) AddEpisode(seriesID int64, season, episode int, title, airDate str
 	return err
 }
 
-// WantedEpisodes returns episodes with status='wanted', joined with the series
-// title so callers have context about which show the episode belongs to.
+// UpsertEpisode inserts a new episode or silently skips if it already exists.
+// Used by the refresh loop to add newly announced episodes without errors on duplicates.
+func (db *DB) UpsertEpisode(seriesID int64, season, episode int, title, airDate string) error {
+	_, err := db.Exec(
+		`INSERT OR IGNORE INTO episodes (series_id, season, episode, title, air_date)
+		 VALUES (?, ?, ?, ?, ?)`,
+		seriesID, season, episode, nullString(title), nullString(airDate),
+	)
+	return err
+}
+
+// UpdateSeriesStatus sets the status of a series (e.g. "monitored", "ended").
+func (db *DB) UpdateSeriesStatus(id int64, status string) error {
+	_, err := db.Exec(`UPDATE series SET status = ? WHERE id = ?`, status, id)
+	return err
+}
+
+// UpdateSeriesRefreshedAt stamps the current time as the last refresh time for a series.
+func (db *DB) UpdateSeriesRefreshedAt(id int64) error {
+	_, err := db.Exec(`UPDATE series SET last_refreshed_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+	return err
+}
+
+// WantedEpisodes returns episodes with status='wanted' that have already aired,
+// joined with the series title so callers have context about which show the
+// episode belongs to. Episodes with a future air_date are excluded.
 func (db *DB) WantedEpisodes() ([]Episode, error) {
 	rows, err := db.Query(
 		`SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
@@ -261,6 +293,7 @@ func (db *DB) WantedEpisodes() ([]Episode, error) {
 		 FROM episodes e
 		 JOIN series s ON s.id = e.series_id
 		 WHERE e.status = 'wanted'
+		   AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
 		 ORDER BY s.title, e.season, e.episode`,
 	)
 	if err != nil {
@@ -415,14 +448,177 @@ func (db *DB) GetEpisode(id int64) (*Episode, error) {
 func (db *DB) GetSeries(id int64) (*Series, error) {
 	var s Series
 	err := db.QueryRow(
-		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at
+		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at, last_refreshed_at
 		 FROM series WHERE id = ?`, id,
 	).Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year,
-		&s.Status, &s.AddedAt)
+		&s.Status, &s.AddedAt, &s.LastRefreshedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &s, nil
+}
+
+// ---------------------------------------------------------------------------
+// History CRUD
+// ---------------------------------------------------------------------------
+
+// AddHistory records a history event for a media item.
+// event is one of "grabbed", "completed", "failed".
+func (db *DB) AddHistory(mediaType string, mediaID int64, title, event, source, quality string) error {
+	_, err := db.Exec(
+		`INSERT INTO history (media_type, media_id, title, event, source, quality) VALUES (?, ?, ?, ?, ?, ?)`,
+		mediaType, mediaID, title, event, nullString(source), nullString(quality),
+	)
+	return err
+}
+
+// ListHistory returns recent history events, most recent first.
+// limit controls how many rows to return (0 = default 50).
+func (db *DB) ListHistory(limit int) ([]History, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := db.Query(
+		`SELECT id, media_type, media_id, title, event, source, quality, created_at
+		 FROM history ORDER BY created_at DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []History
+	for rows.Next() {
+		var h History
+		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
+			&h.Source, &h.Quality, &h.CreatedAt); err != nil {
+			return nil, err
+		}
+		events = append(events, h)
+	}
+	return events, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Remove operations
+// ---------------------------------------------------------------------------
+
+// RemoveMovie deletes a movie from the database by ID. Does not remove files from disk.
+func (db *DB) RemoveMovie(id int64) error {
+	res, err := db.Exec(`DELETE FROM movies WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("movie %d not found", id)
+	}
+	return nil
+}
+
+// RemoveSeries deletes a series and all its episodes from the database by ID.
+// Does not remove files from disk.
+func (db *DB) RemoveSeries(id int64) error {
+	// Delete episodes first (foreign key would block otherwise).
+	if _, err := db.Exec(`DELETE FROM episodes WHERE series_id = ?`, id); err != nil {
+		return fmt.Errorf("delete episodes: %w", err)
+	}
+	res, err := db.Exec(`DELETE FROM series WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("series %d not found", id)
+	}
+	return nil
+}
+
+// FindMovieByTitle returns the first movie whose title matches (case-insensitive).
+func (db *DB) FindMovieByTitle(title string) (*Movie, error) {
+	var m Movie
+	err := db.QueryRow(
+		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at
+		 FROM movies WHERE LOWER(title) = LOWER(?) LIMIT 1`, title,
+	).Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+		&m.Status, &m.Quality, &m.FilePath, &m.AddedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// FindSeriesByTitle returns the first series whose title matches (case-insensitive).
+func (db *DB) FindSeriesByTitle(title string) (*Series, error) {
+	var s Series
+	err := db.QueryRow(
+		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at, last_refreshed_at
+		 FROM series WHERE LOWER(title) = LOWER(?) LIMIT 1`, title,
+	).Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year,
+		&s.Status, &s.AddedAt, &s.LastRefreshedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// ---------------------------------------------------------------------------
+// Queue statistics
+// ---------------------------------------------------------------------------
+
+// QueueStats returns the number of queued and downloading items.
+func (db *DB) QueueStats() (queued, downloading int, err error) {
+	err = db.QueryRow(
+		`SELECT COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0),
+		        COALESCE(SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END), 0)
+		 FROM downloads WHERE status IN ('queued', 'downloading')`,
+	).Scan(&queued, &downloading)
+	return
+}
+
+// ResetFailedDownloads resets all failed downloads back to queued status.
+// If id > 0, only resets the specific download.
+func (db *DB) ResetFailedDownloads(id int64) (int64, error) {
+	var res sql.Result
+	var err error
+	if id > 0 {
+		res, err = db.Exec(`UPDATE downloads SET status = 'queued', error_msg = NULL WHERE id = ? AND status = 'failed'`, id)
+	} else {
+		res, err = db.Exec(`UPDATE downloads SET status = 'queued', error_msg = NULL WHERE status = 'failed'`)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// RecentDownloads returns completed and failed downloads from the last N hours.
+func (db *DB) RecentDownloads(hours int) ([]Download, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	rows, err := db.Query(
+		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at
+		 FROM downloads WHERE status IN ('completed', 'failed') AND created_at > datetime('now', ? || ' hours')
+		 ORDER BY created_at DESC`,
+		fmt.Sprintf("-%d", hours),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var downloads []Download
+	for rows.Next() {
+		var d Download
+		if err := rows.Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
+			&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
+			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		downloads = append(downloads, d)
+	}
+	return downloads, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

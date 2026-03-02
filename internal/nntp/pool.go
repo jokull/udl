@@ -40,33 +40,43 @@ func NewPool(config ProviderConfig, log *slog.Logger) *Pool {
 // Get returns an available connection, creating one if needed and under the limit.
 // Blocks if all connections are in use.
 func (p *Pool) Get() (*Conn, error) {
-	// Try to grab an idle connection without blocking.
-	select {
-	case c := <-p.conns:
-		return c, nil
-	default:
-	}
+	for {
+		// Try to grab an idle connection without blocking.
+		select {
+		case c := <-p.conns:
+			if c == nil {
+				// nil sentinel from Return() — a slot freed up, retry.
+				continue
+			}
+			return c, nil
+		default:
+		}
 
-	// Try to create a new connection if under the limit.
-	p.mu.Lock()
-	if p.active < p.config.Connections {
-		p.active++
+		// Try to create a new connection if under the limit.
+		p.mu.Lock()
+		if p.active < p.config.Connections {
+			p.active++
+			p.mu.Unlock()
+
+			c, err := p.dial()
+			if err != nil {
+				p.mu.Lock()
+				p.active--
+				p.mu.Unlock()
+				return nil, err
+			}
+			return c, nil
+		}
 		p.mu.Unlock()
 
-		c, err := p.dial()
-		if err != nil {
-			p.mu.Lock()
-			p.active--
-			p.mu.Unlock()
-			return nil, err
+		// All connections in use — block until one is returned.
+		c := <-p.conns
+		if c == nil {
+			// nil sentinel from Return() — a slot freed up, retry.
+			continue
 		}
 		return c, nil
 	}
-	p.mu.Unlock()
-
-	// All connections in use — block until one is returned.
-	c := <-p.conns
-	return c, nil
 }
 
 // Put returns a connection to the pool.
@@ -84,6 +94,7 @@ func (p *Pool) Put(conn *Conn) {
 
 // Return discards a broken connection and decrements the active count
 // so a new connection can be dialed on the next Get.
+// Sends a nil sentinel to wake up any goroutine blocked in Get().
 func (p *Pool) Return(conn *Conn) {
 	if conn != nil {
 		conn.Close()
@@ -91,6 +102,12 @@ func (p *Pool) Return(conn *Conn) {
 	p.mu.Lock()
 	p.active--
 	p.mu.Unlock()
+
+	// Wake up a blocked Get() caller by sending a nil sentinel.
+	select {
+	case p.conns <- nil:
+	default:
+	}
 }
 
 // Close closes all idle connections in the pool.

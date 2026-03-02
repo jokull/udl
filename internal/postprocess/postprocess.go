@@ -66,10 +66,90 @@ func HasPar2() bool {
 	return err == nil
 }
 
+// renameByMagic checks files without recognized extensions and renames them
+// based on their magic bytes. This handles obfuscated NZBs where filenames
+// are generic (file_0, file_1, etc.).
+func renameByMagic(dir string, log *slog.Logger) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		// Skip files that already have a recognized extension.
+		if mediaExtensions[ext] || subtitleExtensions[ext] || cleanupExtensions[ext] ||
+			rNumberedPattern.MatchString(ext) || ext == ".jpg" || ext == ".jpeg" || ext == ".png" {
+			continue
+		}
+
+		path := filepath.Join(dir, entry.Name())
+		newExt := detectExtension(path)
+		if newExt == "" {
+			continue
+		}
+
+		newPath := path + newExt
+		if err := os.Rename(path, newPath); err != nil {
+			log.Warn("failed to rename obfuscated file", "from", path, "to", newPath, "error", err)
+			continue
+		}
+		log.Info("renamed obfuscated file", "from", entry.Name(), "to", entry.Name()+newExt)
+	}
+	return nil
+}
+
+// detectExtension reads the first few bytes of a file and returns an appropriate
+// extension based on magic bytes, or empty string if unrecognized.
+func detectExtension(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	buf := make([]byte, 16)
+	n, err := f.Read(buf)
+	if err != nil || n < 4 {
+		return ""
+	}
+	buf = buf[:n]
+
+	// Matroska (.mkv) — EBML header
+	if n >= 4 && buf[0] == 0x1a && buf[1] == 0x45 && buf[2] == 0xdf && buf[3] == 0xa3 {
+		return ".mkv"
+	}
+	// RAR archive
+	if n >= 7 && string(buf[:4]) == "Rar!" {
+		return ".rar"
+	}
+	// PAR2
+	if n >= 8 && string(buf[:4]) == "PAR2" {
+		return ".par2"
+	}
+	// MP4/M4V — ftyp box
+	if n >= 8 && string(buf[4:8]) == "ftyp" {
+		return ".mp4"
+	}
+	// AVI — RIFF
+	if n >= 4 && string(buf[:4]) == "RIFF" {
+		return ".avi"
+	}
+	return ""
+}
+
 // Process runs the full post-processing pipeline on a download directory.
-// Stages: PAR2 verify/repair -> RAR extract -> cleanup -> identify files
+// Stages: rename obfuscated -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
 func Process(dir string, log *slog.Logger) (*Result, error) {
 	result := &Result{}
+
+	// Stage 0: Rename obfuscated files by magic bytes.
+	if err := renameByMagic(dir, log); err != nil {
+		log.Warn("rename by magic failed", "error", err)
+	}
 
 	// Stage 1: PAR2 verify + repair
 	par2File, err := findPAR2File(dir)

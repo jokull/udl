@@ -49,16 +49,16 @@ var problematicChars = strings.NewReplacer(
 )
 
 // MoviePath returns the canonical path for a movie file.
-// Example: "Movies/Dune Part Two (2024)/Dune Part Two (2024) [WEBDL-1080p].mkv"
+// Example: "/library/movies/Dune Part Two (2024)/Dune Part Two (2024) [WEBDL-1080p].mkv"
 func MoviePath(root, title string, year int, q quality.Quality, ext string) string {
 	title = SanitizeTitle(title)
 	folder := fmt.Sprintf("%s (%d)", title, year)
 	filename := fmt.Sprintf("%s (%d) [%s]%s", title, year, q.String(), ext)
-	return filepath.Join(root, "Movies", folder, filename)
+	return filepath.Join(root, folder, filename)
 }
 
 // EpisodePath returns the canonical path for a TV episode file.
-// Example: "TV/Severance (2022)/Season 02/Severance - S02E01 - Hello, Ms. Cobel [WEBDL-1080p].mkv"
+// Example: "/library/tv/Severance (2022)/Season 02/Severance - S02E01 - Hello, Ms. Cobel [WEBDL-1080p].mkv"
 func EpisodePath(root, series string, year, season, episode int, epTitle string, q quality.Quality, ext string) string {
 	series = SanitizeTitle(series)
 	epTitle = SanitizeTitle(epTitle)
@@ -72,7 +72,7 @@ func EpisodePath(root, series string, year, season, episode int, epTitle string,
 		filename = fmt.Sprintf("%s - S%02dE%02d [%s]%s", series, season, episode, q.String(), ext)
 	}
 
-	return filepath.Join(root, "TV", seriesFolder, seasonFolder, filename)
+	return filepath.Join(root, seriesFolder, seasonFolder, filename)
 }
 
 // SubtitlePath returns the path for a subtitle file alongside its media file.

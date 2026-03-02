@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -103,6 +104,32 @@ var queueClearCmd = &cobra.Command{
 	RunE:  runQueueClear,
 }
 
+var queueRetryCmd = &cobra.Command{
+	Use:   "retry [id]",
+	Short: "Retry failed downloads (all or by ID)",
+	RunE:  runQueueRetry,
+}
+
+var movieRemoveCmd = &cobra.Command{
+	Use:   "remove [id|title]",
+	Short: "Remove a movie from monitoring (not from disk)",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runMovieRemove,
+}
+
+var tvRemoveCmd = &cobra.Command{
+	Use:   "remove [id|title]",
+	Short: "Remove a series from monitoring (not from disk)",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runTVRemove,
+}
+
+var tvRefreshCmd = &cobra.Command{
+	Use:   "refresh",
+	Short: "Refresh episode metadata from TMDB for all monitored series",
+	RunE:  runTVRefresh,
+}
+
 var historyCmd = &cobra.Command{
 	Use:   "history",
 	Short: "Show download history",
@@ -127,9 +154,9 @@ var configPathCmd = &cobra.Command{
 }
 
 func init() {
-	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd)
-	tvCmd.AddCommand(tvAddCmd, tvListCmd)
-	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd)
+	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieRemoveCmd)
+	tvCmd.AddCommand(tvAddCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd)
+	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
 	configCmd.AddCommand(configCheckCmd, configPathCmd)
 	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, historyCmd, configCmd)
 }
@@ -204,13 +231,11 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if reply.Running {
-		fmt.Println("daemon: running")
-	} else {
-		fmt.Println("daemon: stopped")
-	}
-	fmt.Printf("queue: %d items\n", reply.QueueSize)
-	fmt.Printf("downloading: %d active\n", reply.Downloading)
+	fmt.Println("daemon: running")
+	fmt.Printf("queue: %d items (%d downloading)\n", reply.QueueSize, reply.Downloading)
+	fmt.Printf("indexers: %d\n", reply.IndexerCount)
+	fmt.Printf("movies: %d  series: %d\n", reply.MovieCount, reply.SeriesCount)
+	fmt.Printf("library: %s (movies), %s (tv)\n", reply.LibraryMovies, reply.LibraryTV)
 	return nil
 }
 
@@ -436,15 +461,107 @@ func runHistory(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TYPE\tEVENT\tSOURCE\tTIME")
+	fmt.Fprintln(w, "TYPE\tTITLE\tEVENT\tQUALITY\tTIME")
 	for _, h := range reply.Events {
-		src := ""
-		if h.Source.Valid {
-			src = h.Source.String
+		q := ""
+		if h.Quality.Valid {
+			q = h.Quality.String
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", h.MediaType, h.Event, src, h.CreatedAt.Format("2006-01-02 15:04"))
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", h.MediaType, h.Title, h.Event, q, h.CreatedAt.Format("2006-01-02 15:04"))
 	}
 	return w.Flush()
+}
+
+func runMovieRemove(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	input := strings.Join(args, " ")
+	rpcArgs := &daemon.RemoveMovieArgs{}
+	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
+		rpcArgs.ID = id
+	} else {
+		rpcArgs.Title = input
+	}
+
+	var reply daemon.RemoveMovieReply
+	if err := client.Call("Service.RemoveMovie", rpcArgs, &reply); err != nil {
+		return err
+	}
+	fmt.Printf("removed: %s\n", reply.Title)
+	return nil
+}
+
+func runTVRemove(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	input := strings.Join(args, " ")
+	rpcArgs := &daemon.RemoveSeriesArgs{}
+	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
+		rpcArgs.ID = id
+	} else {
+		rpcArgs.Title = input
+	}
+
+	var reply daemon.RemoveSeriesReply
+	if err := client.Call("Service.RemoveSeries", rpcArgs, &reply); err != nil {
+		return err
+	}
+	fmt.Printf("removed: %s (and all episodes)\n", reply.Title)
+	return nil
+}
+
+func runTVRefresh(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	fmt.Println("refreshing series from TMDB...")
+	var reply daemon.RefreshSeriesReply
+	if err := client.Call("Service.RefreshSeries", &daemon.Empty{}, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("checked %d series, %d new episodes, %d marked ended\n",
+		reply.Checked, reply.NewEpisodes, reply.Ended)
+	return nil
+}
+
+func runQueueRetry(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.RetryDownloadArgs{}
+	if len(args) > 0 {
+		id, err := strconv.ParseInt(args[0], 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid download ID: %s", args[0])
+		}
+		rpcArgs.ID = id
+	}
+
+	var reply daemon.RetryDownloadReply
+	if err := client.Call("Service.RetryDownload", rpcArgs, &reply); err != nil {
+		return err
+	}
+	if reply.Count == 0 {
+		fmt.Println("no failed downloads to retry")
+	} else {
+		fmt.Printf("retried %d download(s)\n", reply.Count)
+	}
+	return nil
 }
 
 func runConfigCheck(cmd *cobra.Command, args []string) error {

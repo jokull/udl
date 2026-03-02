@@ -38,6 +38,7 @@ type Series struct {
 	IMDBID string
 	Title  string
 	Year   int
+	Status string // "Returning Series", "Ended", "Canceled", etc. from TMDB
 }
 
 // Episode represents a TV episode.
@@ -139,6 +140,7 @@ func (c *Client) GetSeries(tmdbID int) (*Series, error) {
 		IMDBID: extIDs.IMDbID,
 		Title:  details.Name,
 		Year:   parseYear(details.FirstAirDate),
+		Status: details.Status,
 	}, nil
 }
 
@@ -179,6 +181,17 @@ func (c *Client) GetAllEpisodes(tmdbID int) ([]Episode, error) {
 		allEpisodes = append(allEpisodes, eps...)
 	}
 	return allEpisodes, nil
+}
+
+// MapStatus maps a TMDB series status string to the UDL status.
+// "Ended" and "Canceled" map to "ended"; everything else maps to "monitored".
+func MapStatus(tmdbStatus string) string {
+	switch tmdbStatus {
+	case "Ended", "Canceled":
+		return "ended"
+	default:
+		return "monitored"
+	}
 }
 
 // parseYear extracts a 4-digit year from a date string like "2024-03-15".

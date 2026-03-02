@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jokull/udl/internal/config"
@@ -158,7 +159,13 @@ func (d *Downloader) ProcessOne(ctx context.Context, dl database.Download) error
 
 	_, err = d.engine.Download(ctx, parsed, downloadDir, progressFn)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("NNTP download: %v", err))
+		// Segment failures are expected — PAR2 can repair up to ~10-15% missing data.
+		// Only abort if no segments were downloaded at all.
+		if strings.Contains(err.Error(), "segments failed") {
+			d.log.Warn("some segments failed, proceeding to PAR2 repair", "id", dl.ID, "error", err)
+		} else {
+			return d.fail(dl.ID, fmt.Sprintf("NNTP download: %v", err))
+		}
 	}
 
 	// 6. Update status to "post_processing".
@@ -259,7 +266,12 @@ func (d *Downloader) ProcessOne(ctx context.Context, dl database.Download) error
 		d.log.Error("failed to update download to completed", "id", dl.ID, "error", err)
 	}
 
-	// 10. Cleanup: remove the download directory from incomplete.
+	// 10. Record history event.
+	if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "completed", dl.NzbName, q.String()); err != nil {
+		d.log.Error("failed to record history", "id", dl.ID, "error", err)
+	}
+
+	// 11. Cleanup: remove the download directory from incomplete.
 	if err := os.RemoveAll(downloadDir); err != nil {
 		d.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
 	}
@@ -268,10 +280,19 @@ func (d *Downloader) ProcessOne(ctx context.Context, dl database.Download) error
 	return nil
 }
 
-// fail marks the download as failed and returns an error.
+// fail marks the download as failed, records a history event, and returns an error.
 func (d *Downloader) fail(id int64, msg string) error {
 	if err := d.db.UpdateDownloadError(id, msg); err != nil {
 		d.log.Error("failed to update download error", "id", id, "error", err)
+	}
+	// Record failure in history. Best-effort: look up the download for metadata.
+	var dl database.Download
+	if err := d.db.QueryRow(
+		`SELECT category, media_id, title, nzb_name FROM downloads WHERE id = ?`, id,
+	).Scan(&dl.Category, &dl.MediaID, &dl.Title, &dl.NzbName); err == nil {
+		if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "failed", dl.NzbName, ""); err != nil {
+			d.log.Error("failed to record failure history", "id", id, "error", err)
+		}
 	}
 	return fmt.Errorf("download %d: %s", id, msg)
 }

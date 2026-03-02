@@ -99,7 +99,56 @@ type StatusReply struct {
 	Running      bool
 	QueueSize    int
 	Downloading  int
-	DownloadRate int64 // bytes per second, 0 for now
+	IndexerCount int
+	MovieCount   int
+	SeriesCount  int
+	LibraryMovies string
+	LibraryTV     string
+}
+
+// --- Remove types ---
+
+// RemoveMovieArgs contains arguments for the RemoveMovie RPC method.
+type RemoveMovieArgs struct {
+	ID    int64
+	Title string // used if ID is 0
+}
+
+// RemoveMovieReply contains the reply for the RemoveMovie RPC method.
+type RemoveMovieReply struct {
+	Title string
+}
+
+// RemoveSeriesArgs contains arguments for the RemoveSeries RPC method.
+type RemoveSeriesArgs struct {
+	ID    int64
+	Title string // used if ID is 0
+}
+
+// RemoveSeriesReply contains the reply for the RemoveSeries RPC method.
+type RemoveSeriesReply struct {
+	Title string
+}
+
+// --- Queue retry types ---
+
+// RetryDownloadArgs contains arguments for the RetryDownload RPC method.
+type RetryDownloadArgs struct {
+	ID int64 // 0 = retry all failed
+}
+
+// RetryDownloadReply contains the reply for the RetryDownload RPC method.
+type RetryDownloadReply struct {
+	Count int64
+}
+
+// --- Refresh types ---
+
+// RefreshSeriesReply contains the reply for the RefreshSeries RPC method.
+type RefreshSeriesReply struct {
+	Checked     int
+	NewEpisodes int
+	Ended       int
 }
 
 // --- RPC methods ---
@@ -343,15 +392,105 @@ func (s *Service) ResumeAll(args *Empty, reply *Empty) error {
 }
 
 // History returns download history events.
-// Currently returns an empty list.
 func (s *Service) History(args *Empty, reply *HistoryReply) error {
-	reply.Events = nil
+	events, err := s.db.ListHistory(50)
+	if err != nil {
+		return fmt.Errorf("History: %w", err)
+	}
+	reply.Events = events
 	return nil
 }
 
 // Status returns the current daemon status.
 func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	reply.Running = true
+
+	queued, downloading, err := s.db.QueueStats()
+	if err != nil {
+		s.log.Error("status: queue stats", "error", err)
+	}
+	reply.QueueSize = queued + downloading
+	reply.Downloading = downloading
+	reply.IndexerCount = len(s.cfg.Indexers)
+	reply.LibraryMovies = s.cfg.Library.Movies
+	reply.LibraryTV = s.cfg.Library.TV
+
+	// Count movies and series.
+	s.db.QueryRow(`SELECT COUNT(*) FROM movies`).Scan(&reply.MovieCount)
+	s.db.QueryRow(`SELECT COUNT(*) FROM series`).Scan(&reply.SeriesCount)
+
+	return nil
+}
+
+// RemoveMovie removes a movie from the database (not from disk).
+func (s *Service) RemoveMovie(args *RemoveMovieArgs, reply *RemoveMovieReply) error {
+	if args.ID > 0 {
+		movie, err := s.db.GetMovie(args.ID)
+		if err != nil {
+			return fmt.Errorf("RemoveMovie: %w", err)
+		}
+		reply.Title = movie.Title
+		return s.db.RemoveMovie(args.ID)
+	}
+	if args.Title != "" {
+		movie, err := s.db.FindMovieByTitle(args.Title)
+		if err != nil {
+			return fmt.Errorf("RemoveMovie: no movie matching %q", args.Title)
+		}
+		reply.Title = movie.Title
+		return s.db.RemoveMovie(movie.ID)
+	}
+	return fmt.Errorf("RemoveMovie: id or title required")
+}
+
+// RemoveSeries removes a series and its episodes from the database (not from disk).
+func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply) error {
+	if args.ID > 0 {
+		series, err := s.db.GetSeries(args.ID)
+		if err != nil {
+			return fmt.Errorf("RemoveSeries: %w", err)
+		}
+		reply.Title = series.Title
+		return s.db.RemoveSeries(args.ID)
+	}
+	if args.Title != "" {
+		series, err := s.db.FindSeriesByTitle(args.Title)
+		if err != nil {
+			return fmt.Errorf("RemoveSeries: no series matching %q", args.Title)
+		}
+		reply.Title = series.Title
+		return s.db.RemoveSeries(series.ID)
+	}
+	return fmt.Errorf("RemoveSeries: id or title required")
+}
+
+// RetryDownload resets failed downloads back to queued.
+func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadReply) error {
+	n, err := s.db.ResetFailedDownloads(args.ID)
+	if err != nil {
+		return fmt.Errorf("RetryDownload: %w", err)
+	}
+	reply.Count = n
+	s.log.Info("retried failed downloads", "count", n)
+	return nil
+}
+
+// RefreshSeries re-fetches episode metadata from TMDB for all monitored series.
+func (s *Service) RefreshSeries(args *Empty, reply *RefreshSeriesReply) error {
+	if s.tmdb == nil {
+		return fmt.Errorf("RefreshSeries: TMDB client not configured")
+	}
+
+	// Build a temporary scheduler with the TMDB client to reuse RefreshAllSeries.
+	sched := &Scheduler{
+		db:   s.db,
+		tmdb: s.tmdb,
+		log:  s.log,
+	}
+	result := sched.RefreshAllSeries()
+	reply.Checked = result.Checked
+	reply.NewEpisodes = result.NewEpisodes
+	reply.Ended = result.Ended
 	return nil
 }
 
@@ -409,8 +548,8 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	}
 	go server.Accept(ln)
 
-	// Start scheduler (RSS for TV + search sweep for movies).
-	sched := NewScheduler(cfg, db, indexers, log)
+	// Start scheduler (RSS for TV + search sweep for movies + TMDB refresh).
+	sched := NewScheduler(cfg, db, indexers, tc, log)
 	sched.Start(ctx)
 
 	// Start downloader (queue processing).

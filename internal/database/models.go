@@ -20,14 +20,15 @@ type Movie struct {
 
 // Series represents a TV series tracked by the system.
 type Series struct {
-	ID      int64
-	TmdbID  int
-	TvdbID  sql.NullInt64
-	ImdbID  sql.NullString
-	Title   string
-	Year    int
-	Status  string
-	AddedAt time.Time
+	ID              int64
+	TmdbID          int
+	TvdbID          sql.NullInt64
+	ImdbID          sql.NullString
+	Title           string
+	Year            int
+	Status          string
+	AddedAt         time.Time
+	LastRefreshedAt sql.NullTime
 }
 
 // Episode represents a single episode of a series.
@@ -77,6 +78,7 @@ type History struct {
 	ID        int64
 	MediaType string
 	MediaID   int64
+	Title     string
 	Event     string
 	Source    sql.NullString
 	Quality  sql.NullString

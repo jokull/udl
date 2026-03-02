@@ -147,6 +147,11 @@ func (s *Searcher) GrabBest(releases []ScoredRelease, category string, mediaID i
 			return false, fmt.Errorf("add download: %w", err)
 		}
 
+		// Record grab in history.
+		if err := s.db.AddHistory(category, mediaID, sr.Parsed.Title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
+			s.log.Error("failed to record grab history", "error", err)
+		}
+
 		s.log.Info("grabbed release",
 			"title", sr.Release.Title,
 			"quality", sr.Quality,
