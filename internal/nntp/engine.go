@@ -375,7 +375,7 @@ func (e *Engine) fetchFromPool(ctx context.Context, pool *Pool, messageID string
 		// 500KB-750KB of yEnc-encoded data, so this is fine.
 		var buf bytes.Buffer
 		if _, err := io.Copy(&buf, body); err != nil {
-			pool.Put(conn)
+			pool.Return(conn)
 			lastErr = fmt.Errorf("read body: %w", err)
 			continue // transient, retry
 		}
