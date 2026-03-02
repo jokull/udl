@@ -898,6 +898,38 @@ func (db *DB) AllEpisodeFilePaths() (map[string]int64, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Health stat queries
+// ---------------------------------------------------------------------------
+
+// FailedDownloadCount24h returns the count of downloads that failed in the last 24 hours.
+func (db *DB) FailedDownloadCount24h() (int, error) {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM downloads WHERE status = 'failed' AND created_at > datetime('now', '-24 hours')`,
+	).Scan(&count)
+	return count, err
+}
+
+// StuckDownloadCount returns the count of downloads stuck in "downloading" state for more than 2 hours.
+func (db *DB) StuckDownloadCount() (int, error) {
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM downloads
+		 WHERE status = 'downloading'
+		   AND started_at IS NOT NULL
+		   AND started_at < datetime('now', '-2 hours')`,
+	).Scan(&count)
+	return count, err
+}
+
+// BlocklistCount returns the total number of blocklist entries.
+func (db *DB) BlocklistCount() (int, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM blocklist`).Scan(&count)
+	return count, err
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

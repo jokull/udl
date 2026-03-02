@@ -148,6 +148,33 @@ func (p *Pool) Return(conn *Conn) {
 	}
 }
 
+// PoolStatus holds a read-only snapshot of a pool's health state.
+type PoolStatus struct {
+	Name             string
+	Active           int
+	MaxConnections   int
+	ConsecutiveFails int
+	InBackoff        bool
+	BackoffRemaining time.Duration
+}
+
+// Status returns a read-only snapshot of the pool's current health state.
+func (p *Pool) Status() PoolStatus {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ps := PoolStatus{
+		Name:             p.config.Name,
+		Active:           p.active,
+		MaxConnections:   p.config.Connections,
+		ConsecutiveFails: p.consecutiveFails,
+	}
+	if time.Now().Before(p.backoffUntil) {
+		ps.InBackoff = true
+		ps.BackoffRemaining = time.Until(p.backoffUntil)
+	}
+	return ps
+}
+
 // Close closes all idle connections in the pool.
 func (p *Pool) Close() {
 	close(p.conns)

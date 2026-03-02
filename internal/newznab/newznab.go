@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/text/encoding/charmap"
 )
@@ -82,6 +83,40 @@ func (c *Client) SearchMovieText(query string) ([]Release, error) {
 		"cat": {"2000"},
 	}
 	return c.query(params)
+}
+
+// Caps checks the indexer's capabilities endpoint (?t=caps).
+// Returns nil if the indexer is reachable and the API key is valid.
+func (c *Client) Caps() error {
+	params := url.Values{
+		"t":      {"caps"},
+		"apikey": {c.APIKey},
+	}
+	reqURL := c.URL + "/api?" + params.Encode()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(reqURL)
+	if err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+
+	// Check for Newznab API error response.
+	var apiErr nzbError
+	if decodeXML(body, &apiErr) == nil && apiErr.Code != 0 {
+		return fmt.Errorf("api error %d: %s", apiErr.Code, apiErr.Description)
+	}
+
+	return nil
 }
 
 // RSS fetches the latest releases.

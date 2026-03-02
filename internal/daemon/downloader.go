@@ -33,6 +33,11 @@ type DownloadEngine interface {
 	Close()
 }
 
+// PoolStatuser is optionally implemented by DownloadEngine to expose provider health.
+type PoolStatuser interface {
+	PoolStatuses() []nntp.PoolStatus
+}
+
 // Downloader picks items from the download queue and processes them.
 type Downloader struct {
 	cfg      *config.Config
@@ -563,6 +568,149 @@ func (d *Downloader) fail(id int64, msg string, cleanupDir ...string) error {
 		}
 	}
 	return fmt.Errorf("download %d: %s", id, msg)
+}
+
+// HealthChecks runs all diagnostic checks and returns the results.
+func (d *Downloader) HealthChecks() []HealthCheck {
+	var checks []HealthCheck
+
+	// a) NNTP providers — read pool state, no live dial.
+	if ps, ok := d.engine.(PoolStatuser); ok {
+		for _, s := range ps.PoolStatuses() {
+			name := "provider:" + s.Name
+			switch {
+			case s.ConsecutiveFails >= 5:
+				checks = append(checks, HealthCheck{
+					Name:    name,
+					Status:  "error",
+					Message: fmt.Sprintf("%d consecutive failures", s.ConsecutiveFails),
+				})
+			case s.InBackoff:
+				checks = append(checks, HealthCheck{
+					Name:    name,
+					Status:  "warning",
+					Message: fmt.Sprintf("backoff %s remaining", s.BackoffRemaining.Truncate(time.Second)),
+				})
+			default:
+				checks = append(checks, HealthCheck{
+					Name:    name,
+					Status:  "ok",
+					Message: fmt.Sprintf("%d conns, healthy", s.MaxConnections),
+				})
+			}
+		}
+	}
+
+	// b) Indexers — lightweight caps check with 5s timeout.
+	for _, idx := range d.indexers {
+		name := "indexer:" + idx.Name
+		if err := idx.Caps(); err != nil {
+			checks = append(checks, HealthCheck{
+				Name:    name,
+				Status:  "error",
+				Message: err.Error(),
+			})
+		} else {
+			checks = append(checks, HealthCheck{
+				Name:    name,
+				Status:  "ok",
+				Message: "reachable",
+			})
+		}
+	}
+
+	// c) Disk space on configured paths.
+	diskPaths := map[string]string{}
+	if d.cfg != nil {
+		if d.cfg.Library.Movies != "" {
+			diskPaths["disk:movies"] = d.cfg.Library.Movies
+		}
+		if d.cfg.Library.TV != "" {
+			diskPaths["disk:tv"] = d.cfg.Library.TV
+		}
+		if d.cfg.Paths.Incomplete != "" {
+			diskPaths["disk:downloads"] = d.cfg.Paths.Incomplete
+		}
+	}
+	for name, path := range diskPaths {
+		var stat unix.Statfs_t
+		if err := unix.Statfs(path, &stat); err != nil {
+			checks = append(checks, HealthCheck{
+				Name:    name,
+				Status:  "error",
+				Message: fmt.Sprintf("cannot stat: %v", err),
+			})
+			continue
+		}
+		availGB := float64(int64(stat.Bavail)*int64(stat.Bsize)) / (1 << 30)
+		switch {
+		case availGB < 2:
+			checks = append(checks, HealthCheck{
+				Name:    name,
+				Status:  "error",
+				Message: fmt.Sprintf("%.0f GB free", availGB),
+			})
+		case availGB < 10:
+			checks = append(checks, HealthCheck{
+				Name:    name,
+				Status:  "warning",
+				Message: fmt.Sprintf("%.0f GB free", availGB),
+			})
+		default:
+			checks = append(checks, HealthCheck{
+				Name:    name,
+				Status:  "ok",
+				Message: fmt.Sprintf("%.0f GB free", availGB),
+			})
+		}
+	}
+
+	// d) PAR2 availability.
+	if postprocess.HasPar2() {
+		checks = append(checks, HealthCheck{
+			Name:    "par2",
+			Status:  "ok",
+			Message: "par2cmdline installed",
+		})
+	} else {
+		checks = append(checks, HealthCheck{
+			Name:    "par2",
+			Status:  "warning",
+			Message: "par2cmdline not found — repair unavailable",
+		})
+	}
+
+	// e) Library paths accessible.
+	if d.cfg != nil {
+		for label, path := range map[string]string{
+			"path:movies": d.cfg.Library.Movies,
+			"path:tv":     d.cfg.Library.TV,
+		} {
+			if path == "" {
+				continue
+			}
+			if _, err := os.Stat(path); err != nil {
+				checks = append(checks, HealthCheck{
+					Name:    label,
+					Status:  "error",
+					Message: fmt.Sprintf("not accessible: %v", err),
+				})
+			}
+		}
+	}
+
+	// f) Stuck downloads.
+	if d.db != nil {
+		if stuck, err := d.db.StuckDownloadCount(); err == nil && stuck > 0 {
+			checks = append(checks, HealthCheck{
+				Name:    "stuck",
+				Status:  "warning",
+				Message: fmt.Sprintf("%d download(s) stuck > 2h", stuck),
+			})
+		}
+	}
+
+	return checks
 }
 
 // fetchNZB downloads the NZB file from the given URL using a plain HTTP GET.

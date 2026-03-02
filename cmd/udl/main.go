@@ -320,12 +320,59 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Detect terminal for color output.
+	isTTY := isTerminal()
+
 	fmt.Println("daemon: running")
 	fmt.Printf("queue: %d items (%d downloading)\n", reply.QueueSize, reply.Downloading)
-	fmt.Printf("indexers: %d\n", reply.IndexerCount)
-	fmt.Printf("movies: %d  series: %d\n", reply.MovieCount, reply.SeriesCount)
-	fmt.Printf("library: %s (movies), %s (tv)\n", reply.LibraryMovies, reply.LibraryTV)
+	fmt.Printf("indexers: %d   movies: %d   series: %d\n", reply.IndexerCount, reply.MovieCount, reply.SeriesCount)
+	fmt.Printf("library: %s, %s\n", reply.LibraryMovies, reply.LibraryTV)
+
+	if reply.FailedCount > 0 || reply.BlockedCount > 0 {
+		fmt.Printf("failed (24h): %d   blocklisted: %d\n", reply.FailedCount, reply.BlockedCount)
+	}
+
+	if len(reply.Checks) > 0 {
+		fmt.Println()
+		fmt.Println("health:")
+		for _, c := range reply.Checks {
+			sym, color := statusSymbol(c.Status, isTTY)
+			if isTTY && color != "" {
+				fmt.Printf("  %s%s %s%s — %s\n", color, sym, c.Name, ansiReset, c.Message)
+			} else {
+				fmt.Printf("  %s %s — %s\n", sym, c.Name, c.Message)
+			}
+		}
+	}
 	return nil
+}
+
+const (
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiRed    = "\033[31m"
+	ansiReset  = "\033[0m"
+)
+
+func statusSymbol(status string, color bool) (sym string, ansi string) {
+	switch status {
+	case "ok":
+		return "\u2713", ansiGreen
+	case "warning":
+		return "!", ansiYellow
+	case "error":
+		return "\u2717", ansiRed
+	default:
+		return "?", ""
+	}
+}
+
+func isTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 func runMovieAdd(cmd *cobra.Command, args []string) error {

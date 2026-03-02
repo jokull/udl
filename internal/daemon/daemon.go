@@ -27,6 +27,7 @@ type Service struct {
 	tmdb     *tmdb.Client
 	plex     *plex.Client // nil if Plex integration is disabled
 	searcher *Searcher
+	dl       *Downloader // nil until downloader starts; used for health checks
 	log      *slog.Logger
 }
 
@@ -113,16 +114,26 @@ type HistoryReply struct {
 	Events []database.History
 }
 
+// HealthCheck represents a single diagnostic check result.
+type HealthCheck struct {
+	Name    string // e.g. "provider:newshosting", "indexer:DOGnzb", "disk:movies", "par2"
+	Status  string // "ok", "warning", "error"
+	Message string // human-readable detail
+}
+
 // StatusReply contains the reply for the Status RPC method.
 type StatusReply struct {
-	Running      bool
-	QueueSize    int
-	Downloading  int
-	IndexerCount int
-	MovieCount   int
-	SeriesCount  int
+	Running       bool
+	QueueSize     int
+	Downloading   int
+	IndexerCount  int
+	MovieCount    int
+	SeriesCount   int
 	LibraryMovies string
 	LibraryTV     string
+	Checks        []HealthCheck
+	FailedCount   int // failed downloads in last 24h
+	BlockedCount  int // blocklist size
 }
 
 // --- Remove types ---
@@ -511,7 +522,7 @@ func (s *Service) History(args *Empty, reply *HistoryReply) error {
 	return nil
 }
 
-// Status returns the current daemon status.
+// Status returns the current daemon status including health diagnostics.
 func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	reply.Running = true
 
@@ -528,6 +539,17 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	// Count movies and series.
 	s.db.QueryRow(`SELECT COUNT(*) FROM movies`).Scan(&reply.MovieCount)
 	s.db.QueryRow(`SELECT COUNT(*) FROM series`).Scan(&reply.SeriesCount)
+
+	// Health checks.
+	if s.dl != nil {
+		reply.Checks = s.dl.HealthChecks()
+	}
+	if n, err := s.db.FailedDownloadCount24h(); err == nil {
+		reply.FailedCount = n
+	}
+	if n, err := s.db.BlocklistCount(); err == nil {
+		reply.BlockedCount = n
+	}
 
 	return nil
 }
@@ -866,8 +888,11 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 
 	log.Info("daemon listening", "socket", sockPath)
 
+	// Start downloader (queue processing) — created before RPC so status can access it.
+	dl := NewDownloader(cfg, db, log)
+
 	// Start RPC server.
-	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, searcher: searcher, log: log}
+	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, searcher: searcher, dl: dl, log: log}
 	server := rpc.NewServer()
 	if err := server.Register(svc); err != nil {
 		ln.Close()
@@ -884,8 +909,6 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 		log.Warn("par2cmdline not found -- PAR2 repair unavailable. Install: brew install par2cmdline")
 	}
 
-	// Start downloader (queue processing).
-	dl := NewDownloader(cfg, db, log)
 	dl.Start(ctx)
 
 	log.Info("daemon started",

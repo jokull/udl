@@ -66,6 +66,15 @@ func (e *Engine) Pools() []*Pool {
 	return e.pools
 }
 
+// PoolStatuses returns a health snapshot for every provider pool.
+func (e *Engine) PoolStatuses() []PoolStatus {
+	statuses := make([]PoolStatus, len(e.pools))
+	for i, p := range e.pools {
+		statuses[i] = p.Status()
+	}
+	return statuses
+}
+
 // segmentWork describes one segment to download.
 type segmentWork struct {
 	fileIndex    int
