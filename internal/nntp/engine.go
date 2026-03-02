@@ -87,10 +87,13 @@ var filenameRegex = regexp.MustCompile(`"([^"]+)"`)
 
 // extractFilename extracts the filename from an NZB subject line.
 // Falls back to "file_<index>" if no quoted filename is found.
+// Sanitizes the result to prevent path traversal.
 func extractFilename(subject string, index int) string {
 	matches := filenameRegex.FindStringSubmatch(subject)
 	if len(matches) >= 2 {
-		return matches[1]
+		// Use filepath.Base to prevent path traversal via crafted subjects
+		// like "../../etc/cron.d/evil".
+		return filepath.Base(matches[1])
 	}
 	return fmt.Sprintf("file_%d", index)
 }
@@ -150,28 +153,19 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 		}
 	}
 
-	// Pre-allocate output files using the total size from segment byte counts.
-	// We create the files now so workers can WriteAt concurrently.
-	for fi, file := range n.Files {
-		var totalSize int64
-		for _, seg := range file.Segments {
-			totalSize += int64(seg.Bytes)
-		}
-
+	// Create output files (no pre-allocation — final size is determined after
+	// yEnc decoding and tracked via fileMaxEnd below).
+	for fi := range n.Files {
 		f, err := os.Create(outputFiles[fi])
 		if err != nil {
 			return nil, fmt.Errorf("nntp: create file %s: %w", outputFiles[fi], err)
 		}
-		// Pre-allocate with estimated size. The actual yEnc decoded size
-		// may differ slightly, but this gives us a reasonable starting point.
-		if totalSize > 0 {
-			if err := f.Truncate(totalSize); err != nil {
-				f.Close()
-				return nil, fmt.Errorf("nntp: truncate file %s: %w", outputFiles[fi], err)
-			}
-		}
 		f.Close()
 	}
+
+	// Track the actual decoded end offset per file so we can truncate away
+	// any slack after all segments are written.
+	fileMaxEnd := make([]atomic.Int64, len(n.Files))
 
 	// Open all output files for concurrent WriteAt access.
 	openFiles := make([]*os.File, len(n.Files))
@@ -212,12 +206,24 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 			wg.Add(1)
 			go func(p *Pool) {
 				defer wg.Done()
-				e.worker(ctx, p, workCh, openFiles, &doneSegments, &failedSegments, &bytesDownloaded, reportProgress)
+				e.worker(ctx, p, workCh, openFiles, fileMaxEnd, &doneSegments, &failedSegments, &bytesDownloaded, reportProgress)
 			}(pool)
 		}
 	}
 
 	wg.Wait()
+
+	// Truncate each file to its actual decoded size (yEnc decoded data is
+	// smaller than the raw segment byte counts used for pre-allocation).
+	for fi, f := range openFiles {
+		end := fileMaxEnd[fi].Load()
+		if end > 0 {
+			if err := f.Truncate(end); err != nil {
+				e.log.Warn("truncate file to actual size failed",
+					"file", outputFiles[fi], "size", end, "error", err)
+			}
+		}
+	}
 
 	if failed := failedSegments.Load(); failed > 0 {
 		return outputFiles, fmt.Errorf("nntp: %d of %d segments failed", failed, totalSegments)
@@ -232,6 +238,7 @@ func (e *Engine) worker(
 	pool *Pool,
 	workCh <-chan segmentWork,
 	files []*os.File,
+	fileMaxEnd []atomic.Int64,
 	doneSegments, failedSegments *atomic.Int64,
 	bytesDownloaded *atomic.Int64,
 	reportProgress func(),
@@ -270,30 +277,28 @@ func (e *Engine) worker(
 
 		// Write data at the correct offset using DirectWrite.
 		f := files[w.fileIndex]
+		var offset int64
 		if result.Part != nil && result.Part.Begin > 0 {
 			// yEnc part offsets are 1-based, file offsets are 0-based.
-			offset := result.Part.Begin - 1
-			if _, err := f.WriteAt(result.Data, offset); err != nil {
-				e.log.Warn("write failed",
-					"message_id", w.messageID,
-					"offset", offset,
-					"error", err,
-				)
-				failedSegments.Add(1)
-				reportProgress()
-				continue
-			}
-		} else {
-			// No part info -- write at offset 0.
-			// This path handles single-part yEnc or missing part headers.
-			if _, err := f.WriteAt(result.Data, 0); err != nil {
-				e.log.Warn("write failed",
-					"message_id", w.messageID,
-					"error", err,
-				)
-				failedSegments.Add(1)
-				reportProgress()
-				continue
+			offset = result.Part.Begin - 1
+		}
+		if _, err := f.WriteAt(result.Data, offset); err != nil {
+			e.log.Warn("write failed",
+				"message_id", w.messageID,
+				"offset", offset,
+				"error", err,
+			)
+			failedSegments.Add(1)
+			reportProgress()
+			continue
+		}
+
+		// Track the furthest byte written so Download() can truncate to actual size.
+		end := offset + int64(len(result.Data))
+		for {
+			cur := fileMaxEnd[w.fileIndex].Load()
+			if end <= cur || fileMaxEnd[w.fileIndex].CompareAndSwap(cur, end) {
+				break
 			}
 		}
 

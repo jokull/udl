@@ -901,7 +901,8 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	go server.Accept(ln)
 
 	// Start scheduler (episode search + movie search sweep + TMDB refresh).
-	sched := NewScheduler(cfg, db, indexers, tc, plexClient, log)
+	// Share the same searcher instance to prevent duplicate indexer queries.
+	sched := NewScheduler(cfg, db, searcher, tc, plexClient, log)
 	sched.Start(ctx)
 
 	// Check for par2cmdline availability.

@@ -92,6 +92,10 @@ func (c *Conn) Auth(username, password string) error {
 
 const bodyTimeout = 60 * time.Second
 
+// maxBodySize is the maximum size of a single NNTP article body.
+// yEnc segments are typically 500KB-750KB; 2MB provides ample headroom.
+const maxBodySize = 2 * 1024 * 1024
+
 // Body fetches the body of an article by message ID.
 // Returns the raw body as an io.Reader. The caller must read fully before
 // issuing the next command on this connection.
@@ -142,6 +146,10 @@ func (c *Conn) Body(messageID string) (io.Reader, error) {
 
 		buf.WriteString(trimmed)
 		buf.WriteByte('\n')
+
+		if buf.Len() > maxBodySize {
+			return nil, fmt.Errorf("nntp: body exceeds %d bytes limit", maxBodySize)
+		}
 	}
 
 	return &buf, nil

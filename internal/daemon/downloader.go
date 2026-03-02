@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -46,6 +47,7 @@ type Downloader struct {
 	indexers []*newznab.Client
 	log      *slog.Logger
 	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 // NewDownloader creates a downloader with NNTP engine initialized from config providers.
@@ -125,10 +127,12 @@ func (d *Downloader) Start(ctx context.Context) {
 	}()
 }
 
-// Stop signals the downloader to stop.
+// Stop signals the downloader to stop. Safe to call multiple times.
 func (d *Downloader) Stop() {
-	close(d.stop)
-	d.engine.Close()
+	d.stopOnce.Do(func() {
+		close(d.stop)
+		d.engine.Close()
+	})
 }
 
 // checkDiskSpace verifies that there's enough free space at path for the download.

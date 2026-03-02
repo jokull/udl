@@ -279,15 +279,6 @@ func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, er
 			continue
 		}
 
-		active, err := s.db.HasActiveDownload(ctx.Category, ctx.MediaID)
-		if err != nil {
-			return false, fmt.Errorf("check active download: %w", err)
-		}
-		if active {
-			s.log.Debug("already downloading", "title", sr.Release.Title, "category", ctx.Category)
-			return false, nil
-		}
-
 		// Check if a Plex friend already has this — download from them instead.
 		if s.plex != nil {
 			plexGrabbed, plexErr := s.grabFromPlex(ctx)
@@ -299,9 +290,15 @@ func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, er
 			}
 		}
 
-		dlID, err := s.db.AddDownload(sr.Release.Link, sr.Release.Title, sr.Parsed.Title, ctx.Category, ctx.MediaID, sr.Release.Size)
+		// Atomically check for active download and insert in a single transaction
+		// to prevent duplicate downloads from concurrent scheduler/RPC calls.
+		dlID, inserted, err := s.db.AddDownloadIfNoActive(sr.Release.Link, sr.Release.Title, sr.Parsed.Title, ctx.Category, ctx.MediaID, sr.Release.Size, "usenet")
 		if err != nil {
 			return false, fmt.Errorf("add download: %w", err)
+		}
+		if !inserted {
+			s.log.Debug("already downloading", "title", sr.Release.Title, "category", ctx.Category)
+			return false, nil
 		}
 
 		// Record grab in history.

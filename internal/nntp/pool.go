@@ -179,7 +179,9 @@ func (p *Pool) Status() PoolStatus {
 func (p *Pool) Close() {
 	close(p.conns)
 	for c := range p.conns {
-		c.Close()
+		if c != nil {
+			c.Close()
+		}
 	}
 }
 

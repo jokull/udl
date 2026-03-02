@@ -17,22 +17,22 @@ type DB struct {
 // foreign keys, and runs schema migrations. Use ":memory:" for an in-memory
 // database suitable for tests.
 func Open(path string) (*DB, error) {
-	sqlDB, err := sql.Open("sqlite", path)
+	// Use _pragma DSN parameters so every pooled connection gets foreign_keys=ON.
+	// WAL mode is per-database (persistent), but we set it here too for first open.
+	dsn := path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
+	if path == ":memory:" {
+		dsn = ":memory:?_pragma=foreign_keys(1)"
+	}
+
+	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	// Enable WAL mode for better concurrent read performance.
-	if _, err := sqlDB.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("enable WAL mode: %w", err)
-	}
-
-	// Enable foreign key constraint enforcement.
-	if _, err := sqlDB.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		sqlDB.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
-	}
+	// Serialize all access through a single connection to avoid SQLite BUSY errors.
+	// SQLite only allows one writer at a time; with unlimited pool connections,
+	// concurrent goroutines cause "database is locked" errors.
+	sqlDB.SetMaxOpenConns(1)
 
 	db := &DB{sqlDB}
 
@@ -456,6 +456,41 @@ func (db *DB) HasActiveDownload(category string, mediaID int64) (bool, error) {
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// AddDownloadIfNoActive atomically checks for an active download and inserts
+// a new one in a single transaction. Returns (id, true, nil) if a download was
+// inserted, or (0, false, nil) if there was already an active download.
+// This prevents the TOCTOU race between HasActiveDownload + AddDownload.
+func (db *DB) AddDownloadIfNoActive(dlURL, name, title, category string, mediaID int64, sizeBytes int64, source string) (int64, bool, error) {
+	var id int64
+	var inserted bool
+	err := db.WithTx(func(tx *sql.Tx) error {
+		var count int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM downloads WHERE category = ? AND media_id = ? AND status IN ('queued', 'downloading')`,
+			category, mediaID,
+		).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return nil // already active
+		}
+		res, err := tx.Exec(
+			`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, size_bytes, source) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			dlURL, name, title, category, mediaID, sizeBytes, source,
+		)
+		if err != nil {
+			return err
+		}
+		id, err = res.LastInsertId()
+		if err != nil {
+			return err
+		}
+		inserted = true
+		return nil
+	})
+	return id, inserted, err
 }
 
 // WithTx executes fn within a database transaction.

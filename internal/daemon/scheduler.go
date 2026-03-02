@@ -3,11 +3,11 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
-	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/tmdb"
 )
@@ -17,21 +17,20 @@ type Scheduler struct {
 	cfg      *config.Config
 	db       *database.DB
 	log      *slog.Logger
-	indexers []*newznab.Client
 	searcher *Searcher
 	tmdb     *tmdb.Client
 	plex     *plex.Client // nil if Plex integration is disabled
 	stop     chan struct{}
+	stopOnce sync.Once
 }
 
-// NewScheduler creates a scheduler from config.
-func NewScheduler(cfg *config.Config, db *database.DB, indexers []*newznab.Client, tc *tmdb.Client, plexClient *plex.Client, log *slog.Logger) *Scheduler {
-	searcher := NewSearcher(cfg, db, indexers, plexClient, log)
+// NewScheduler creates a scheduler from config. The searcher is shared with the
+// RPC Service to avoid duplicate indexer queries from concurrent operations.
+func NewScheduler(cfg *config.Config, db *database.DB, searcher *Searcher, tc *tmdb.Client, plexClient *plex.Client, log *slog.Logger) *Scheduler {
 	return &Scheduler{
 		cfg:      cfg,
 		db:       db,
 		log:      log,
-		indexers: indexers,
 		searcher: searcher,
 		tmdb:     tc,
 		plex:     plexClient,
@@ -46,9 +45,11 @@ func (s *Scheduler) Start(ctx context.Context) {
 	go s.refreshLoop(ctx)
 }
 
-// Stop signals the scheduler to stop.
+// Stop signals the scheduler to stop. Safe to call multiple times.
 func (s *Scheduler) Stop() {
-	close(s.stop)
+	s.stopOnce.Do(func() {
+		close(s.stop)
+	})
 }
 
 // episodeSearchLoop searches for TV episodes based on air date scheduling.

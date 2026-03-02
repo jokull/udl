@@ -21,7 +21,9 @@ type Client struct {
 	token      string
 	httpClient *http.Client
 	servers    []Server
-	mu         sync.Mutex
+	serversErr error
+	serversOnce sync.Once
+	mu         sync.Mutex // protects episodeCache only
 
 	// episodeCache stores series episode data keyed by "serverURI|seriesTitle"
 	// to avoid repeating the 3-call chain for multiple episodes of the same show.
@@ -92,15 +94,16 @@ func MapResolution(res string) quality.Quality {
 }
 
 // DiscoverServers fetches shared (non-owned) Plex servers from plex.tv.
-// Results are cached for the lifetime of the Client.
+// Results are cached for the lifetime of the Client. Safe for concurrent use.
 func (c *Client) DiscoverServers() ([]Server, error) {
-	c.mu.Lock()
-	if c.servers != nil {
-		defer c.mu.Unlock()
-		return c.servers, nil
-	}
-	c.mu.Unlock()
+	c.serversOnce.Do(func() {
+		c.servers, c.serversErr = c.discoverServersInternal()
+	})
+	return c.servers, c.serversErr
+}
 
+// discoverServersInternal performs the actual HTTP fetch for server discovery.
+func (c *Client) discoverServersInternal() ([]Server, error) {
 	req, err := http.NewRequest("GET", "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1", nil)
 	if err != nil {
 		return nil, fmt.Errorf("plex: build request: %w", err)
@@ -144,10 +147,6 @@ func (c *Client) DiscoverServers() ([]Server, error) {
 			Owned:       r.Owned,
 		})
 	}
-
-	c.mu.Lock()
-	c.servers = servers
-	c.mu.Unlock()
 
 	return servers, nil
 }
@@ -439,8 +438,6 @@ func (c *Client) ClearEpisodeCache() {
 
 // Servers returns the cached server list (empty if DiscoverServers hasn't been called).
 func (c *Client) Servers() []Server {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	return c.servers
 }
 
