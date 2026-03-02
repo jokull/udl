@@ -631,6 +631,9 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 			keys = append(keys, k)
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("RetryDownload: iterate rows: %w", err)
+		}
 
 		res, err := s.db.Exec(`DELETE FROM downloads WHERE status = 'failed'`)
 		if err != nil {

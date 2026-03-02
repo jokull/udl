@@ -273,7 +273,9 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	os.MkdirAll(dataDir, 0755)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("create data directory: %w", err)
+	}
 
 	dbPath := filepath.Join(dataDir, "udl.db")
 	db, err := database.Open(dbPath)
@@ -295,12 +297,16 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
-		log.Info("received signal, shutting down", "signal", sig)
+		log.Info("received signal, shutting down gracefully", "signal", sig)
 		cancel()
+		// Second signal forces immediate exit.
+		sig = <-sigCh
+		log.Error("received second signal, forcing exit", "signal", sig)
+		os.Exit(1)
 	}()
 
 	return daemon.ServeWithContext(ctx, cfg, db, log)

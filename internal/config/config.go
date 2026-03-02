@@ -159,6 +159,14 @@ func LoadFrom(path string) (*Config, error) {
 		cfg.Prefs.UpgradeUntil = quality.Parse(cfg.Quality.UpgradeUntil)
 	}
 
+	// Default to the "1080p" profile if no quality settings were specified at all,
+	// so ShouldGrab() doesn't silently reject everything.
+	if cfg.Quality.Profile == "" && cfg.Quality.Min == "" && cfg.Quality.Preferred == "" && cfg.Quality.UpgradeUntil == "" {
+		if prof, ok := quality.LookupProfile("1080p"); ok {
+			cfg.Prefs = prof.Prefs
+		}
+	}
+
 	// Plex token: fall back to PLEX_TOKEN env var if not in config.
 	if cfg.Plex.Token == "" {
 		cfg.Plex.Token = os.Getenv("PLEX_TOKEN")

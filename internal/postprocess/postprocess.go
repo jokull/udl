@@ -266,16 +266,21 @@ func findPAR2File(dir string) (string, error) {
 
 // par2Verify runs par2 verify on a PAR2 file.
 // Returns needsRepair=true if exit code is 1 (repairable).
+// Exit code 2 means damage is irreparable (not enough recovery data).
 func par2Verify(par2File string, log *slog.Logger) (needsRepair bool, err error) {
 	cmd := exec.Command("par2", "verify", par2File)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 1 {
+			switch exitErr.ExitCode() {
+			case 1:
 				log.Info("par2 verify: files need repair", "output", string(output))
 				return true, nil
+			case 2:
+				return false, fmt.Errorf("par2 verify: damage is irreparable (insufficient recovery data): %s", string(output))
+			default:
+				return false, fmt.Errorf("par2 verify failed (exit code %d): %s", exitErr.ExitCode(), string(output))
 			}
-			return false, fmt.Errorf("par2 verify failed (exit code %d): %s", exitErr.ExitCode(), string(output))
 		}
 		return false, fmt.Errorf("par2 verify command error: %w", err)
 	}

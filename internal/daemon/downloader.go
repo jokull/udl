@@ -99,8 +99,9 @@ func NewDownloaderWithEngine(cfg *config.Config, db *database.DB, engine Downloa
 // Polls the database for queued downloads every few seconds.
 // On startup, resets any downloads stuck in 'downloading' from a previous run.
 func (d *Downloader) Start(ctx context.Context) {
-	// Reset stale downloads from previous daemon runs.
-	if _, err := d.db.Exec(`UPDATE downloads SET status = 'queued' WHERE status = 'downloading'`); err != nil {
+	// Reset stale downloads from previous daemon runs (including post_processing
+	// which can get stuck if the daemon crashes mid-pipeline).
+	if _, err := d.db.Exec(`UPDATE downloads SET status = 'queued' WHERE status IN ('downloading', 'post_processing')`); err != nil {
 		d.log.Error("failed to reset stale downloads", "error", err)
 	}
 
@@ -219,10 +220,10 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 		}
 	}
 
-	dlURL := dl.NzbURL.String
-	if dlURL == "" {
+	if !dl.NzbURL.Valid || dl.NzbURL.String == "" {
 		return d.fail(dl.ID, "plex download has no URL")
 	}
+	dlURL := dl.NzbURL.String
 
 	// Create a temporary file for the download.
 	downloadDir := filepath.Join(d.cfg.Paths.Incomplete, fmt.Sprintf("plex-%d", dl.ID))
@@ -236,7 +237,8 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 		return d.fail(dl.ID, fmt.Sprintf("create request: %v", err), downloadDir)
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	plexHTTP := &http.Client{Timeout: 30 * time.Minute} // large files
+	resp, err := plexHTTP.Do(req)
 	if err != nil {
 		return d.fail(dl.ID, fmt.Sprintf("plex download: %v", err), downloadDir)
 	}
@@ -384,10 +386,10 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 	}
 
 	// 3. Fetch NZB bytes from the download's nzb_url.
-	nzbURL := dl.NzbURL.String
-	if nzbURL == "" {
+	if !dl.NzbURL.Valid || dl.NzbURL.String == "" {
 		return d.fail(dl.ID, "download has no NZB URL")
 	}
+	nzbURL := dl.NzbURL.String
 
 	nzbData, err := d.fetchNZB(nzbURL)
 	if err != nil {
@@ -717,21 +719,24 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 	return checks
 }
 
-// fetchNZB downloads the NZB file from the given URL using a plain HTTP GET.
+// fetchNZB downloads the NZB file from the given URL.
+// Uses a 30s timeout and limits response to 50MB to prevent resource exhaustion.
 func (d *Downloader) fetchNZB(nzbURL string) ([]byte, error) {
-	resp, err := http.Get(nzbURL)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(nzbURL)
 	if err != nil {
-		return nil, fmt.Errorf("fetch %s: %w", nzbURL, err)
+		return nil, fmt.Errorf("fetch NZB: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch %s: HTTP %d", nzbURL, resp.StatusCode)
+		return nil, fmt.Errorf("fetch NZB: HTTP %d", resp.StatusCode)
 	}
 
-	var buf bytes.Buffer
-	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		return nil, fmt.Errorf("read body from %s: %w", nzbURL, err)
+	const maxNZBSize = 50 * 1024 * 1024 // 50MB
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxNZBSize))
+	if err != nil {
+		return nil, fmt.Errorf("read NZB body: %w", err)
 	}
-	return buf.Bytes(), nil
+	return data, nil
 }

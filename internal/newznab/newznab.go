@@ -14,12 +14,29 @@ import (
 	"golang.org/x/text/encoding/charmap"
 )
 
+// maxResponseSize limits indexer response bodies to 10MB.
+const maxResponseSize = 10 * 1024 * 1024
+
 // Client talks to a single Newznab-compatible indexer.
 type Client struct {
 	Name   string
 	URL    string // base URL like "https://api.nzbgeek.info"
 	APIKey string
 	http   *http.Client
+}
+
+// sanitizeURL removes the apikey parameter from a URL for safe logging.
+func sanitizeURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	if q.Has("apikey") {
+		q.Set("apikey", "***")
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 // New creates a new Newznab client.
@@ -105,7 +122,7 @@ func (c *Client) Caps() error {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return fmt.Errorf("read response: %w", err)
 	}
@@ -137,15 +154,15 @@ func (c *Client) DownloadNZB(release Release) ([]byte, error) {
 
 	resp, err := c.http.Get(dlURL)
 	if err != nil {
-		return nil, fmt.Errorf("newznab: download %s: %w", dlURL, err)
+		return nil, fmt.Errorf("newznab: download %s: %w", sanitizeURL(dlURL), err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("newznab: download %s: status %d", dlURL, resp.StatusCode)
+		return nil, fmt.Errorf("newznab: download %s: status %d", sanitizeURL(dlURL), resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("newznab: read body: %w", err)
 	}
@@ -160,15 +177,15 @@ func (c *Client) query(params url.Values) ([]Release, error) {
 
 	resp, err := c.http.Get(reqURL)
 	if err != nil {
-		return nil, fmt.Errorf("newznab: request %s: %w", reqURL, err)
+		return nil, fmt.Errorf("newznab: request %s: %w", sanitizeURL(reqURL), err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("newznab: %s returned status %d", reqURL, resp.StatusCode)
+		return nil, fmt.Errorf("newznab: %s returned status %d", sanitizeURL(reqURL), resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("newznab: read response: %w", err)
 	}

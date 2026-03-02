@@ -133,6 +133,12 @@ CREATE TABLE IF NOT EXISTS blocklist (
 		return err
 	}
 
+	// Indexes for frequently-queried columns.
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_blocklist_lookup ON blocklist(media_type, media_id, release_title)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_history_lookup ON history(media_type, media_id, event)`)
+
 	// Add tvdb_id to series if migrating from older schema.
 	db.Exec("ALTER TABLE series ADD COLUMN tvdb_id INTEGER")
 
@@ -736,21 +742,24 @@ func (db *DB) RemoveMovie(id int64) error {
 }
 
 // RemoveSeries deletes a series and all its episodes from the database by ID.
-// Does not remove files from disk.
+// Does not remove files from disk. Uses a transaction to avoid orphan episodes
+// if the series DELETE fails.
 func (db *DB) RemoveSeries(id int64) error {
-	// Delete episodes first (foreign key would block otherwise).
-	if _, err := db.Exec(`DELETE FROM episodes WHERE series_id = ?`, id); err != nil {
-		return fmt.Errorf("delete episodes: %w", err)
-	}
-	res, err := db.Exec(`DELETE FROM series WHERE id = ?`, id)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("series %d not found", id)
-	}
-	return nil
+	return db.WithTx(func(tx *sql.Tx) error {
+		// Delete episodes first (foreign key would block otherwise).
+		if _, err := tx.Exec(`DELETE FROM episodes WHERE series_id = ?`, id); err != nil {
+			return fmt.Errorf("delete episodes: %w", err)
+		}
+		res, err := tx.Exec(`DELETE FROM series WHERE id = ?`, id)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return fmt.Errorf("series %d not found", id)
+		}
+		return nil
+	})
 }
 
 // FindMovieByTitle returns the first movie whose title matches (case-insensitive).
@@ -817,7 +826,7 @@ func (db *DB) RecentDownloads(hours int) ([]Download, error) {
 		hours = 24
 	}
 	rows, err := db.Query(
-		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at
+		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
 		 FROM downloads WHERE status IN ('completed', 'failed') AND created_at > datetime('now', ? || ' hours')
 		 ORDER BY created_at DESC`,
 		fmt.Sprintf("-%d", hours),
@@ -832,7 +841,7 @@ func (db *DB) RecentDownloads(hours int) ([]Download, error) {
 		var d Download
 		if err := rows.Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
 			&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
-			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt); err != nil {
+			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source); err != nil {
 			return nil, err
 		}
 		downloads = append(downloads, d)

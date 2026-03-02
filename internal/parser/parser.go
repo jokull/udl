@@ -31,6 +31,9 @@ var (
 	// Alternate format: 1x05
 	altSEPattern = regexp.MustCompile(`(?i)\b(\d{1,2})[xX](\d{2,3})\b`)
 
+	// Quick check: S01E pattern (used to distinguish season packs from S01E01)
+	seQuickPattern = regexp.MustCompile(`(?i)[Ss]\d{1,2}[Ee]`)
+
 	// Year: (19|20)xx — four-digit year not preceded by S/E/x digits
 	yearPattern = regexp.MustCompile(`\b((?:19|20)\d{2})\b`)
 
@@ -97,7 +100,7 @@ func Parse(title string) Result {
 	} else if m := spPattern.FindStringSubmatchIndex(title); m != nil {
 		// Check this is truly a season pack (S01 not followed by E)
 		full := title[m[0]:m[1]]
-		if !regexp.MustCompile(`(?i)[Ss]\d{1,2}[Ee]`).MatchString(full) {
+		if !seQuickPattern.MatchString(full) {
 			r.Season = mustInt(title[m[2]:m[3]])
 			r.Episode = -1
 			r.IsTV = true
