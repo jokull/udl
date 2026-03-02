@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"regexp"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/parser"
+	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
@@ -23,12 +25,13 @@ type Scheduler struct {
 	indexers []*newznab.Client
 	searcher *Searcher
 	tmdb     *tmdb.Client
+	plex     *plex.Client // nil if Plex integration is disabled
 	stop     chan struct{}
 }
 
 // NewScheduler creates a scheduler from config.
-func NewScheduler(cfg *config.Config, db *database.DB, indexers []*newznab.Client, tc *tmdb.Client, log *slog.Logger) *Scheduler {
-	searcher := NewSearcher(cfg, db, indexers, log)
+func NewScheduler(cfg *config.Config, db *database.DB, indexers []*newznab.Client, tc *tmdb.Client, plexClient *plex.Client, log *slog.Logger) *Scheduler {
+	searcher := NewSearcher(cfg, db, indexers, plexClient, log)
 	return &Scheduler{
 		cfg:      cfg,
 		db:       db,
@@ -36,6 +39,7 @@ func NewScheduler(cfg *config.Config, db *database.DB, indexers []*newznab.Clien
 		indexers: indexers,
 		searcher: searcher,
 		tmdb:     tc,
+		plex:     plexClient,
 		stop:     make(chan struct{}),
 	}
 }
@@ -117,6 +121,10 @@ func (s *Scheduler) searchLoop(ctx context.Context) {
 
 // runSearchSweep searches indexers for all wanted movies and episodes.
 func (s *Scheduler) runSearchSweep() {
+	// Clear Plex episode cache so fresh data is fetched each sweep.
+	if s.plex != nil {
+		s.plex.ClearEpisodeCache()
+	}
 	if err := s.searcher.SearchWantedMovies(); err != nil {
 		s.log.Error("search sweep: movies failed", "error", err)
 	}
@@ -166,6 +174,35 @@ func (s *Scheduler) RunRSSSync() error {
 			}
 			if active {
 				continue
+			}
+
+			// Check if a Plex friend has this episode — download from them.
+			if s.plex != nil {
+				found, match, plexErr := s.plex.HasEpisode(parsed.Title, parsed.Season, parsed.Episode, s.cfg.Prefs.Min)
+				if plexErr != nil {
+					s.log.Debug("rss sync: plex check failed", "title", release.Title, "error", plexErr)
+				} else if found && match != nil {
+					info, infoErr := s.plex.GetDownloadInfo(*match)
+					if infoErr != nil {
+						s.log.Debug("rss sync: plex download info failed", "error", infoErr)
+					} else {
+						sourceName := fmt.Sprintf("plex:%s", match.ServerName)
+						dlID, addErr := s.db.AddDownloadWithSource(
+							info.URL, sourceName, parsed.Title, "episode", mediaID, info.Size, "plex",
+						)
+						if addErr != nil {
+							s.log.Error("rss sync: add plex download failed", "error", addErr)
+						} else {
+							s.log.Info("rss sync: grabbed from plex friend",
+								"title", release.Title,
+								"server", match.ServerName,
+								"quality", match.Quality,
+								"download_id", dlID,
+							)
+							continue
+						}
+					}
+				}
 			}
 
 			// Create download entry.

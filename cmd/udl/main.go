@@ -130,10 +130,48 @@ var tvRefreshCmd = &cobra.Command{
 	RunE:  runTVRefresh,
 }
 
+var plexCmd = &cobra.Command{
+	Use:   "plex",
+	Short: "Plex friends integration",
+}
+
+var plexServersCmd = &cobra.Command{
+	Use:   "servers",
+	Short: "List shared Plex servers from friends",
+	RunE:  runPlexServers,
+}
+
+var plexCheckCmd = &cobra.Command{
+	Use:   "check [title] [year]",
+	Short: "Check if a movie or show is available on friends' Plex servers",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runPlexCheck,
+}
+
 var historyCmd = &cobra.Command{
 	Use:   "history",
 	Short: "Show download history",
 	RunE:  runHistory,
+}
+
+var libraryCmd = &cobra.Command{
+	Use:   "library",
+	Short: "Library management",
+}
+
+var libraryImportCmd = &cobra.Command{
+	Use:   "import [dir]",
+	Short: "Scan a directory, identify media via TMDB, and import to library",
+	Long:  "Dry-run by default. Use --execute to actually move files and update the database.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runLibraryImport,
+}
+
+var libraryCleanupCmd = &cobra.Command{
+	Use:   "cleanup",
+	Short: "Scan library for orphan files and misnamed tracked files",
+	Long:  "Dry-run by default. Use --rename --execute to fix misnamed files.",
+	RunE:  runLibraryCleanup,
 }
 
 var configCmd = &cobra.Command{
@@ -157,8 +195,15 @@ func init() {
 	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieRemoveCmd)
 	tvCmd.AddCommand(tvAddCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd)
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
+	plexCmd.AddCommand(plexServersCmd, plexCheckCmd)
 	configCmd.AddCommand(configCheckCmd, configPathCmd)
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, historyCmd, configCmd)
+
+	libraryImportCmd.Flags().Bool("execute", false, "Actually import files (default is dry-run)")
+	libraryCleanupCmd.Flags().Bool("execute", false, "Actually rename files (default is dry-run)")
+	libraryCleanupCmd.Flags().Bool("rename", false, "Fix misnamed files (requires --execute to apply)")
+	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd)
+
+	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, libraryCmd, configCmd)
 }
 
 func main() {
@@ -561,6 +606,167 @@ func runQueueRetry(cmd *cobra.Command, args []string) error {
 	} else {
 		fmt.Printf("retried %d download(s)\n", reply.Count)
 	}
+	return nil
+}
+
+func runPlexServers(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.PlexServersReply
+	if err := client.Call("Service.PlexServers", &daemon.Empty{}, &reply); err != nil {
+		return err
+	}
+
+	if !reply.Enabled {
+		fmt.Println("plex integration not configured (set plex.token in config or PLEX_TOKEN env var)")
+		return nil
+	}
+
+	if len(reply.Servers) == 0 {
+		fmt.Println("no shared servers found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tURI")
+	for _, s := range reply.Servers {
+		fmt.Fprintf(w, "%s\t%s\n", s.Name, s.URI)
+	}
+	return w.Flush()
+}
+
+func runPlexCheck(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	title := args[0]
+	year := 0
+	if len(args) > 1 {
+		if y, err := strconv.Atoi(args[1]); err == nil {
+			year = y
+		}
+	}
+
+	rpcArgs := &daemon.PlexCheckArgs{Title: title, Year: year}
+	var reply daemon.PlexCheckReply
+	if err := client.Call("Service.PlexCheck", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Matches) == 0 {
+		fmt.Printf("not found on any friend's server: %s", title)
+		if year > 0 {
+			fmt.Printf(" (%d)", year)
+		}
+		fmt.Println()
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERVER\tTITLE\tYEAR\tRESOLUTION\tQUALITY")
+	for _, m := range reply.Matches {
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", m.ServerName, m.Title, m.Year, m.Resolution, m.Quality)
+	}
+	return w.Flush()
+}
+
+func runLibraryImport(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	execute, _ := cmd.Flags().GetBool("execute")
+
+	rpcArgs := &daemon.LibraryImportArgs{
+		Dir:     args[0],
+		Execute: execute,
+	}
+	var reply daemon.LibraryImportReply
+	if err := client.Call("Service.LibraryImport", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("scanned %d media files\n\n", reply.Scanned)
+
+	if len(reply.Actions) > 0 {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ACTION\tTYPE\tTITLE\tQUALITY\tPATH")
+		for _, a := range reply.Actions {
+			dest := a.DestPath
+			if dest == "" {
+				dest = a.Reason
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", a.Action, a.MediaType, a.Title, a.Quality, dest)
+		}
+		w.Flush()
+		fmt.Println()
+	}
+
+	if len(reply.Errors) > 0 {
+		fmt.Printf("errors:\n")
+		for _, e := range reply.Errors {
+			fmt.Printf("  %s\n", e)
+		}
+		fmt.Println()
+	}
+
+	mode := "dry-run: use --execute to perform"
+	if execute {
+		mode = "executed"
+	}
+	fmt.Printf("%d to import, %d skipped, %d errors (%s)\n",
+		reply.Imported, reply.Skipped, len(reply.Errors), mode)
+	return nil
+}
+
+func runLibraryCleanup(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	execute, _ := cmd.Flags().GetBool("execute")
+	rename, _ := cmd.Flags().GetBool("rename")
+
+	rpcArgs := &daemon.LibraryCleanupArgs{
+		Rename:  rename,
+		Execute: execute,
+	}
+	var reply daemon.LibraryCleanupReply
+	if err := client.Call("Service.LibraryCleanup", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Findings) > 0 {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "FINDING\tTYPE\tTITLE\tPATH")
+		for _, f := range reply.Findings {
+			path := f.FilePath
+			if f.Finding == "misnamed" && f.ExpectedPath != "" {
+				path = fmt.Sprintf("%s\n\t\t\t→ %s", f.FilePath, f.ExpectedPath)
+				if f.Renamed {
+					path += " (renamed)"
+				}
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Finding, f.MediaType, f.Title, path)
+		}
+		w.Flush()
+		fmt.Println()
+	}
+
+	ok := reply.Scanned - reply.Orphans - reply.Misnamed
+	fmt.Printf("%d scanned, %d ok, %d orphans, %d misnamed\n",
+		reply.Scanned, ok, reply.Orphans, reply.Misnamed)
 	return nil
 }
 

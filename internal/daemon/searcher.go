@@ -14,6 +14,7 @@ import (
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/parser"
+	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/quality"
 )
 
@@ -22,12 +23,26 @@ type Searcher struct {
 	cfg      *config.Config
 	db       *database.DB
 	indexers []*newznab.Client
+	plex     *plex.Client // nil if Plex integration is disabled
 	log      *slog.Logger
 }
 
 // NewSearcher creates a Searcher.
-func NewSearcher(cfg *config.Config, db *database.DB, indexers []*newznab.Client, log *slog.Logger) *Searcher {
-	return &Searcher{cfg: cfg, db: db, indexers: indexers, log: log}
+func NewSearcher(cfg *config.Config, db *database.DB, indexers []*newznab.Client, plexClient *plex.Client, log *slog.Logger) *Searcher {
+	return &Searcher{cfg: cfg, db: db, indexers: indexers, plex: plexClient, log: log}
+}
+
+// GrabContext provides metadata needed for both quality selection and Plex
+// availability checks.
+type GrabContext struct {
+	Category string
+	MediaID  int64
+	Title    string
+	Year     int
+	ImdbID   string
+	Season   int
+	Episode  int
+	Existing quality.Quality
 }
 
 // ScoredRelease is a Newznab release with parsed metadata and quality score.
@@ -127,41 +142,103 @@ func (s *Searcher) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredR
 
 // GrabBest picks the best acceptable release and enqueues it for download.
 // Returns true if a release was grabbed.
-func (s *Searcher) GrabBest(releases []ScoredRelease, category string, mediaID int64, existing quality.Quality) (bool, error) {
+func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, error) {
 	for _, sr := range releases {
-		if !s.cfg.Prefs.ShouldGrab(sr.Quality, existing) {
+		if !s.cfg.Prefs.ShouldGrab(sr.Quality, ctx.Existing) {
 			continue
 		}
 
-		active, err := s.db.HasActiveDownload(category, mediaID)
+		active, err := s.db.HasActiveDownload(ctx.Category, ctx.MediaID)
 		if err != nil {
 			return false, fmt.Errorf("check active download: %w", err)
 		}
 		if active {
-			s.log.Debug("already downloading", "title", sr.Release.Title, "category", category)
+			s.log.Debug("already downloading", "title", sr.Release.Title, "category", ctx.Category)
 			return false, nil
 		}
 
-		dlID, err := s.db.AddDownload(sr.Release.Link, sr.Release.Title, sr.Parsed.Title, category, mediaID, sr.Release.Size)
+		// Check if a Plex friend already has this — download from them instead.
+		if s.plex != nil {
+			grabbed, plexErr := s.grabFromPlex(ctx)
+			if plexErr != nil {
+				s.log.Debug("plex grab failed, falling through to usenet", "title", ctx.Title, "error", plexErr)
+			} else if grabbed {
+				return true, nil
+			}
+		}
+
+		dlID, err := s.db.AddDownload(sr.Release.Link, sr.Release.Title, sr.Parsed.Title, ctx.Category, ctx.MediaID, sr.Release.Size)
 		if err != nil {
 			return false, fmt.Errorf("add download: %w", err)
 		}
 
 		// Record grab in history.
-		if err := s.db.AddHistory(category, mediaID, sr.Parsed.Title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
+		if err := s.db.AddHistory(ctx.Category, ctx.MediaID, sr.Parsed.Title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
 			s.log.Error("failed to record grab history", "error", err)
 		}
 
 		s.log.Info("grabbed release",
 			"title", sr.Release.Title,
 			"quality", sr.Quality,
-			"category", category,
-			"media_id", mediaID,
+			"category", ctx.Category,
+			"media_id", ctx.MediaID,
 			"download_id", dlID,
 		)
 		return true, nil
 	}
 	return false, nil
+}
+
+// grabFromPlex checks Plex friends for the media and enqueues an HTTP download
+// from their server instead of going through Usenet. Returns true if a Plex
+// download was enqueued.
+func (s *Searcher) grabFromPlex(ctx GrabContext) (bool, error) {
+	var match *plex.MediaMatch
+	var err error
+
+	switch ctx.Category {
+	case "movie":
+		var found bool
+		found, match, err = s.plex.HasMovie(ctx.Title, ctx.Year, ctx.ImdbID, s.cfg.Prefs.Min)
+		if err != nil || !found || match == nil {
+			return false, err
+		}
+	case "episode":
+		var found bool
+		found, match, err = s.plex.HasEpisode(ctx.Title, ctx.Season, ctx.Episode, s.cfg.Prefs.Min)
+		if err != nil || !found || match == nil {
+			return false, err
+		}
+	default:
+		return false, nil
+	}
+
+	// Get the actual download URL from the server.
+	info, err := s.plex.GetDownloadInfo(*match)
+	if err != nil {
+		return false, fmt.Errorf("plex download info: %w", err)
+	}
+
+	sourceName := fmt.Sprintf("plex:%s", match.ServerName)
+	dlID, err := s.db.AddDownloadWithSource(
+		info.URL, sourceName, ctx.Title, ctx.Category, ctx.MediaID, info.Size, "plex",
+	)
+	if err != nil {
+		return false, fmt.Errorf("add plex download: %w", err)
+	}
+
+	if err := s.db.AddHistory(ctx.Category, ctx.MediaID, ctx.Title, "grabbed", sourceName, match.Quality.String()); err != nil {
+		s.log.Error("failed to record plex grab history", "error", err)
+	}
+
+	s.log.Info("grabbed from plex friend",
+		"title", ctx.Title,
+		"server", match.ServerName,
+		"quality", match.Quality,
+		"size_mb", info.Size/(1024*1024),
+		"download_id", dlID,
+	)
+	return true, nil
 }
 
 // SearchAndGrabMovie searches indexers for a movie and grabs the best result.
@@ -185,7 +262,14 @@ func (s *Searcher) SearchAndGrabMovie(movie *database.Movie) (bool, error) {
 	}
 
 	existing := existingQualityFromDB(s.db, "movie", movie.ID)
-	return s.GrabBest(releases, "movie", movie.ID, existing)
+	return s.GrabBest(releases, GrabContext{
+		Category: "movie",
+		MediaID:  movie.ID,
+		Title:    movie.Title,
+		Year:     movie.Year,
+		ImdbID:   imdbID,
+		Existing: existing,
+	})
 }
 
 // SearchAndGrabEpisode searches indexers for an episode and grabs the best result.
@@ -205,7 +289,14 @@ func (s *Searcher) SearchAndGrabEpisode(ep *database.Episode, tvdbID int) (bool,
 	}
 
 	existing := existingQualityFromDB(s.db, "episode", ep.ID)
-	return s.GrabBest(releases, "episode", ep.ID, existing)
+	return s.GrabBest(releases, GrabContext{
+		Category: "episode",
+		MediaID:  ep.ID,
+		Title:    ep.SeriesTitle,
+		Season:   ep.Season,
+		Episode:  ep.Episode,
+		Existing: existing,
+	})
 }
 
 // SearchWantedMovies searches indexers for all wanted movies.

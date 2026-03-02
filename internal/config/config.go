@@ -19,6 +19,7 @@ type Config struct {
 	Usenet   Usenet           `toml:"usenet"`
 	Indexers []Indexer        `toml:"indexers"`
 	TMDB     TMDBConfig       `toml:"tmdb"`
+	Plex     PlexConfig       `toml:"plex"`
 	Daemon   Daemon           `toml:"daemon"`
 	Prefs    quality.Prefs    `toml:"-"` // populated after parsing from Quality strings
 }
@@ -26,6 +27,13 @@ type Config struct {
 // TMDBConfig holds the TMDB API credentials.
 type TMDBConfig struct {
 	APIKey string `toml:"apikey"`
+}
+
+// PlexConfig holds optional Plex integration settings. When a token is
+// available (from config or PLEX_TOKEN env var), UDL checks friends' servers
+// before downloading.
+type PlexConfig struct {
+	Token string `toml:"token"`
 }
 
 // Library holds the final media destination directories.
@@ -146,6 +154,11 @@ func LoadFrom(path string) (*Config, error) {
 	}
 	if cfg.Quality.UpgradeUntil != "" {
 		cfg.Prefs.UpgradeUntil = quality.Parse(cfg.Quality.UpgradeUntil)
+	}
+
+	// Plex token: fall back to PLEX_TOKEN env var if not in config.
+	if cfg.Plex.Token == "" {
+		cfg.Plex.Token = os.Getenv("PLEX_TOKEN")
 	}
 
 	// Parse RSS interval with a default.

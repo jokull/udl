@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"github.com/jokull/udl/internal/organize"
 	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/postprocess"
+	"github.com/jokull/udl/internal/quality"
 )
 
 // Downloader picks items from the download queue and processes them.
@@ -118,8 +120,165 @@ func (d *Downloader) processQueue(ctx context.Context) {
 }
 
 // ProcessOne processes a single download from the queue.
-// This is the main pipeline: fetch NZB -> download -> post-process -> import.
+// Dispatches to the appropriate pipeline based on the download source.
 func (d *Downloader) ProcessOne(ctx context.Context, dl database.Download) error {
+	if dl.Source == "plex" {
+		return d.processPlexDownload(ctx, dl)
+	}
+	return d.processUsenetDownload(ctx, dl)
+}
+
+// processPlexDownload handles downloads from Plex friends' servers.
+// Simple pipeline: HTTP stream → file → import to library.
+func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Download) error {
+	if err := d.db.UpdateDownloadStatus(dl.ID, "downloading"); err != nil {
+		return fmt.Errorf("update status to downloading: %w", err)
+	}
+
+	dlURL := dl.NzbURL.String
+	if dlURL == "" {
+		return d.fail(dl.ID, "plex download has no URL")
+	}
+
+	// Create a temporary file for the download.
+	downloadDir := filepath.Join(d.cfg.Paths.Incomplete, fmt.Sprintf("plex-%d", dl.ID))
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		return d.fail(dl.ID, fmt.Sprintf("create download dir: %v", err))
+	}
+
+	// Stream the file from the Plex server.
+	req, err := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+	if err != nil {
+		return d.fail(dl.ID, fmt.Sprintf("create request: %v", err))
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return d.fail(dl.ID, fmt.Sprintf("plex download: %v", err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return d.fail(dl.ID, fmt.Sprintf("plex download: HTTP %d", resp.StatusCode))
+	}
+
+	// Determine filename — use Content-Disposition or fall back to a generic name.
+	ext := ".mkv" // most common
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "mp4") {
+		ext = ".mp4"
+	}
+	tmpPath := filepath.Join(downloadDir, fmt.Sprintf("plex-download%s.part", ext))
+	finalTmpPath := filepath.Join(downloadDir, fmt.Sprintf("plex-download%s", ext))
+
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return d.fail(dl.ID, fmt.Sprintf("create temp file: %v", err))
+	}
+
+	// Stream with progress updates.
+	var downloaded int64
+	totalSize := resp.ContentLength
+	buf := make([]byte, 256*1024) // 256KB chunks
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, writeErr := tmpFile.Write(buf[:n]); writeErr != nil {
+				tmpFile.Close()
+				return d.fail(dl.ID, fmt.Sprintf("write: %v", writeErr))
+			}
+			downloaded += int64(n)
+			if totalSize > 0 {
+				progress := float64(downloaded) / float64(totalSize) * 100
+				_ = d.db.UpdateDownloadProgress(dl.ID, progress, downloaded)
+			}
+		}
+		if readErr != nil {
+			if readErr.Error() == "EOF" || readErr == io.EOF {
+				break
+			}
+			tmpFile.Close()
+			return d.fail(dl.ID, fmt.Sprintf("read: %v", readErr))
+		}
+	}
+	tmpFile.Close()
+
+	// Atomic rename from .part to final.
+	if err := os.Rename(tmpPath, finalTmpPath); err != nil {
+		return d.fail(dl.ID, fmt.Sprintf("rename: %v", err))
+	}
+
+	// Import to library — same logic as Usenet downloads.
+	mediaExt := filepath.Ext(finalTmpPath)
+	// Parse quality from the nzb_name field (format: "plex:ServerName").
+	// We don't have release name quality info, so infer from Plex resolution.
+	q := parser.Parse(dl.Title).Quality
+	if q == 0 {
+		// Fallback: try to detect from file size.
+		q = quality.WEBDL1080p // conservative default for Plex
+	}
+
+	var dstPath string
+	switch dl.Category {
+	case "movie":
+		movie, err := d.db.GetMovie(dl.MediaID)
+		if err != nil {
+			return d.fail(dl.ID, fmt.Sprintf("get movie %d: %v", dl.MediaID, err))
+		}
+		dstPath = organize.MoviePath(d.cfg.Library.Movies, movie.Title, movie.Year, q, mediaExt)
+		if err := organize.Import(finalTmpPath, dstPath); err != nil {
+			return d.fail(dl.ID, fmt.Sprintf("import movie: %v", err))
+		}
+		if err := d.db.UpdateMovieStatus(movie.ID, "downloaded", q.String(), dstPath); err != nil {
+			d.log.Error("failed to update movie status", "id", movie.ID, "error", err)
+		}
+
+	case "episode":
+		ep, err := d.db.GetEpisode(dl.MediaID)
+		if err != nil {
+			return d.fail(dl.ID, fmt.Sprintf("get episode %d: %v", dl.MediaID, err))
+		}
+		series, err := d.db.GetSeries(ep.SeriesID)
+		if err != nil {
+			return d.fail(dl.ID, fmt.Sprintf("get series %d: %v", ep.SeriesID, err))
+		}
+		epTitle := ""
+		if ep.Title.Valid {
+			epTitle = ep.Title.String
+		}
+		dstPath = organize.EpisodePath(
+			d.cfg.Library.TV, series.Title, series.Year,
+			ep.Season, ep.Episode, epTitle, q, mediaExt,
+		)
+		if err := organize.Import(finalTmpPath, dstPath); err != nil {
+			return d.fail(dl.ID, fmt.Sprintf("import episode: %v", err))
+		}
+		if err := d.db.UpdateEpisodeStatus(ep.ID, "downloaded", q.String(), dstPath); err != nil {
+			d.log.Error("failed to update episode status", "id", ep.ID, "error", err)
+		}
+
+	default:
+		return d.fail(dl.ID, fmt.Sprintf("unknown category: %s", dl.Category))
+	}
+
+	// Completed.
+	if err := d.db.UpdateDownloadStatus(dl.ID, "completed"); err != nil {
+		d.log.Error("failed to update download to completed", "id", dl.ID, "error", err)
+	}
+	if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "completed", dl.NzbName, q.String()); err != nil {
+		d.log.Error("failed to record history", "id", dl.ID, "error", err)
+	}
+	if err := os.RemoveAll(downloadDir); err != nil {
+		d.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
+	}
+
+	d.log.Info("plex download completed", "id", dl.ID, "title", dl.Title, "path", dstPath,
+		"size_mb", downloaded/(1024*1024), "server", dl.NzbName)
+	return nil
+}
+
+// processUsenetDownload handles downloads from Usenet via NZB/NNTP.
+// Pipeline: fetch NZB -> download -> post-process -> import.
+func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Download) error {
 	// 1. Update status to "downloading".
 	if err := d.db.UpdateDownloadStatus(dl.ID, "downloading"); err != nil {
 		return fmt.Errorf("update status to downloading: %w", err)

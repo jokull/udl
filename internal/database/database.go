@@ -133,6 +133,9 @@ CREATE TABLE IF NOT EXISTS history (
 	// Add last_refreshed_at to series if migrating from older schema.
 	db.Exec("ALTER TABLE series ADD COLUMN last_refreshed_at TEXT")
 
+	// Add source column to downloads (usenet or plex).
+	db.Exec("ALTER TABLE downloads ADD COLUMN source TEXT NOT NULL DEFAULT 'usenet'")
+
 	return nil
 }
 
@@ -329,9 +332,14 @@ func (db *DB) UpdateEpisodeStatus(id int64, status, quality, filePath string) er
 
 // AddDownload inserts a new download record with status 'queued'.
 func (db *DB) AddDownload(nzbURL, nzbName, title, category string, mediaID int64, sizeBytes int64) (int64, error) {
+	return db.AddDownloadWithSource(nzbURL, nzbName, title, category, mediaID, sizeBytes, "usenet")
+}
+
+// AddDownloadWithSource inserts a download with an explicit source ("usenet" or "plex").
+func (db *DB) AddDownloadWithSource(dlURL, name, title, category string, mediaID int64, sizeBytes int64, source string) (int64, error) {
 	res, err := db.Exec(
-		`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, size_bytes) VALUES (?, ?, ?, ?, ?, ?)`,
-		nzbURL, nzbName, title, category, mediaID, sizeBytes,
+		`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, size_bytes, source) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		dlURL, name, title, category, mediaID, sizeBytes, source,
 	)
 	if err != nil {
 		return 0, err
@@ -342,7 +350,7 @@ func (db *DB) AddDownload(nzbURL, nzbName, title, category string, mediaID int64
 // PendingDownloads returns downloads that are queued or currently downloading.
 func (db *DB) PendingDownloads() ([]Download, error) {
 	rows, err := db.Query(
-		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at
+		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
 		 FROM downloads WHERE status IN ('queued', 'downloading') ORDER BY created_at ASC`,
 	)
 	if err != nil {
@@ -355,7 +363,7 @@ func (db *DB) PendingDownloads() ([]Download, error) {
 		var d Download
 		if err := rows.Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
 			&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
-			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt); err != nil {
+			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source); err != nil {
 			return nil, err
 		}
 		downloads = append(downloads, d)
@@ -619,6 +627,106 @@ func (db *DB) RecentDownloads(hours int) ([]Download, error) {
 		downloads = append(downloads, d)
 	}
 	return downloads, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Library queries
+// ---------------------------------------------------------------------------
+
+// FindMovieByTmdbID returns the movie with the given TMDB ID, or nil,nil if not found.
+func (db *DB) FindMovieByTmdbID(tmdbID int) (*Movie, error) {
+	var m Movie
+	err := db.QueryRow(
+		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at
+		 FROM movies WHERE tmdb_id = ?`, tmdbID,
+	).Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+		&m.Status, &m.Quality, &m.FilePath, &m.AddedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// FindSeriesByTmdbID returns the series with the given TMDB ID, or nil,nil if not found.
+func (db *DB) FindSeriesByTmdbID(tmdbID int) (*Series, error) {
+	var s Series
+	err := db.QueryRow(
+		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at, last_refreshed_at
+		 FROM series WHERE tmdb_id = ?`, tmdbID,
+	).Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year,
+		&s.Status, &s.AddedAt, &s.LastRefreshedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// FindEpisode returns the episode matching (seriesID, season, episode), or nil,nil if not found.
+func (db *DB) FindEpisode(seriesID int64, season, episode int) (*Episode, error) {
+	var ep Episode
+	err := db.QueryRow(
+		`SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
+		        e.status, e.quality, e.file_path, s.title
+		 FROM episodes e
+		 JOIN series s ON s.id = e.series_id
+		 WHERE e.series_id = ? AND e.season = ? AND e.episode = ?`,
+		seriesID, season, episode,
+	).Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
+		&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+		&ep.SeriesTitle)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &ep, nil
+}
+
+// AllMovieFilePaths returns a map of file_path → movie ID for all movies with a non-NULL file_path.
+func (db *DB) AllMovieFilePaths() (map[string]int64, error) {
+	rows, err := db.Query(`SELECT id, file_path FROM movies WHERE file_path IS NOT NULL AND file_path != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[string]int64)
+	for rows.Next() {
+		var id int64
+		var fp string
+		if err := rows.Scan(&id, &fp); err != nil {
+			return nil, err
+		}
+		m[fp] = id
+	}
+	return m, rows.Err()
+}
+
+// AllEpisodeFilePaths returns a map of file_path → episode ID for all episodes with a non-NULL file_path.
+func (db *DB) AllEpisodeFilePaths() (map[string]int64, error) {
+	rows, err := db.Query(`SELECT id, file_path FROM episodes WHERE file_path IS NOT NULL AND file_path != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[string]int64)
+	for rows.Next() {
+		var id int64
+		var fp string
+		if err := rows.Scan(&id, &fp); err != nil {
+			return nil, err
+		}
+		m[fp] = id
+	}
+	return m, rows.Err()
 }
 
 // ---------------------------------------------------------------------------

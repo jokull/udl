@@ -10,10 +10,12 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/newznab"
+	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
@@ -22,6 +24,7 @@ type Service struct {
 	cfg      *config.Config
 	db       *database.DB
 	tmdb     *tmdb.Client
+	plex     *plex.Client // nil if Plex integration is disabled
 	searcher *Searcher
 	log      *slog.Logger
 }
@@ -475,6 +478,96 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 	return nil
 }
 
+// --- Plex types ---
+
+// PlexServerInfo describes a shared Plex server for RPC responses.
+type PlexServerInfo struct {
+	Name  string
+	URI   string
+	Owned bool
+}
+
+// PlexServersReply contains the reply for the PlexServers RPC method.
+type PlexServersReply struct {
+	Servers []PlexServerInfo
+	Enabled bool
+}
+
+// PlexCheckArgs contains arguments for the PlexCheck RPC method.
+type PlexCheckArgs struct {
+	Title   string
+	Year    int
+	Season  int // > 0 for TV episode check
+	Episode int
+}
+
+// PlexCheckReply contains the reply for the PlexCheck RPC method.
+type PlexCheckReply struct {
+	Matches []plex.MediaMatch
+}
+
+// PlexServers returns the list of discovered shared Plex servers.
+func (s *Service) PlexServers(args *Empty, reply *PlexServersReply) error {
+	if s.plex == nil {
+		reply.Enabled = false
+		return nil
+	}
+	reply.Enabled = true
+
+	servers, err := s.plex.DiscoverServers()
+	if err != nil {
+		return fmt.Errorf("PlexServers: %w", err)
+	}
+
+	for _, srv := range servers {
+		reply.Servers = append(reply.Servers, PlexServerInfo{
+			Name:  srv.Name,
+			URI:   srv.URI,
+			Owned: srv.Owned,
+		})
+	}
+	return nil
+}
+
+// PlexCheck searches all shared Plex servers for the given media.
+func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
+	if s.plex == nil {
+		return fmt.Errorf("PlexCheck: Plex integration not configured (set plex.token or PLEX_TOKEN)")
+	}
+
+	servers, err := s.plex.DiscoverServers()
+	if err != nil {
+		return fmt.Errorf("PlexCheck: %w", err)
+	}
+
+	// Search all servers concurrently to avoid sequential timeouts.
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for _, srv := range servers {
+		wg.Add(1)
+		go func(srv plex.Server) {
+			defer wg.Done()
+			var matches []plex.MediaMatch
+			var err error
+			if args.Season > 0 {
+				matches, err = s.plex.SearchEpisode(srv, args.Title, args.Season, args.Episode)
+			} else {
+				matches, err = s.plex.SearchMovie(srv, args.Title, args.Year, "")
+			}
+			if err != nil {
+				s.log.Debug("plex check: search failed", "server", srv.Name, "error", err)
+				return
+			}
+			mu.Lock()
+			reply.Matches = append(reply.Matches, matches...)
+			mu.Unlock()
+		}(srv)
+	}
+	wg.Wait()
+
+	return nil
+}
+
 // RefreshSeries re-fetches episode metadata from TMDB for all monitored series.
 func (s *Service) RefreshSeries(args *Empty, reply *RefreshSeriesReply) error {
 	if s.tmdb == nil {
@@ -535,12 +628,27 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 		indexers[i] = newznab.New(idx.Name, idx.URL, idx.APIKey)
 	}
 
-	searcher := NewSearcher(cfg, db, indexers, log)
+	// Initialize Plex client if a token is available.
+	var plexClient *plex.Client
+	if cfg.Plex.Token != "" {
+		plexClient = plex.New(cfg.Plex.Token)
+		servers, err := plexClient.DiscoverServers()
+		if err != nil {
+			log.Warn("plex: failed to discover servers", "error", err)
+		} else {
+			log.Info("plex: discovered shared servers", "count", len(servers))
+			for _, srv := range servers {
+				log.Info("plex: shared server", "name", srv.Name, "uri", srv.URI)
+			}
+		}
+	}
+
+	searcher := NewSearcher(cfg, db, indexers, plexClient, log)
 
 	log.Info("daemon listening", "socket", sockPath)
 
 	// Start RPC server.
-	svc := &Service{cfg: cfg, db: db, tmdb: tc, searcher: searcher, log: log}
+	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, searcher: searcher, log: log}
 	server := rpc.NewServer()
 	if err := server.Register(svc); err != nil {
 		ln.Close()
@@ -549,7 +657,7 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	go server.Accept(ln)
 
 	// Start scheduler (RSS for TV + search sweep for movies + TMDB refresh).
-	sched := NewScheduler(cfg, db, indexers, tc, log)
+	sched := NewScheduler(cfg, db, indexers, tc, plexClient, log)
 	sched.Start(ctx)
 
 	// Start downloader (queue processing).

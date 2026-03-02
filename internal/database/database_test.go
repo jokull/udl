@@ -219,3 +219,123 @@ func TestEpisodeForeignKey(t *testing.T) {
 		t.Fatal("expected foreign key error, got nil")
 	}
 }
+
+func TestFindMovieByTmdbID(t *testing.T) {
+	db := mustOpen(t)
+
+	// Not found returns nil, nil.
+	m, err := db.FindMovieByTmdbID(12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m != nil {
+		t.Fatal("expected nil for non-existent tmdb_id")
+	}
+
+	// Add a movie and find it.
+	db.AddMovie(12345, "tt1234567", "Test Movie", 2024)
+	m, err = db.FindMovieByTmdbID(12345)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m == nil || m.Title != "Test Movie" {
+		t.Errorf("FindMovieByTmdbID: got %v, want Test Movie", m)
+	}
+}
+
+func TestFindSeriesByTmdbID(t *testing.T) {
+	db := mustOpen(t)
+
+	s, err := db.FindSeriesByTmdbID(9999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != nil {
+		t.Fatal("expected nil for non-existent tmdb_id")
+	}
+
+	db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023)
+	s, err = db.FindSeriesByTmdbID(9999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s == nil || s.Title != "Test Series" {
+		t.Errorf("FindSeriesByTmdbID: got %v, want Test Series", s)
+	}
+}
+
+func TestFindEpisode(t *testing.T) {
+	db := mustOpen(t)
+
+	sid, _ := db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023)
+	db.AddEpisode(sid, 1, 3, "Episode Three", "2023-03-01")
+
+	// Not found.
+	ep, err := db.FindEpisode(sid, 1, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ep != nil {
+		t.Fatal("expected nil for non-existent episode")
+	}
+
+	// Found.
+	ep, err = db.FindEpisode(sid, 1, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ep == nil {
+		t.Fatal("expected non-nil episode")
+	}
+	if ep.Season != 1 || ep.Episode != 3 {
+		t.Errorf("FindEpisode: got S%02dE%02d, want S01E03", ep.Season, ep.Episode)
+	}
+	if ep.SeriesTitle != "Test Series" {
+		t.Errorf("FindEpisode: series title = %q, want Test Series", ep.SeriesTitle)
+	}
+}
+
+func TestAllMovieFilePaths(t *testing.T) {
+	db := mustOpen(t)
+
+	id1, _ := db.AddMovie(111, "tt0000111", "Movie One", 2020)
+	id2, _ := db.AddMovie(222, "tt0000222", "Movie Two", 2021)
+	db.AddMovie(333, "tt0000333", "Movie Three", 2022) // no file_path
+
+	db.UpdateMovieStatus(id1, "downloaded", "WEBDL-1080p", "/movies/one.mkv")
+	db.UpdateMovieStatus(id2, "downloaded", "Bluray-1080p", "/movies/two.mkv")
+
+	paths, err := db.AllMovieFilePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 2 {
+		t.Fatalf("AllMovieFilePaths: got %d, want 2", len(paths))
+	}
+	if paths["/movies/one.mkv"] != id1 {
+		t.Errorf("expected id %d for /movies/one.mkv, got %d", id1, paths["/movies/one.mkv"])
+	}
+}
+
+func TestAllEpisodeFilePaths(t *testing.T) {
+	db := mustOpen(t)
+
+	sid, _ := db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023)
+	db.AddEpisode(sid, 1, 1, "Ep1", "2023-01-01")
+	db.AddEpisode(sid, 1, 2, "Ep2", "2023-01-08")
+
+	// Find the episodes to get their IDs.
+	ep1, _ := db.FindEpisode(sid, 1, 1)
+	db.UpdateEpisodeStatus(ep1.ID, "downloaded", "WEBDL-1080p", "/tv/test/s01e01.mkv")
+
+	paths, err := db.AllEpisodeFilePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("AllEpisodeFilePaths: got %d, want 1", len(paths))
+	}
+	if paths["/tv/test/s01e01.mkv"] != ep1.ID {
+		t.Errorf("expected id %d for ep1 path, got %d", ep1.ID, paths["/tv/test/s01e01.mkv"])
+	}
+}

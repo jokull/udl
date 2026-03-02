@@ -46,7 +46,7 @@ type Episode struct {
 	SeriesTitle string
 }
 
-// Download represents a download job (NZB-based).
+// Download represents a download job (Usenet NZB or Plex HTTP).
 type Download struct {
 	ID              int64
 	NzbURL          sql.NullString
@@ -62,6 +62,7 @@ type Download struct {
 	StartedAt       sql.NullTime
 	CompletedAt     sql.NullTime
 	CreatedAt       time.Time
+	Source          string // "usenet" or "plex"
 }
 
 // Indexer represents a Newznab-compatible indexer.

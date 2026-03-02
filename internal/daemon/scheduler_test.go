@@ -91,7 +91,7 @@ func newTestScheduler(t *testing.T) *Scheduler {
 		db:       db,
 		log:      log,
 		indexers: nil,
-		searcher: NewSearcher(cfg, db, nil, log),
+		searcher: NewSearcher(cfg, db, nil, nil, log),
 		stop:     make(chan struct{}),
 	}
 }
