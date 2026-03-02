@@ -33,17 +33,19 @@ type Series struct {
 
 // Episode represents a single episode of a series.
 type Episode struct {
-	ID        int64
-	SeriesID  int64
-	Season    int
-	Episode   int
-	Title     sql.NullString
-	AirDate   sql.NullString
-	Status    string
-	Quality   sql.NullString
-	FilePath  sql.NullString
+	ID             int64
+	SeriesID       int64
+	Season         int
+	Episode        int
+	Title          sql.NullString
+	AirDate        sql.NullString
+	Status         string
+	Quality        sql.NullString
+	FilePath       sql.NullString
+	LastSearchedAt sql.NullString
 	// Populated by joins — not stored directly in the episodes table.
 	SeriesTitle string
+	TvdbID      sql.NullInt64
 }
 
 // Download represents a download job (Usenet NZB or Plex HTTP).

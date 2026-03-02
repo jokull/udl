@@ -119,15 +119,6 @@ func (c *Client) Caps() error {
 	return nil
 }
 
-// RSS fetches the latest releases.
-func (c *Client) RSS() ([]Release, error) {
-	params := url.Values{
-		"t":     {"search"},
-		"limit": {"100"},
-	}
-	return c.query(params)
-}
-
 // DownloadNZB downloads the NZB file for a release.
 func (c *Client) DownloadNZB(release Release) ([]byte, error) {
 	dlURL := release.Link

@@ -3,18 +3,12 @@ package daemon
 import (
 	"context"
 	"log/slog"
-	"regexp"
-	"sort"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/newznab"
-	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/plex"
-	"github.com/jokull/udl/internal/quality"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
@@ -47,7 +41,7 @@ func NewScheduler(cfg *config.Config, db *database.DB, indexers []*newznab.Clien
 
 // Start begins the scheduler loops. Non-blocking — runs in background goroutines.
 func (s *Scheduler) Start(ctx context.Context) {
-	go s.rssLoop(ctx)
+	go s.episodeSearchLoop(ctx)
 	go s.searchLoop(ctx)
 	go s.refreshLoop(ctx)
 }
@@ -57,19 +51,14 @@ func (s *Scheduler) Stop() {
 	close(s.stop)
 }
 
-// rssLoop runs the RSS sync (TV episodes only) on a ticker.
-func (s *Scheduler) rssLoop(ctx context.Context) {
-	s.log.Info("rss sync: starting initial run (TV only)")
-	if err := s.RunRSSSync(); err != nil {
-		s.log.Error("rss sync: initial run failed", "error", err)
-	}
+// episodeSearchLoop searches for TV episodes based on air date scheduling.
+// Runs immediately on startup, then ticks every 2 minutes. Each tick searches
+// up to 5 episodes that are "due" based on how recently they aired.
+func (s *Scheduler) episodeSearchLoop(ctx context.Context) {
+	s.log.Info("episode search: starting initial run")
+	s.runEpisodeSearch()
 
-	interval := s.cfg.Daemon.RSSInterval
-	if interval <= 0 {
-		interval = 15 * time.Minute
-	}
-
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -79,29 +68,58 @@ func (s *Scheduler) rssLoop(ctx context.Context) {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			s.log.Info("rss sync: running scheduled cycle")
-			if err := s.RunRSSSync(); err != nil {
-				s.log.Error("rss sync: cycle failed", "error", err)
-			}
+			s.runEpisodeSearch()
 		}
 	}
 }
 
-// searchLoop runs periodic search sweeps for wanted movies and stale episodes.
-// Movies are always searched via API (not RSS). Episodes that RSS hasn't caught
-// are also swept up here.
-func (s *Scheduler) searchLoop(ctx context.Context) {
-	// Initial search sweep after a short delay to let RSS run first.
-	select {
-	case <-ctx.Done():
-		return
-	case <-s.stop:
-		return
-	case <-time.After(2 * time.Minute):
+// runEpisodeSearch queries due episodes and searches indexers for each.
+func (s *Scheduler) runEpisodeSearch() {
+	// Clear Plex episode cache so fresh data is fetched each cycle.
+	if s.plex != nil {
+		s.plex.ClearEpisodeCache()
 	}
 
-	s.log.Info("search sweep: running initial cycle")
-	s.runSearchSweep()
+	episodes, err := s.db.SearchableEpisodes(5)
+	if err != nil {
+		s.log.Error("episode search: query failed", "error", err)
+		return
+	}
+
+	if len(episodes) == 0 {
+		s.log.Debug("episode search: no episodes due")
+		return
+	}
+
+	grabbed := 0
+	for _, ep := range episodes {
+		tvdbID := 0
+		if ep.TvdbID.Valid {
+			tvdbID = int(ep.TvdbID.Int64)
+		}
+
+		ok, err := s.searcher.SearchAndGrabEpisode(&ep, tvdbID)
+		if err != nil {
+			s.log.Error("episode search: search failed",
+				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
+		}
+		if ok {
+			grabbed++
+		}
+
+		// Always update searched_at regardless of result.
+		if err := s.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
+			s.log.Error("episode search: update searched_at failed", "episode_id", ep.ID, "error", err)
+		}
+	}
+
+	s.log.Info("episode search: cycle complete", "checked", len(episodes), "grabbed", grabbed)
+}
+
+// searchLoop runs periodic search sweeps for wanted movies.
+func (s *Scheduler) searchLoop(ctx context.Context) {
+	s.log.Info("movie search sweep: running initial cycle")
+	s.runMovieSearchSweep()
 
 	// Repeat every 6 hours.
 	ticker := time.NewTicker(6 * time.Hour)
@@ -114,135 +132,21 @@ func (s *Scheduler) searchLoop(ctx context.Context) {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			s.log.Info("search sweep: running scheduled cycle")
-			s.runSearchSweep()
+			s.log.Info("movie search sweep: running scheduled cycle")
+			s.runMovieSearchSweep()
 		}
 	}
 }
 
-// runSearchSweep searches indexers for all wanted movies and episodes.
-func (s *Scheduler) runSearchSweep() {
+// runMovieSearchSweep searches indexers for all wanted movies.
+func (s *Scheduler) runMovieSearchSweep() {
 	// Clear Plex episode cache so fresh data is fetched each sweep.
 	if s.plex != nil {
 		s.plex.ClearEpisodeCache()
 	}
 	if err := s.searcher.SearchWantedMovies(); err != nil {
-		s.log.Error("search sweep: movies failed", "error", err)
+		s.log.Error("movie search sweep: failed", "error", err)
 	}
-	if err := s.searcher.SearchWantedEpisodes(); err != nil {
-		s.log.Error("search sweep: episodes failed", "error", err)
-	}
-}
-
-// RunRSSSync performs one RSS sync cycle for TV episodes only.
-// Movies are handled by the search sweep, not RSS.
-// RSS releases are scored, grouped by matched episode, and passed through
-// GrabBest which applies all viability checks (size, retention, blocklist, etc.).
-func (s *Scheduler) RunRSSSync() error {
-	for _, client := range s.indexers {
-		releases, err := client.RSS()
-		if err != nil {
-			s.log.Error("rss sync: fetch failed", "indexer", client.Name, "error", err)
-			continue
-		}
-
-		s.log.Info("rss sync: fetched releases", "indexer", client.Name, "count", len(releases))
-
-		// Group scored releases by matched episode ID.
-		type episodeGroup struct {
-			mediaID  int64
-			title    string
-			season   int
-			episode  int
-			releases []ScoredRelease
-		}
-		groups := make(map[int64]*episodeGroup)
-
-		for _, release := range releases {
-			scored := scoreRelease(release, s.cfg)
-			if scored.Quality == quality.Unknown {
-				continue
-			}
-			if scored.Parsed.Title == "" || !scored.Parsed.IsTV {
-				continue // RSS is TV-only; skip movies and unparseable titles
-			}
-
-			mediaID, err := s.matchTV(scored.Parsed)
-			if err != nil {
-				s.log.Error("rss sync: match error", "title", release.Title, "error", err)
-				continue
-			}
-			if mediaID == 0 {
-				continue
-			}
-
-			g, ok := groups[mediaID]
-			if !ok {
-				g = &episodeGroup{
-					mediaID: mediaID,
-					title:   scored.Parsed.Title,
-					season:  scored.Parsed.Season,
-					episode: scored.Parsed.Episode,
-				}
-				groups[mediaID] = g
-			}
-			g.releases = append(g.releases, scored)
-		}
-
-		// For each episode group, sort by score and call GrabBest.
-		for _, g := range groups {
-			sort.Slice(g.releases, func(i, j int) bool {
-				return g.releases[i].Score > g.releases[j].Score
-			})
-
-			existing := existingQualityFromDB(s.db, "episode", g.mediaID)
-			grabbed, err := s.searcher.GrabBest(g.releases, GrabContext{
-				Category: "episode",
-				MediaID:  g.mediaID,
-				Title:    g.title,
-				Season:   g.season,
-				Episode:  g.episode,
-				Existing: existing,
-			})
-			if err != nil {
-				s.log.Error("rss sync: grab failed", "title", g.title, "error", err)
-				continue
-			}
-			if grabbed {
-				s.log.Info("rss sync: grabbed episode",
-					"title", g.title,
-					"season", g.season,
-					"episode", g.episode,
-				)
-			}
-		}
-	}
-
-	return nil
-}
-
-// matchTV checks if a parsed TV release matches a wanted episode.
-// Returns the episode database ID if matched, or 0 if no match.
-func (s *Scheduler) matchTV(rel parser.Result) (int64, error) {
-	if rel.Season < 0 || rel.Episode < 0 {
-		return 0, nil
-	}
-
-	episodes, err := s.db.WantedEpisodes()
-	if err != nil {
-		return 0, err
-	}
-
-	normalizedRelTitle := normalize(rel.Title)
-	for _, ep := range episodes {
-		if ep.Season != rel.Season || ep.Episode != rel.Episode {
-			continue
-		}
-		if strings.EqualFold(normalizedRelTitle, normalize(ep.SeriesTitle)) {
-			return ep.ID, nil
-		}
-	}
-	return 0, nil
 }
 
 // refreshLoop periodically re-fetches episode metadata from TMDB for all monitored series.
@@ -252,7 +156,7 @@ func (s *Scheduler) refreshLoop(ctx context.Context) {
 		return
 	}
 
-	// Initial delay — let RSS and search run first.
+	// Initial delay — let search run first.
 	select {
 	case <-ctx.Done():
 		return
@@ -364,18 +268,3 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 	return result
 }
 
-// punctuationRe matches any character that is not a letter, digit, or space.
-var punctuationRe = regexp.MustCompile(`[^\p{L}\p{N}\s]`)
-
-// multiSpaceRe collapses runs of whitespace.
-var multiSpaceRe = regexp.MustCompile(`\s+`)
-
-// normalize cleans a title for fuzzy matching: lowercase, strip punctuation,
-// collapse whitespace, and trim.
-func normalize(title string) string {
-	s := foldDiacritics(title)
-	s = strings.Map(unicode.ToLower, s)
-	s = punctuationRe.ReplaceAllString(s, " ")
-	s = multiSpaceRe.ReplaceAllString(s, " ")
-	return strings.TrimSpace(s)
-}

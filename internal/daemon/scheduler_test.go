@@ -7,45 +7,8 @@ import (
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
-	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/quality"
 )
-
-// --------------------------------------------------------------------------
-// normalize tests
-// --------------------------------------------------------------------------
-
-func TestNormalize(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"The Walking Dead", "the walking dead"},
-		{"the.walking.dead", "the walking dead"},
-		{"The_Walking_Dead", "the walking dead"},
-		{"Breaking   Bad", "breaking bad"},
-		{"  Stranger Things  ", "stranger things"},
-		{"Mr. Robot", "mr robot"},
-		{"What We Do in the Shadows", "what we do in the shadows"},
-		{"Spider-Man: Into the Spider-Verse", "spider man into the spider verse"},
-		{"", ""},
-		{"It's Always Sunny in Philadelphia", "it s always sunny in philadelphia"},
-		{"DARK", "dark"},
-		{"The 100", "the 100"},
-		{"9-1-1", "9 1 1"},
-	}
-
-	for _, tt := range tests {
-		got := normalize(tt.input)
-		if got != tt.want {
-			t.Errorf("normalize(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
-// --------------------------------------------------------------------------
-// matchTV tests (RSS is TV-only now)
-// --------------------------------------------------------------------------
 
 func newTestScheduler(t *testing.T) *Scheduler {
 	t.Helper()
@@ -96,64 +59,115 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	}
 }
 
-func TestMatchTV_Match(t *testing.T) {
+// TestSearchableEpisodes_NeverSearched verifies that episodes that have never been
+// searched are returned by SearchableEpisodes.
+func TestSearchableEpisodes_NeverSearched(t *testing.T) {
 	s := newTestScheduler(t)
 
-	parsed := parser.Parse("Game.of.Thrones.S01E01.720p.HDTV.x264-GROUP")
-	mediaID, err := s.matchTV(parsed)
+	episodes, err := s.db.SearchableEpisodes(10)
 	if err != nil {
-		t.Fatalf("matchTV: %v", err)
+		t.Fatalf("SearchableEpisodes: %v", err)
 	}
-	if mediaID == 0 {
-		t.Fatal("expected non-zero mediaID for TV match")
+	// All 3 episodes are wanted, already aired, and never searched — all should be returned.
+	if len(episodes) != 3 {
+		t.Errorf("expected 3 searchable episodes, got %d", len(episodes))
+	}
+
+	// Verify TvdbID is populated via the join.
+	for _, ep := range episodes {
+		if !ep.TvdbID.Valid {
+			t.Errorf("episode %d (%s S%02dE%02d) should have TvdbID populated",
+				ep.ID, ep.SeriesTitle, ep.Season, ep.Episode)
+		}
 	}
 }
 
-func TestMatchTV_WrongEpisode(t *testing.T) {
+// TestSearchableEpisodes_RecentlySearched verifies that episodes with a recent
+// last_searched_at are not returned.
+func TestSearchableEpisodes_RecentlySearched(t *testing.T) {
 	s := newTestScheduler(t)
 
-	// S01E02 is not in our wanted list (only S01E01 and S03E09).
-	parsed := parser.Parse("Game.of.Thrones.S01E02.720p.HDTV.x264-GROUP")
-	mediaID, err := s.matchTV(parsed)
-	if err != nil {
-		t.Fatalf("matchTV: %v", err)
+	// Mark all episodes as recently searched.
+	episodes, _ := s.db.SearchableEpisodes(10)
+	for _, ep := range episodes {
+		if err := s.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
+			t.Fatalf("UpdateEpisodeSearchedAt: %v", err)
+		}
 	}
-	if mediaID != 0 {
-		t.Errorf("expected no match for unwanted episode, got mediaID=%d", mediaID)
+
+	// Now none should be returned (all aired 31+ days ago → 24h interval, just searched now).
+	episodes, err := s.db.SearchableEpisodes(10)
+	if err != nil {
+		t.Fatalf("SearchableEpisodes: %v", err)
+	}
+	if len(episodes) != 0 {
+		t.Errorf("expected 0 searchable episodes after marking as searched, got %d", len(episodes))
 	}
 }
 
-func TestMatchTV_DifferentSeries(t *testing.T) {
+// TestSearchableEpisodes_Limit verifies the limit parameter works.
+func TestSearchableEpisodes_Limit(t *testing.T) {
 	s := newTestScheduler(t)
 
-	// Stranger Things S01E01 should match.
-	parsed := parser.Parse("Stranger.Things.S01E01.1080p.WEB-DL.x264-GROUP")
-	mediaID, err := s.matchTV(parsed)
+	episodes, err := s.db.SearchableEpisodes(2)
 	if err != nil {
-		t.Fatalf("matchTV: %v", err)
+		t.Fatalf("SearchableEpisodes: %v", err)
 	}
-	if mediaID == 0 {
-		t.Fatal("expected non-zero mediaID for Stranger Things match")
+	if len(episodes) != 2 {
+		t.Errorf("expected 2 searchable episodes with limit=2, got %d", len(episodes))
 	}
 }
 
-func TestMatchTV_NoMatch(t *testing.T) {
-	s := newTestScheduler(t)
-
-	parsed := parser.Parse("Breaking.Bad.S01E01.720p.HDTV.x264-GROUP")
-	mediaID, err := s.matchTV(parsed)
+// TestSearchableEpisodes_FutureEpisode verifies that future episodes are excluded.
+func TestSearchableEpisodes_FutureEpisode(t *testing.T) {
+	db, err := database.Open(":memory:")
 	if err != nil {
-		t.Fatalf("matchTV: %v", err)
+		t.Fatalf("database.Open(:memory:): %v", err)
 	}
-	if mediaID != 0 {
-		t.Errorf("expected no match for unlisted series, got mediaID=%d", mediaID)
+	t.Cleanup(func() { db.Close() })
+
+	seriesID, err := db.AddSeries(1, 100, "", "Future Show", 2026)
+	if err != nil {
+		t.Fatalf("AddSeries: %v", err)
+	}
+	// Add an episode in the far future.
+	if err := db.AddEpisode(seriesID, 1, 1, "Pilot", "2099-01-01"); err != nil {
+		t.Fatalf("AddEpisode: %v", err)
+	}
+	// Add an episode that already aired.
+	if err := db.AddEpisode(seriesID, 1, 2, "Second", "2020-01-01"); err != nil {
+		t.Fatalf("AddEpisode: %v", err)
+	}
+
+	episodes, err := db.SearchableEpisodes(10)
+	if err != nil {
+		t.Fatalf("SearchableEpisodes: %v", err)
+	}
+	if len(episodes) != 1 {
+		t.Errorf("expected 1 searchable episode (future excluded), got %d", len(episodes))
+	}
+	if len(episodes) > 0 && episodes[0].Season == 1 && episodes[0].Episode == 1 {
+		t.Error("future episode should not be returned")
 	}
 }
 
-func TestMatchTV_MovieSkipped(t *testing.T) {
-	// Verify that non-TV releases are skipped in RSS (parser.IsTV=false).
-	parsed := parser.Parse("Fight.Club.1999.1080p.BluRay.x264-GROUP")
-	if parsed.IsTV {
-		t.Fatal("expected Fight Club to be parsed as movie, not TV")
+// TestSearchableEpisodes_OrderByAirDateDesc verifies results are ordered most recent first.
+func TestSearchableEpisodes_OrderByAirDateDesc(t *testing.T) {
+	s := newTestScheduler(t)
+
+	episodes, err := s.db.SearchableEpisodes(10)
+	if err != nil {
+		t.Fatalf("SearchableEpisodes: %v", err)
+	}
+	if len(episodes) < 2 {
+		t.Fatalf("expected at least 2 episodes, got %d", len(episodes))
+	}
+
+	// Stranger Things (2016-07-15) should come before GoT S03E09 (2013-06-02).
+	if episodes[0].AirDate.Valid && episodes[1].AirDate.Valid {
+		if episodes[0].AirDate.String < episodes[1].AirDate.String {
+			t.Errorf("episodes not in air_date DESC order: %s before %s",
+				episodes[0].AirDate.String, episodes[1].AirDate.String)
+		}
 	}
 }

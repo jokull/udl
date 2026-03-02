@@ -145,6 +145,9 @@ CREATE TABLE IF NOT EXISTS blocklist (
 	// Add source column to downloads (usenet or plex).
 	db.Exec("ALTER TABLE downloads ADD COLUMN source TEXT NOT NULL DEFAULT 'usenet'")
 
+	// Add last_searched_at to episodes for air-date-driven search scheduling.
+	db.Exec("ALTER TABLE episodes ADD COLUMN last_searched_at TEXT")
+
 	return nil
 }
 
@@ -324,6 +327,67 @@ func (db *DB) WantedEpisodes() ([]Episode, error) {
 		episodes = append(episodes, ep)
 	}
 	return episodes, rows.Err()
+}
+
+// SearchableEpisodes returns wanted, already-aired episodes that are "due" for
+// search based on their air_date age and last_searched_at timestamp.
+// Search intervals by episode age (since air_date):
+//   - Aired today: eligible every 30 minutes
+//   - Aired 1-7 days ago: eligible every 2 hours
+//   - Aired 8-30 days ago: eligible every 6 hours
+//   - Aired 31+ days ago (or no air_date): eligible every 24 hours
+//
+// Results are ordered by air_date DESC (most recently aired first) and limited.
+// Includes the series' tvdb_id in the join.
+func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
+	if limit <= 0 {
+		limit = 5
+	}
+	rows, err := db.Query(`
+		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
+		       e.status, e.quality, e.file_path, e.last_searched_at, s.title, s.tvdb_id
+		FROM episodes e
+		JOIN series s ON s.id = e.series_id
+		WHERE e.status = 'wanted'
+		  AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
+		  AND (
+		    e.last_searched_at IS NULL
+		    OR (
+		      -- Aired today: every 30 minutes
+		      (e.air_date = date('now') AND e.last_searched_at < datetime('now', '-30 minutes'))
+		      -- Aired 1-7 days ago: every 2 hours
+		      OR (e.air_date >= date('now', '-7 days') AND e.air_date < date('now') AND e.last_searched_at < datetime('now', '-2 hours'))
+		      -- Aired 8-30 days ago: every 6 hours
+		      OR (e.air_date >= date('now', '-30 days') AND e.air_date < date('now', '-7 days') AND e.last_searched_at < datetime('now', '-6 hours'))
+		      -- Aired 31+ days ago or no air_date: every 24 hours
+		      OR ((e.air_date < date('now', '-30 days') OR e.air_date IS NULL OR e.air_date = '') AND e.last_searched_at < datetime('now', '-24 hours'))
+		    )
+		  )
+		ORDER BY
+		  CASE WHEN e.air_date IS NULL OR e.air_date = '' THEN '1970-01-01' ELSE e.air_date END DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var episodes []Episode
+	for rows.Next() {
+		var ep Episode
+		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
+			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.LastSearchedAt, &ep.SeriesTitle, &ep.TvdbID); err != nil {
+			return nil, err
+		}
+		episodes = append(episodes, ep)
+	}
+	return episodes, rows.Err()
+}
+
+// UpdateEpisodeSearchedAt sets last_searched_at to the current time for an episode.
+func (db *DB) UpdateEpisodeSearchedAt(id int64) error {
+	_, err := db.Exec(`UPDATE episodes SET last_searched_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
+	return err
 }
 
 // UpdateEpisodeStatus updates the status, quality, and file_path of an episode.

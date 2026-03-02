@@ -900,7 +900,7 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	}
 	go server.Accept(ln)
 
-	// Start scheduler (RSS for TV + search sweep for movies + TMDB refresh).
+	// Start scheduler (episode search + movie search sweep + TMDB refresh).
 	sched := NewScheduler(cfg, db, indexers, tc, plexClient, log)
 	sched.Start(ctx)
 
@@ -909,10 +909,16 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 		log.Warn("par2cmdline not found -- PAR2 repair unavailable. Install: brew install par2cmdline")
 	}
 
+	// Warn if old rss_interval config is present.
+	if cfg.Daemon.RSSIntervalRaw != "" {
+		log.Warn("rss_interval is deprecated and ignored; episodes are now searched based on air dates")
+	}
+
 	dl.Start(ctx)
 
 	log.Info("daemon started",
-		"rss_interval", cfg.Daemon.RSSInterval,
+		"episode_search_interval", "2m",
+		"movie_search_interval", "6h",
 		"providers", len(cfg.Usenet.Providers),
 		"indexers", len(cfg.Indexers),
 	)

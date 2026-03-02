@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -296,78 +295,3 @@ func TestFail_AutoBlocklists(t *testing.T) {
 	}
 }
 
-// --------------------------------------------------------------------------
-// RSS sync skips blocklisted releases
-// --------------------------------------------------------------------------
-
-func TestRSSSync_SkipsBlocklisted(t *testing.T) {
-	db, err := database.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	// Add a wanted episode.
-	seriesID, _ := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011)
-	db.AddEpisode(seriesID, 1, 1, "Winter Is Coming", "2011-04-17")
-	ep, _ := db.FindEpisode(seriesID, 1, 1)
-
-	// Blocklist a specific release for this episode.
-	db.AddBlocklist("episode", ep.ID, "Game.of.Thrones.S01E01.720p.HDTV.x264-BAD", "segments failed")
-
-	// Serve RSS with both a blocklisted and a non-blocklisted release.
-	rssXML := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<rss version="2.0" xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
-<channel>
-<item>
-  <title>Game.of.Thrones.S01E01.720p.HDTV.x264-BAD</title>
-  <link>http://example.com/bad.nzb</link>
-  <enclosure url="http://example.com/bad.nzb" length="1073741824" type="application/x-nzb"/>
-  <newznab:attr name="category" value="5000"/>
-</item>
-<item>
-  <title>Game.of.Thrones.S01E01.1080p.WEB-DL.x264-GOOD</title>
-  <link>http://example.com/good.nzb</link>
-  <enclosure url="http://example.com/good.nzb" length="2147483648" type="application/x-nzb"/>
-  <newznab:attr name="category" value="5000"/>
-</item>
-</channel>
-</rss>`)
-
-	rssSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/rss+xml")
-		w.Write([]byte(rssXML))
-	}))
-	defer rssSrv.Close()
-
-	cfg := &config.Config{
-		Prefs: quality.Prefs{
-			Min:          quality.HDTV720p,
-			Preferred:    quality.WEBDL1080p,
-			UpgradeUntil: quality.Bluray1080p,
-		},
-	}
-	log := quietLogger()
-	indexers := []*newznab.Client{newznab.New("test", rssSrv.URL, "testkey")}
-	scheduler := &Scheduler{
-		cfg:      cfg,
-		db:       db,
-		log:      log,
-		indexers: indexers,
-		searcher: NewSearcher(cfg, db, indexers, nil, log),
-		stop:     make(chan struct{}),
-	}
-
-	if err := scheduler.RunRSSSync(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Should have grabbed only the non-blocklisted release.
-	downloads, _ := db.PendingDownloads()
-	if len(downloads) != 1 {
-		t.Fatalf("expected 1 download, got %d", len(downloads))
-	}
-	if downloads[0].NzbName != "Game.of.Thrones.S01E01.1080p.WEB-DL.x264-GOOD" {
-		t.Errorf("grabbed %q, want the non-blocklisted release", downloads[0].NzbName)
-	}
-}

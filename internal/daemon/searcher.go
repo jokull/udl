@@ -455,43 +455,10 @@ func (s *Searcher) SearchWantedMovies() error {
 	return nil
 }
 
-// SearchWantedEpisodes searches indexers for all wanted episodes.
-func (s *Searcher) SearchWantedEpisodes() error {
-	episodes, err := s.db.WantedEpisodes()
-	if err != nil {
-		return fmt.Errorf("wanted episodes: %w", err)
-	}
 
-	// Cache series TVDB IDs to avoid repeated lookups.
-	tvdbCache := make(map[int64]int)
-	for i := range episodes {
-		ep := &episodes[i]
-		tvdbID, ok := tvdbCache[ep.SeriesID]
-		if !ok {
-			series, err := s.db.GetSeries(ep.SeriesID)
-			if err != nil {
-				s.log.Error("get series for episode search", "series_id", ep.SeriesID, "error", err)
-				continue
-			}
-			if series.TvdbID.Valid {
-				tvdbID = int(series.TvdbID.Int64)
-			}
-			tvdbCache[ep.SeriesID] = tvdbID
-		}
-
-		grabbed, err := s.SearchAndGrabEpisode(ep, tvdbID)
-		if err != nil {
-			s.log.Error("search episode failed",
-				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
-			continue
-		}
-		if grabbed {
-			s.log.Info("grabbed episode",
-				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode)
-		}
-	}
-	return nil
-}
+// punctuationRe matches any character that is not a letter, digit, or space.
+// Used by SearchMovieReleases for text search fallback query cleaning.
+var punctuationRe = regexp.MustCompile(`[^\p{L}\p{N}\s]`)
 
 // rawDiscRe matches release titles for raw Bluray disc images (not playable media files).
 var rawDiscRe = regexp.MustCompile(`(?i)\b(COMPLETE\.?BLURAY|AVC\.?REMUX|BDREMUX|DISC\d*|ISO|BDISO)\b`)
