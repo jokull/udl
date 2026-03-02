@@ -59,6 +59,21 @@ type SearchMovieReply struct {
 	Results []ScoredRelease
 }
 
+// GrabMovieReleaseArgs contains arguments for the GrabMovieRelease RPC method.
+type GrabMovieReleaseArgs struct {
+	Query string // movie title to search
+	Index int    // 1-based index into search results
+}
+
+// GrabMovieReleaseReply contains the reply for the GrabMovieRelease RPC method.
+type GrabMovieReleaseReply struct {
+	Title       string
+	Year        int
+	ReleaseName string
+	Quality     string
+	DownloadID  int64
+}
+
 // MovieListReply contains the reply for the ListMovies RPC method.
 type MovieListReply struct {
 	Movies []database.Movie
@@ -259,6 +274,97 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 		return fmt.Errorf("SearchMovie: %w", err)
 	}
 	reply.Results = releases
+	return nil
+}
+
+// GrabMovieRelease searches indexers for a movie and grabs the release at the
+// given 1-based index. If the movie isn't in the DB yet, it gets added as wanted.
+func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieReleaseReply) error {
+	if s.tmdb == nil {
+		return fmt.Errorf("GrabMovieRelease: TMDB client not configured")
+	}
+	if s.searcher == nil {
+		return fmt.Errorf("GrabMovieRelease: searcher not configured")
+	}
+	if args.Index < 1 {
+		return fmt.Errorf("GrabMovieRelease: index must be >= 1")
+	}
+
+	// Look up the movie on TMDB.
+	results, err := s.tmdb.SearchMovie(args.Query)
+	if err != nil {
+		return fmt.Errorf("GrabMovieRelease: %w", err)
+	}
+	if len(results) == 0 {
+		return fmt.Errorf("GrabMovieRelease: no TMDB results for %q", args.Query)
+	}
+	movie, err := s.tmdb.GetMovie(results[0].TMDBID)
+	if err != nil {
+		return fmt.Errorf("GrabMovieRelease: %w", err)
+	}
+	if movie.IMDBID == "" {
+		return fmt.Errorf("GrabMovieRelease: no IMDB ID for %q", movie.Title)
+	}
+
+	// Search indexers.
+	releases, err := s.searcher.SearchMovieReleases(movie.IMDBID, movie.Title, movie.Year)
+	if err != nil {
+		return fmt.Errorf("GrabMovieRelease: %w", err)
+	}
+	if len(releases) == 0 {
+		return fmt.Errorf("GrabMovieRelease: no releases found for %q", movie.Title)
+	}
+	if args.Index > len(releases) {
+		return fmt.Errorf("GrabMovieRelease: index %d out of range (1-%d)", args.Index, len(releases))
+	}
+
+	sr := releases[args.Index-1]
+
+	// Ensure the movie is in the DB.
+	dbMovie, err := s.db.FindMovieByTmdbID(movie.TMDBID)
+	if err != nil {
+		return fmt.Errorf("GrabMovieRelease: %w", err)
+	}
+	if dbMovie == nil {
+		id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year)
+		if err != nil {
+			return fmt.Errorf("GrabMovieRelease: add movie: %w", err)
+		}
+		s.log.Info("auto-added movie for manual grab", "title", movie.Title, "year", movie.Year)
+		dbMovie = &database.Movie{ID: id, Title: movie.Title, Year: movie.Year}
+	}
+
+	// Check for active download.
+	active, err := s.db.HasActiveDownload("movie", dbMovie.ID)
+	if err != nil {
+		return fmt.Errorf("GrabMovieRelease: %w", err)
+	}
+	if active {
+		return fmt.Errorf("GrabMovieRelease: already downloading %q", movie.Title)
+	}
+
+	// Enqueue the download.
+	dlID, err := s.db.AddDownload(sr.Release.Link, sr.Release.Title, sr.Parsed.Title, "movie", dbMovie.ID, sr.Release.Size)
+	if err != nil {
+		return fmt.Errorf("GrabMovieRelease: add download: %w", err)
+	}
+
+	if err := s.db.AddHistory("movie", dbMovie.ID, sr.Parsed.Title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
+		s.log.Error("failed to record grab history", "error", err)
+	}
+
+	s.log.Info("manual grab",
+		"title", movie.Title,
+		"release", sr.Release.Title,
+		"quality", sr.Quality,
+		"download_id", dlID,
+	)
+
+	reply.Title = movie.Title
+	reply.Year = movie.Year
+	reply.ReleaseName = sr.Release.Title
+	reply.Quality = sr.Quality.String()
+	reply.DownloadID = dlID
 	return nil
 }
 
@@ -468,15 +574,101 @@ func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply)
 	return fmt.Errorf("RemoveSeries: id or title required")
 }
 
-// RetryDownload resets failed downloads back to queued.
+// RetryDownload deletes failed downloads and re-searches for the media.
+// The failed release is already blocklisted, so re-search will pick a different one.
 func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadReply) error {
-	n, err := s.db.ResetFailedDownloads(args.ID)
-	if err != nil {
-		return fmt.Errorf("RetryDownload: %w", err)
+	if args.ID > 0 {
+		// Single retry: look up the download, delete it, re-search the media.
+		dl, err := s.db.GetDownload(args.ID)
+		if err != nil || dl == nil || dl.Status != "failed" {
+			return fmt.Errorf("RetryDownload: download %d not found or not failed", args.ID)
+		}
+		s.db.Exec(`DELETE FROM downloads WHERE id = ? AND status = 'failed'`, args.ID)
+		if s.searcher != nil {
+			s.retryMedia(dl.Category, dl.MediaID)
+		}
+		reply.Count = 1
+	} else {
+		// Retry all: collect unique media items from failed downloads, delete them, re-search.
+		rows, err := s.db.Query(
+			`SELECT DISTINCT category, media_id FROM downloads WHERE status = 'failed'`)
+		if err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		type mediaKey struct {
+			category string
+			mediaID  int64
+		}
+		var keys []mediaKey
+		for rows.Next() {
+			var k mediaKey
+			if err := rows.Scan(&k.category, &k.mediaID); err != nil {
+				rows.Close()
+				return fmt.Errorf("RetryDownload: %w", err)
+			}
+			keys = append(keys, k)
+		}
+		rows.Close()
+
+		res, err := s.db.Exec(`DELETE FROM downloads WHERE status = 'failed'`)
+		if err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		reply.Count, _ = res.RowsAffected()
+
+		if s.searcher != nil {
+			for _, k := range keys {
+				s.retryMedia(k.category, k.mediaID)
+			}
+		}
 	}
-	reply.Count = n
-	s.log.Info("retried failed downloads", "count", n)
+	s.log.Info("retried failed downloads", "count", reply.Count)
 	return nil
+}
+
+// retryMedia re-searches indexers for a specific media item.
+func (s *Service) retryMedia(category string, mediaID int64) {
+	switch category {
+	case "movie":
+		movie, err := s.db.GetMovie(mediaID)
+		if err == nil && movie != nil && movie.Status == "wanted" {
+			if _, err := s.searcher.SearchAndGrabMovie(movie); err != nil {
+				s.log.Error("retry: search movie failed", "title", movie.Title, "error", err)
+			}
+		}
+	case "episode":
+		ep, err := s.db.GetEpisode(mediaID)
+		if err == nil && ep != nil && ep.Status == "wanted" {
+			series, serr := s.db.GetSeries(ep.SeriesID)
+			if serr == nil && series != nil {
+				tvdbID := 0
+				if series.TvdbID.Valid {
+					tvdbID = int(series.TvdbID.Int64)
+				}
+				if _, err := s.searcher.SearchAndGrabEpisode(ep, tvdbID); err != nil {
+					s.log.Error("retry: search episode failed",
+						"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
+				}
+			}
+		}
+	}
+}
+
+// --- Blocklist types ---
+
+// BlocklistReply contains the reply for the Blocklist RPC method.
+type BlocklistReply struct {
+	Entries []database.BlocklistEntry
+}
+
+// BlocklistRemoveArgs contains arguments for the BlocklistRemove RPC method.
+type BlocklistRemoveArgs struct {
+	ID int64
+}
+
+// BlocklistClearReply contains the reply for the BlocklistClear RPC method.
+type BlocklistClearReply struct {
+	Cleared int64
 }
 
 // --- Plex types ---
@@ -505,6 +697,32 @@ type PlexCheckArgs struct {
 // PlexCheckReply contains the reply for the PlexCheck RPC method.
 type PlexCheckReply struct {
 	Matches []plex.MediaMatch
+}
+
+// Blocklist returns all blocklist entries.
+func (s *Service) Blocklist(args *Empty, reply *BlocklistReply) error {
+	entries, err := s.db.ListBlocklist()
+	if err != nil {
+		return fmt.Errorf("Blocklist: %w", err)
+	}
+	reply.Entries = entries
+	return nil
+}
+
+// BlocklistRemove removes a single blocklist entry by ID.
+func (s *Service) BlocklistRemove(args *BlocklistRemoveArgs, reply *Empty) error {
+	return s.db.RemoveBlocklist(args.ID)
+}
+
+// BlocklistClear removes all blocklist entries.
+func (s *Service) BlocklistClear(args *Empty, reply *BlocklistClearReply) error {
+	n, err := s.db.ClearBlocklist()
+	if err != nil {
+		return fmt.Errorf("BlocklistClear: %w", err)
+	}
+	reply.Cleared = n
+	s.log.Info("cleared blocklist", "count", n)
+	return nil
 }
 
 // PlexServers returns the list of discovered shared Plex servers.

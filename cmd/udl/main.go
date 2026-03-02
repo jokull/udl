@@ -62,6 +62,14 @@ var movieSearchCmd = &cobra.Command{
 	RunE:  runMovieSearch,
 }
 
+var movieGrabCmd = &cobra.Command{
+	Use:   "grab [query] [#]",
+	Short: "Search indexers and grab a specific release by number",
+	Long:  "Searches indexers for a movie and grabs the release at the given index.\nRun 'udl movie search' first to see numbered results, then grab by number.",
+	Args:  cobra.MinimumNArgs(2),
+	RunE:  runMovieGrab,
+}
+
 var tvCmd = &cobra.Command{
 	Use:   "tv",
 	Short: "Manage TV series",
@@ -148,6 +156,25 @@ var plexCheckCmd = &cobra.Command{
 	RunE:  runPlexCheck,
 }
 
+var blocklistCmd = &cobra.Command{
+	Use:   "blocklist",
+	Short: "Show blocklisted releases",
+	RunE:  runBlocklist,
+}
+
+var blocklistClearCmd = &cobra.Command{
+	Use:   "clear",
+	Short: "Clear all blocklist entries",
+	RunE:  runBlocklistClear,
+}
+
+var blocklistRemoveCmd = &cobra.Command{
+	Use:   "remove [id]",
+	Short: "Remove a specific blocklist entry",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runBlocklistRemove,
+}
+
 var historyCmd = &cobra.Command{
 	Use:   "history",
 	Short: "Show download history",
@@ -169,9 +196,23 @@ var libraryImportCmd = &cobra.Command{
 
 var libraryCleanupCmd = &cobra.Command{
 	Use:   "cleanup",
-	Short: "Scan library for orphan files and misnamed tracked files",
-	Long:  "Dry-run by default. Use --rename --execute to fix misnamed files.",
+	Short: "Scan library for orphan files, misnamed files, and missing files",
+	Long:  "Dry-run by default. Use --rename --execute to fix misnamed files. Use --delete --execute to remove orphans.",
 	RunE:  runLibraryCleanup,
+}
+
+var libraryPruneIncompleteCmd = &cobra.Command{
+	Use:   "prune-incomplete",
+	Short: "Remove orphan incomplete download directories",
+	Long:  "Scans the incomplete directory for dirs whose download has completed, failed, or no longer exists. Dry-run by default.",
+	RunE:  runLibraryPruneIncomplete,
+}
+
+var libraryVerifyCmd = &cobra.Command{
+	Use:   "verify",
+	Short: "Check library consistency (missing files, orphans, misnamed)",
+	Long:  "Read-only check that reports all issues without making changes.",
+	RunE:  runLibraryVerify,
 }
 
 var configCmd = &cobra.Command{
@@ -192,18 +233,21 @@ var configPathCmd = &cobra.Command{
 }
 
 func init() {
-	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieRemoveCmd)
+	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieGrabCmd, movieRemoveCmd)
 	tvCmd.AddCommand(tvAddCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd)
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
 	plexCmd.AddCommand(plexServersCmd, plexCheckCmd)
+	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
 	configCmd.AddCommand(configCheckCmd, configPathCmd)
 
 	libraryImportCmd.Flags().Bool("execute", false, "Actually import files (default is dry-run)")
-	libraryCleanupCmd.Flags().Bool("execute", false, "Actually rename files (default is dry-run)")
+	libraryCleanupCmd.Flags().Bool("execute", false, "Actually apply changes (default is dry-run)")
 	libraryCleanupCmd.Flags().Bool("rename", false, "Fix misnamed files (requires --execute to apply)")
-	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd)
+	libraryCleanupCmd.Flags().Bool("delete", false, "Delete orphan files (requires --execute to apply)")
+	libraryPruneIncompleteCmd.Flags().Bool("execute", false, "Actually remove directories (default is dry-run)")
+	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd, libraryPruneIncompleteCmd, libraryVerifyCmd)
 
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, libraryCmd, configCmd)
+	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, configCmd)
 }
 
 func main() {
@@ -370,6 +414,37 @@ func runMovieSearch(cmd *cobra.Command, args []string) error {
 	return w.Flush()
 }
 
+func runMovieGrab(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	// Last arg is the release number, everything before is the query.
+	indexStr := args[len(args)-1]
+	index, err := strconv.Atoi(indexStr)
+	if err != nil {
+		return fmt.Errorf("last argument must be a release number (e.g. 'udl movie grab \"Title\" 3')")
+	}
+
+	query := strings.Join(args[:len(args)-1], " ")
+	if query == "" {
+		return fmt.Errorf("movie title is required")
+	}
+
+	rpcArgs := &daemon.GrabMovieReleaseArgs{Query: query, Index: index}
+	var reply daemon.GrabMovieReleaseReply
+	if err := client.Call("Service.GrabMovieRelease", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("grabbed: %s (%d)\n", reply.Title, reply.Year)
+	fmt.Printf("  release: %s\n", reply.ReleaseName)
+	fmt.Printf("  quality: %s\n", reply.Quality)
+	return nil
+}
+
 func runTVAdd(cmd *cobra.Command, args []string) error {
 	client, err := daemon.Dial()
 	if err != nil {
@@ -515,6 +590,70 @@ func runHistory(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", h.MediaType, h.Title, h.Event, q, h.CreatedAt.Format("2006-01-02 15:04"))
 	}
 	return w.Flush()
+}
+
+func runBlocklist(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.BlocklistReply
+	if err := client.Call("Service.Blocklist", &daemon.Empty{}, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Entries) == 0 {
+		fmt.Println("blocklist empty")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tTYPE\tRELEASE\tREASON\tTIME")
+	for _, e := range reply.Entries {
+		reason := e.Reason
+		if len(reason) > 60 {
+			reason = reason[:60] + "..."
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", e.ID, e.MediaType, e.ReleaseTitle, reason, e.CreatedAt.Format("2006-01-02 15:04"))
+	}
+	return w.Flush()
+}
+
+func runBlocklistClear(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.BlocklistClearReply
+	if err := client.Call("Service.BlocklistClear", &daemon.Empty{}, &reply); err != nil {
+		return err
+	}
+	fmt.Printf("cleared %d blocklist entries\n", reply.Cleared)
+	return nil
+}
+
+func runBlocklistRemove(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	id, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid blocklist ID: %s", args[0])
+	}
+
+	rpcArgs := &daemon.BlocklistRemoveArgs{ID: id}
+	if err := client.Call("Service.BlocklistRemove", rpcArgs, &daemon.Empty{}); err != nil {
+		return err
+	}
+	fmt.Printf("removed blocklist entry %d\n", id)
+	return nil
 }
 
 func runMovieRemove(cmd *cobra.Command, args []string) error {
@@ -723,8 +862,17 @@ func runLibraryImport(cmd *cobra.Command, args []string) error {
 	if execute {
 		mode = "executed"
 	}
-	fmt.Printf("%d to import, %d skipped, %d errors (%s)\n",
-		reply.Imported, reply.Skipped, len(reply.Errors), mode)
+	importParts := []string{
+		fmt.Sprintf("%d to import", reply.Imported),
+	}
+	if reply.Upgraded > 0 {
+		importParts = append(importParts, fmt.Sprintf("%d upgrades", reply.Upgraded))
+	}
+	importParts = append(importParts,
+		fmt.Sprintf("%d skipped", reply.Skipped),
+		fmt.Sprintf("%d errors", len(reply.Errors)),
+	)
+	fmt.Printf("%s (%s)\n", strings.Join(importParts, ", "), mode)
 	return nil
 }
 
@@ -737,9 +885,11 @@ func runLibraryCleanup(cmd *cobra.Command, args []string) error {
 
 	execute, _ := cmd.Flags().GetBool("execute")
 	rename, _ := cmd.Flags().GetBool("rename")
+	del, _ := cmd.Flags().GetBool("delete")
 
 	rpcArgs := &daemon.LibraryCleanupArgs{
 		Rename:  rename,
+		Delete:  del,
 		Execute: execute,
 	}
 	var reply daemon.LibraryCleanupReply
@@ -758,6 +908,12 @@ func runLibraryCleanup(cmd *cobra.Command, args []string) error {
 					path += " (renamed)"
 				}
 			}
+			if f.Deleted {
+				path += " (deleted)"
+			}
+			if f.Finding == "missing" && execute {
+				path += " (reset to wanted)"
+			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Finding, f.MediaType, f.Title, path)
 		}
 		w.Flush()
@@ -765,8 +921,97 @@ func runLibraryCleanup(cmd *cobra.Command, args []string) error {
 	}
 
 	ok := reply.Scanned - reply.Orphans - reply.Misnamed
-	fmt.Printf("%d scanned, %d ok, %d orphans, %d misnamed\n",
-		reply.Scanned, ok, reply.Orphans, reply.Misnamed)
+	parts := []string{
+		fmt.Sprintf("%d scanned", reply.Scanned),
+		fmt.Sprintf("%d ok", ok),
+		fmt.Sprintf("%d orphans", reply.Orphans),
+		fmt.Sprintf("%d misnamed", reply.Misnamed),
+		fmt.Sprintf("%d missing", reply.Missing),
+	}
+	if reply.EmptyDirsRemoved > 0 {
+		parts = append(parts, fmt.Sprintf("%d empty dirs removed", reply.EmptyDirsRemoved))
+	}
+	fmt.Println(strings.Join(parts, ", "))
+	return nil
+}
+
+func runLibraryPruneIncomplete(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	execute, _ := cmd.Flags().GetBool("execute")
+
+	rpcArgs := &daemon.PruneIncompleteArgs{Execute: execute}
+	var reply daemon.PruneIncompleteReply
+	if err := client.Call("Service.LibraryPruneIncomplete", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Findings) == 0 {
+		fmt.Println("no orphan incomplete directories found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "REASON\tSIZE\tDIR")
+	for _, f := range reply.Findings {
+		size := fmt.Sprintf("%.1f MB", float64(f.Size)/(1024*1024))
+		status := f.Dir
+		if f.Pruned {
+			status += " (removed)"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", f.Reason, size, status)
+	}
+	w.Flush()
+	fmt.Println()
+
+	totalMB := float64(reply.TotalSize) / (1024 * 1024)
+	mode := "dry-run: use --execute to remove"
+	if execute {
+		mode = fmt.Sprintf("removed %d of %d dirs", reply.PrunedDirs, reply.TotalDirs)
+	}
+	fmt.Printf("%d orphan dirs (%.1f MB) — %s\n", reply.TotalDirs, totalMB, mode)
+	return nil
+}
+
+func runLibraryVerify(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.LibraryVerifyReply
+	if err := client.Call("Service.LibraryVerify", &daemon.LibraryVerifyArgs{}, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Findings) == 0 {
+		fmt.Println("library OK: no issues found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "FINDING\tTYPE\tTITLE\tPATH")
+	for _, f := range reply.Findings {
+		path := f.FilePath
+		if f.Finding == "misnamed" && f.ExpectedPath != "" {
+			path = fmt.Sprintf("%s → %s", f.FilePath, f.ExpectedPath)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Finding, f.MediaType, f.Title, path)
+	}
+	w.Flush()
+	fmt.Println()
+
+	fmt.Printf("%d orphans, %d misnamed, %d missing\n",
+		reply.Orphans, reply.Misnamed, reply.Missing)
+
+	if reply.Orphans > 0 || reply.Misnamed > 0 || reply.Missing > 0 {
+		os.Exit(1)
+	}
 	return nil
 }
 
