@@ -89,8 +89,7 @@ type AddMovieReply struct {
 
 // SearchMovieArgs contains arguments for the SearchMovie (indexer search) RPC method.
 type SearchMovieArgs struct {
-	MovieID int64  // DB movie ID (required if Title is empty)
-	Title   string // DB movie title lookup (used if MovieID is 0)
+	MovieID int64 // DB movie ID (required)
 }
 
 // SearchMovieReply contains indexer search results for manual selection.
@@ -100,9 +99,8 @@ type SearchMovieReply struct {
 
 // GrabMovieReleaseArgs contains arguments for the GrabMovieRelease RPC method.
 type GrabMovieReleaseArgs struct {
-	MovieID int64  // DB movie ID (required if Title is empty)
-	Title   string // DB movie title lookup (used if MovieID is 0)
-	Index   int    // 1-based index into search results
+	MovieID int64 // DB movie ID (required)
+	Index   int   // 1-based index into search results
 }
 
 // GrabMovieReleaseReply contains the reply for the GrabMovieRelease RPC method.
@@ -177,24 +175,26 @@ type StatusReply struct {
 
 // RemoveMovieArgs contains arguments for the RemoveMovie RPC method.
 type RemoveMovieArgs struct {
-	ID    int64
-	Title string // used if ID is 0
+	ID int64 // DB movie ID (required)
 }
 
 // RemoveMovieReply contains the reply for the RemoveMovie RPC method.
 type RemoveMovieReply struct {
+	ID    int64
 	Title string
+	Year  int
 }
 
 // RemoveSeriesArgs contains arguments for the RemoveSeries RPC method.
 type RemoveSeriesArgs struct {
-	ID    int64
-	Title string // used if ID is 0
+	ID int64 // DB series ID (required)
 }
 
 // RemoveSeriesReply contains the reply for the RemoveSeries RPC method.
 type RemoveSeriesReply struct {
+	ID    int64
 	Title string
+	Year  int
 }
 
 // --- Queue retry types ---
@@ -325,8 +325,11 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	if len(s.indexers) == 0 {
 		return fmt.Errorf("SearchMovie: no indexers configured")
 	}
+	if args.MovieID == 0 {
+		return fmt.Errorf("SearchMovie: movie ID is required")
+	}
 
-	movie, err := s.resolveMovie(args.MovieID, args.Title)
+	movie, err := s.db.GetMovie(args.MovieID)
 	if err != nil {
 		return fmt.Errorf("SearchMovie: %w", err)
 	}
@@ -347,16 +350,6 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	return nil
 }
 
-// resolveMovie looks up a movie in the DB by ID or title.
-func (s *Service) resolveMovie(id int64, title string) (*database.Movie, error) {
-	if id > 0 {
-		return s.db.GetMovie(id)
-	}
-	if title != "" {
-		return s.db.FindMovieByTitle(title)
-	}
-	return nil, fmt.Errorf("movie ID or title is required")
-}
 
 // GrabMovieRelease searches indexers for a movie in the DB and grabs the release
 // at the given 1-based index. The movie must already exist in the database.
@@ -364,11 +357,14 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 	if len(s.indexers) == 0 {
 		return fmt.Errorf("GrabMovieRelease: no indexers configured")
 	}
+	if args.MovieID == 0 {
+		return fmt.Errorf("GrabMovieRelease: movie ID is required")
+	}
 	if args.Index < 1 {
 		return fmt.Errorf("GrabMovieRelease: index must be >= 1")
 	}
 
-	movie, err := s.resolveMovie(args.MovieID, args.Title)
+	movie, err := s.db.GetMovie(args.MovieID)
 	if err != nil {
 		return fmt.Errorf("GrabMovieRelease: %w", err)
 	}
@@ -586,44 +582,32 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 
 // RemoveMovie removes a movie from the database (not from disk).
 func (s *Service) RemoveMovie(args *RemoveMovieArgs, reply *RemoveMovieReply) error {
-	if args.ID > 0 {
-		movie, err := s.db.GetMovie(args.ID)
-		if err != nil {
-			return fmt.Errorf("RemoveMovie: %w", err)
-		}
-		reply.Title = movie.Title
-		return s.db.RemoveMovie(args.ID)
+	if args.ID == 0 {
+		return fmt.Errorf("RemoveMovie: movie ID is required")
 	}
-	if args.Title != "" {
-		movie, err := s.db.FindMovieByTitle(args.Title)
-		if err != nil {
-			return fmt.Errorf("RemoveMovie: no movie matching %q", args.Title)
-		}
-		reply.Title = movie.Title
-		return s.db.RemoveMovie(movie.ID)
+	movie, err := s.db.GetMovie(args.ID)
+	if err != nil {
+		return fmt.Errorf("RemoveMovie: %w", err)
 	}
-	return fmt.Errorf("RemoveMovie: id or title required")
+	reply.ID = movie.ID
+	reply.Title = movie.Title
+	reply.Year = movie.Year
+	return s.db.RemoveMovie(args.ID)
 }
 
 // RemoveSeries removes a series and its episodes from the database (not from disk).
 func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply) error {
-	if args.ID > 0 {
-		series, err := s.db.GetSeries(args.ID)
-		if err != nil {
-			return fmt.Errorf("RemoveSeries: %w", err)
-		}
-		reply.Title = series.Title
-		return s.db.RemoveSeries(args.ID)
+	if args.ID == 0 {
+		return fmt.Errorf("RemoveSeries: series ID is required")
 	}
-	if args.Title != "" {
-		series, err := s.db.FindSeriesByTitle(args.Title)
-		if err != nil {
-			return fmt.Errorf("RemoveSeries: no series matching %q", args.Title)
-		}
-		reply.Title = series.Title
-		return s.db.RemoveSeries(series.ID)
+	series, err := s.db.GetSeries(args.ID)
+	if err != nil {
+		return fmt.Errorf("RemoveSeries: %w", err)
 	}
-	return fmt.Errorf("RemoveSeries: id or title required")
+	reply.ID = series.ID
+	reply.Title = series.Title
+	reply.Year = series.Year
+	return s.db.RemoveSeries(args.ID)
 }
 
 // RetryDownload resets failed media items to wanted and re-searches for them.
@@ -721,10 +705,7 @@ type PlexServersReply struct {
 
 // PlexCheckArgs contains arguments for the PlexCheck RPC method.
 type PlexCheckArgs struct {
-	Title   string
-	Year    int
-	Season  int // > 0 for TV episode check
-	Episode int
+	MovieID int64 // DB movie ID (required)
 }
 
 // PlexCheckReply contains the reply for the PlexCheck RPC method.
@@ -812,10 +793,23 @@ func (s *Service) PlexServers(args *Empty, reply *PlexServersReply) error {
 	return nil
 }
 
-// PlexCheck searches all shared Plex servers for the given media.
+// PlexCheck searches all shared Plex servers for a movie by its DB ID.
 func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 	if s.plex == nil {
 		return fmt.Errorf("PlexCheck: Plex integration not configured (set plex.token or PLEX_TOKEN)")
+	}
+	if args.MovieID == 0 {
+		return fmt.Errorf("PlexCheck: movie ID is required")
+	}
+
+	movie, err := s.db.GetMovie(args.MovieID)
+	if err != nil {
+		return fmt.Errorf("PlexCheck: %w", err)
+	}
+
+	imdbID := ""
+	if movie.ImdbID.Valid {
+		imdbID = movie.ImdbID.String
 	}
 
 	servers, err := s.plex.DiscoverServers()
@@ -830,13 +824,7 @@ func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 		wg.Add(1)
 		go func(srv plex.Server) {
 			defer wg.Done()
-			var matches []plex.MediaMatch
-			var err error
-			if args.Season > 0 {
-				matches, err = s.plex.SearchEpisode(srv, args.Title, args.Season, args.Episode)
-			} else {
-				matches, err = s.plex.SearchMovie(srv, args.Title, args.Year, "", 0)
-			}
+			matches, err := s.plex.SearchMovie(srv, movie.Title, movie.Year, imdbID, movie.TmdbID)
 			if err != nil {
 				s.log.Debug("plex check: search failed", "server", srv.Name, "error", err)
 				return

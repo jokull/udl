@@ -65,18 +65,18 @@ var movieSearchCmd = &cobra.Command{
 }
 
 var movieReleasesCmd = &cobra.Command{
-	Use:   "releases [id|title]",
+	Use:   "releases [id]",
 	Short: "Search indexers for a movie in the database",
-	Long:  "Searches Usenet indexers for releases matching a movie already in the database.\nUse a DB ID or title to identify the movie.",
-	Args:  cobra.MinimumNArgs(1),
+	Long:  "Searches Usenet indexers for releases matching a movie already in the database.\nUse the movie's DB ID (from 'udl movie list').",
+	Args:  cobra.ExactArgs(1),
 	RunE:  runMovieReleases,
 }
 
 var movieGrabCmd = &cobra.Command{
-	Use:   "grab [id|title] [#]",
+	Use:   "grab [id] [#]",
 	Short: "Grab a specific indexer release for a movie",
 	Long:  "Searches indexers for a movie in the database and grabs the release at the given index.\nRun 'udl movie releases' first to see numbered results, then grab by number.",
-	Args:  cobra.MinimumNArgs(2),
+	Args:  cobra.ExactArgs(2),
 	RunE:  runMovieGrab,
 }
 
@@ -138,16 +138,18 @@ var queueRetryCmd = &cobra.Command{
 }
 
 var movieRemoveCmd = &cobra.Command{
-	Use:   "remove [id|title]",
+	Use:   "remove [id]",
 	Short: "Remove a movie from monitoring (not from disk)",
-	Args:  cobra.MinimumNArgs(1),
+	Long:  "Remove a movie by its DB ID (from 'udl movie list').",
+	Args:  cobra.ExactArgs(1),
 	RunE:  runMovieRemove,
 }
 
 var tvRemoveCmd = &cobra.Command{
-	Use:   "remove [id|title]",
+	Use:   "remove [id]",
 	Short: "Remove a series from monitoring (not from disk)",
-	Args:  cobra.MinimumNArgs(1),
+	Long:  "Remove a series by its DB ID (from 'udl tv list').",
+	Args:  cobra.ExactArgs(1),
 	RunE:  runTVRemove,
 }
 
@@ -169,9 +171,10 @@ var plexServersCmd = &cobra.Command{
 }
 
 var plexCheckCmd = &cobra.Command{
-	Use:   "check [title] [year]",
-	Short: "Check if a movie or show is available on friends' Plex servers",
-	Args:  cobra.MinimumNArgs(1),
+	Use:   "check [movie-id]",
+	Short: "Check if a movie is available on friends' Plex servers",
+	Long:  "Check by DB movie ID (from 'udl movie list').",
+	Args:  cobra.ExactArgs(1),
 	RunE:  runPlexCheck,
 }
 
@@ -428,7 +431,7 @@ func runMovieAdd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("added: %s (%d)\n", reply.Title, reply.Year)
+	fmt.Printf("added: %s (%d) [id=%d]\n", reply.Title, reply.Year, reply.ID)
 	if reply.Grabbed {
 		fmt.Println("  -> release found and enqueued for download")
 	} else {
@@ -455,13 +458,13 @@ func runMovieList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TITLE\tYEAR\tSTATUS\tQUALITY")
+	fmt.Fprintln(w, "ID\tTITLE\tYEAR\tSTATUS\tQUALITY")
 	for _, m := range reply.Movies {
 		q := ""
 		if m.Quality.Valid {
 			q = m.Quality.String
 		}
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\n", m.Title, m.Year, m.Status, q)
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\n", m.ID, m.Title, m.Year, m.Status, q)
 	}
 	return w.Flush()
 }
@@ -497,19 +500,18 @@ func runMovieSearch(cmd *cobra.Command, args []string) error {
 }
 
 func runMovieReleases(cmd *cobra.Command, args []string) error {
+	movieID, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("movie ID must be a number (use 'udl movie list' to find it)")
+	}
+
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	input := strings.Join(args, " ")
-	rpcArgs := &daemon.SearchMovieArgs{}
-	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
-		rpcArgs.MovieID = id
-	} else {
-		rpcArgs.Title = input
-	}
+	rpcArgs := &daemon.SearchMovieArgs{MovieID: movieID}
 
 	var reply daemon.SearchMovieReply
 	if err := client.Call("Service.SearchMovie", rpcArgs, &reply); err != nil {
@@ -537,37 +539,29 @@ func runMovieReleases(cmd *cobra.Command, args []string) error {
 }
 
 func runMovieGrab(cmd *cobra.Command, args []string) error {
+	movieID, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("first argument must be a movie ID (use 'udl movie list' to find it)")
+	}
+	index, err := strconv.Atoi(args[1])
+	if err != nil {
+		return fmt.Errorf("second argument must be a release number (use 'udl movie releases' to find it)")
+	}
+
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	// Last arg is the release number, everything before is the movie identifier.
-	indexStr := args[len(args)-1]
-	index, err := strconv.Atoi(indexStr)
-	if err != nil {
-		return fmt.Errorf("last argument must be a release number (e.g. 'udl movie grab \"Title\" 3')")
-	}
-
-	input := strings.Join(args[:len(args)-1], " ")
-	if input == "" {
-		return fmt.Errorf("movie ID or title is required")
-	}
-
-	rpcArgs := &daemon.GrabMovieReleaseArgs{Index: index}
-	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
-		rpcArgs.MovieID = id
-	} else {
-		rpcArgs.Title = input
-	}
+	rpcArgs := &daemon.GrabMovieReleaseArgs{MovieID: movieID, Index: index}
 
 	var reply daemon.GrabMovieReleaseReply
 	if err := client.Call("Service.GrabMovieRelease", rpcArgs, &reply); err != nil {
 		return err
 	}
 
-	fmt.Printf("grabbed: %s (%d)\n", reply.Title, reply.Year)
+	fmt.Printf("grabbed: %s (%d) [id=%d]\n", reply.Title, reply.Year, movieID)
 	fmt.Printf("  release: %s\n", reply.ReleaseName)
 	fmt.Printf("  quality: %s\n", reply.Quality)
 	return nil
@@ -591,7 +585,7 @@ func runTVAdd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("added: %s (%d) — %d episodes\n", reply.Title, reply.Year, reply.EpisodeCount)
+	fmt.Printf("added: %s (%d) [id=%d] — %d episodes\n", reply.Title, reply.Year, reply.ID, reply.EpisodeCount)
 	if reply.Grabbed > 0 {
 		fmt.Printf("  -> %d episodes enqueued for download\n", reply.Grabbed)
 	}
@@ -646,9 +640,9 @@ func runTVList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TITLE\tYEAR\tSTATUS")
+	fmt.Fprintln(w, "ID\tTITLE\tYEAR\tSTATUS")
 	for _, s := range reply.Series {
-		fmt.Fprintf(w, "%s\t%d\t%s\n", s.Title, s.Year, s.Status)
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\n", s.ID, s.Title, s.Year, s.Status)
 	}
 	return w.Flush()
 }
@@ -671,13 +665,14 @@ func runQueue(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TITLE\tSTATUS\tPROGRESS")
+	fmt.Fprintln(w, "ID\tTITLE\tSTATUS\tPROGRESS")
 	for _, d := range reply.Items {
 		progress := d.Progress
 		if progress > 100 {
 			progress = 100
 		}
-		fmt.Fprintf(w, "%s\t%s\t%.0f%%\n", d.Title, d.Status, progress)
+		id := fmt.Sprintf("%s:%d", d.Category, d.MediaID)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%.0f%%\n", id, d.Title, d.Status, progress)
 	}
 	return w.Flush()
 }
@@ -743,13 +738,14 @@ func runHistory(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TYPE\tTITLE\tEVENT\tQUALITY\tTIME")
+	fmt.Fprintln(w, "ID\tTITLE\tEVENT\tQUALITY\tTIME")
 	for _, h := range reply.Events {
 		q := ""
 		if h.Quality.Valid {
 			q = h.Quality.String
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", h.MediaType, h.Title, h.Event, q, h.CreatedAt.Format("2006-01-02 15:04"))
+		id := fmt.Sprintf("%s:%d", h.MediaType, h.MediaID)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, h.Title, h.Event, q, h.CreatedAt.Format("2006-01-02 15:04"))
 	}
 	return w.Flush()
 }
@@ -772,13 +768,14 @@ func runBlocklist(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTYPE\tRELEASE\tREASON\tTIME")
+	fmt.Fprintln(w, "ID\tMEDIA\tRELEASE\tREASON\tTIME")
 	for _, e := range reply.Entries {
 		reason := e.Reason
 		if len(reason) > 60 {
 			reason = reason[:60] + "..."
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", e.ID, e.MediaType, e.ReleaseTitle, reason, e.CreatedAt.Format("2006-01-02 15:04"))
+		media := fmt.Sprintf("%s:%d", e.MediaType, e.MediaID)
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", e.ID, media, e.ReleaseTitle, reason, e.CreatedAt.Format("2006-01-02 15:04"))
 	}
 	return w.Flush()
 }
@@ -819,48 +816,44 @@ func runBlocklistRemove(cmd *cobra.Command, args []string) error {
 }
 
 func runMovieRemove(cmd *cobra.Command, args []string) error {
+	movieID, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("movie ID must be a number (use 'udl movie list' to find it)")
+	}
+
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	input := strings.Join(args, " ")
-	rpcArgs := &daemon.RemoveMovieArgs{}
-	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
-		rpcArgs.ID = id
-	} else {
-		rpcArgs.Title = input
-	}
-
+	rpcArgs := &daemon.RemoveMovieArgs{ID: movieID}
 	var reply daemon.RemoveMovieReply
 	if err := client.Call("Service.RemoveMovie", rpcArgs, &reply); err != nil {
 		return err
 	}
-	fmt.Printf("removed: %s\n", reply.Title)
+	fmt.Printf("removed: %s (%d) [id=%d]\n", reply.Title, reply.Year, reply.ID)
 	return nil
 }
 
 func runTVRemove(cmd *cobra.Command, args []string) error {
+	seriesID, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("series ID must be a number (use 'udl tv list' to find it)")
+	}
+
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	input := strings.Join(args, " ")
-	rpcArgs := &daemon.RemoveSeriesArgs{}
-	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
-		rpcArgs.ID = id
-	} else {
-		rpcArgs.Title = input
-	}
-
+	rpcArgs := &daemon.RemoveSeriesArgs{ID: seriesID}
 	var reply daemon.RemoveSeriesReply
 	if err := client.Call("Service.RemoveSeries", rpcArgs, &reply); err != nil {
 		return err
 	}
-	fmt.Printf("removed: %s (and all episodes)\n", reply.Title)
+	fmt.Printf("removed: %s (%d) [id=%d] (and all episodes)\n", reply.Title, reply.Year, reply.ID)
 	return nil
 }
 
@@ -957,26 +950,19 @@ func runPlexCheck(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
-	title := args[0]
-	year := 0
-	if len(args) > 1 {
-		if y, err := strconv.Atoi(args[1]); err == nil {
-			year = y
-		}
+	movieID, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("movie ID must be a number (use 'udl movie list' to find it)")
 	}
 
-	rpcArgs := &daemon.PlexCheckArgs{Title: title, Year: year}
+	rpcArgs := &daemon.PlexCheckArgs{MovieID: movieID}
 	var reply daemon.PlexCheckReply
 	if err := client.Call("Service.PlexCheck", rpcArgs, &reply); err != nil {
 		return err
 	}
 
 	if len(reply.Matches) == 0 {
-		fmt.Printf("not found on any friend's server: %s", title)
-		if year > 0 {
-			fmt.Printf(" (%d)", year)
-		}
-		fmt.Println()
+		fmt.Printf("not found on any friend's server (movie id=%d)\n", movieID)
 		return nil
 	}
 
