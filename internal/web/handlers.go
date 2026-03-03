@@ -264,8 +264,14 @@ func (s *Server) handleRetryDownload(w http.ResponseWriter, r *http.Request) {
 
 // render executes a full page template (wrapped in layout).
 func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {
+	t, ok := s.pages[name]
+	if !ok {
+		s.log.Error("web: unknown page template", "template", name)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
+	if err := t.ExecuteTemplate(w, "layout", data); err != nil {
 		s.log.Error("web: render template", "template", name, "error", err)
 	}
 }
@@ -273,7 +279,7 @@ func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {
 // renderPartial executes a template fragment (no layout).
 func (s *Server) renderPartial(w http.ResponseWriter, name string, data interface{}) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := s.tmpl.ExecuteTemplate(w, name, data); err != nil {
+	if err := s.partials.ExecuteTemplate(w, name, data); err != nil {
 		s.log.Error("web: render partial", "template", name, "error", err)
 	}
 }

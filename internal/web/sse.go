@@ -50,7 +50,7 @@ func (s *Server) sendQueueSSE(w http.ResponseWriter, flusher http.Flusher) {
 
 	// Render the queue rows partial
 	var htmlBuf bytes.Buffer
-	err = s.tmpl.ExecuteTemplate(&htmlBuf, "queue_rows.html", downloads)
+	err = s.partials.ExecuteTemplate(&htmlBuf, "queue_rows.html", downloads)
 	if err != nil {
 		s.log.Error("web: sse render", "error", err)
 		return

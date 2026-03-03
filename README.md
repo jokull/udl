@@ -46,7 +46,50 @@ brew install par2cmdline
 
 ./udl plex servers             # list Plex friend servers
 ./udl plex check "Title"       # check if friends have it
+./udl plex cleanup             # show unwatched old media (dry-run)
+./udl plex cleanup --execute   # delete unwatched media older than 90 days
+./udl plex cleanup --days 30   # shorter age threshold
 ```
+
+## Web UI
+
+Enable the optional web dashboard by adding a `[web]` section to config:
+
+```toml
+[web]
+port = 9876
+bind = "127.0.0.1"
+```
+
+The dashboard shows library stats, active downloads with live progress (via SSE), queue status, series schedule, and download history. Navigation: Dashboard, Movies, Series, Queue, Schedule, History.
+
+![UDL Dashboard](docs/dashboard.png)
+
+Pages use htmx for dynamic updates — the queue refreshes automatically via server-sent events.
+
+## Plex Cleanup
+
+Reclaim disk space by deleting media that was never watched on your Plex server. Queries your owned Plex server's watch history and identifies items added more than N days ago with zero plays.
+
+```bash
+./udl plex cleanup                 # dry-run — shows what would be deleted
+./udl plex cleanup --days 30       # items older than 30 days (default: 90)
+./udl plex cleanup --execute       # actually delete files and reset to "wanted"
+./udl plex cleanup --verbose       # also show kept items with reasons
+```
+
+Output:
+```
+ACTION  TYPE    TITLE                QUALITY       AGE   SIZE
+delete  movie   Late Night (2024)    WEBDL-1080p   120d  4.2 GB
+delete  series  The Bear (2022)      WEBDL-1080p   95d   18.7 GB
+keep    movie   Dune Part Two (2024) WEBDL-1080p   45d   — (too recent)
+keep    series  Severance (2022)     WEBDL-1080p   60d   — (watched)
+
+would delete 2 items (22.9 GB), keep 2 — use --execute to apply
+```
+
+On `--execute`: files are deleted, database status is reset to "wanted" (so they can be re-grabbed later if needed), and a "cleaned" history event is recorded. Empty directories are cleaned up automatically. Requires `[plex] token` in config.
 
 ## Configuration
 
@@ -82,7 +125,11 @@ url = "https://indexer.example.com"
 apikey = "key"
 
 [plex]
-token = "your-plex-token"  # optional, enables friend library checking
+token = "your-plex-token"  # optional, enables friend library checking + cleanup
+
+[web]
+port = 9876          # optional, enables web dashboard
+bind = "127.0.0.1"   # default: localhost only
 ```
 
 ## Library Import
@@ -161,7 +208,7 @@ go test ./internal/daemon/ -run TestLibrary -v    # library management tests
 ## Design Principles
 
 - Usenet only — no torrents
-- No web UI — CLI only (TUI planned)
+- Optional web dashboard — CLI is the primary interface
 - No custom naming templates
 - Minimal config surface — provider credentials, indexer keys, library paths
 - Failed releases are blocklisted, not retried

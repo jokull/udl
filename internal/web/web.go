@@ -54,13 +54,14 @@ type StatusData struct {
 
 // Server is the embedded HTTP server.
 type Server struct {
-	svc    ServiceInterface
-	cfg    *config.Config
-	db     *database.DB
-	log    *slog.Logger
-	mux    *http.ServeMux
-	tmpl   *template.Template
-	server *http.Server
+	svc      ServiceInterface
+	cfg      *config.Config
+	db       *database.DB
+	log      *slog.Logger
+	mux      *http.ServeMux
+	pages    map[string]*template.Template // per-page templates (layout + page)
+	partials *template.Template            // shared partials (no layout)
+	server   *http.Server
 }
 
 // New creates a new web server.
@@ -103,22 +104,57 @@ func (s *Server) Shutdown() error {
 
 func (s *Server) loadTemplates() error {
 	funcMap := template.FuncMap{
-		"nullable":    tplNullable,
-		"nullInt":     tplNullInt,
-		"fmtBytes":    tplFmtBytes,
+		"nullable":     tplNullable,
+		"nullInt":      tplNullInt,
+		"fmtBytes":     tplFmtBytes,
 		"fmtNullBytes": tplFmtNullBytes,
-		"fmtTime":     tplFmtTime,
-		"fmtNullTime": tplFmtNullTime,
-		"fmtProgress": tplFmtProgress,
-		"statusClass": tplStatusClass,
-		"seasonEp":    tplSeasonEp,
+		"fmtTime":      tplFmtTime,
+		"fmtNullTime":  tplFmtNullTime,
+		"fmtProgress":  tplFmtProgress,
+		"statusClass":  tplStatusClass,
+		"seasonEp":     tplSeasonEp,
 	}
 
-	tmpl, err := template.New("").Funcs(funcMap).ParseFS(templateFS, "templates/*.html")
+	layoutBytes, err := templateFS.ReadFile("templates/layout.html")
 	if err != nil {
-		return err
+		return fmt.Errorf("read layout: %w", err)
 	}
-	s.tmpl = tmpl
+
+	// Build per-page templates: each page gets its own clone of layout so
+	// the "content" and "title" blocks don't collide across pages.
+	pageFiles := []string{
+		"dashboard.html",
+		"movies.html",
+		"series.html",
+		"queue.html",
+		"schedule.html",
+		"history.html",
+	}
+	s.pages = make(map[string]*template.Template, len(pageFiles))
+	for _, name := range pageFiles {
+		pageBytes, err := templateFS.ReadFile("templates/" + name)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", name, err)
+		}
+		t, err := template.New(name).Funcs(funcMap).Parse(string(layoutBytes))
+		if err != nil {
+			return fmt.Errorf("parse layout for %s: %w", name, err)
+		}
+		if _, err := t.Parse(string(pageBytes)); err != nil {
+			return fmt.Errorf("parse %s: %w", name, err)
+		}
+		s.pages[name] = t
+	}
+
+	// Partials share a single template set (they have unique define names).
+	s.partials, err = template.New("").Funcs(funcMap).ParseFS(templateFS,
+		"templates/episodes_partial.html",
+		"templates/queue_rows.html",
+	)
+	if err != nil {
+		return fmt.Errorf("parse partials: %w", err)
+	}
+
 	return nil
 }
 
