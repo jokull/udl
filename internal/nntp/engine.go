@@ -229,6 +229,22 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 		return outputFiles, fmt.Errorf("nntp: %d of %d segments failed", failed, totalSegments)
 	}
 
+	// Guard against vacuous success: if context was canceled, workers may have
+	// exited before processing all segments.
+	if err := ctx.Err(); err != nil {
+		return outputFiles, fmt.Errorf("nntp: download canceled: %w", err)
+	}
+
+	// Guard against zero-work scenarios (e.g. all providers are fill-only with
+	// Level>0, so no primary workers were spawned).
+	completed := doneSegments.Load()
+	if totalSegments > 0 && completed == 0 {
+		return outputFiles, fmt.Errorf("nntp: no segments downloaded (0 of %d)", totalSegments)
+	}
+	if completed < int64(totalSegments) {
+		return outputFiles, fmt.Errorf("nntp: incomplete download: %d of %d segments completed", completed, totalSegments)
+	}
+
 	return outputFiles, nil
 }
 

@@ -97,8 +97,8 @@ func (c *Conn) Auth(username, password string) error {
 const bodyTimeout = 60 * time.Second
 
 // maxBodySize is the maximum size of a single NNTP article body.
-// yEnc segments are typically 500KB-750KB; 2MB provides ample headroom.
-const maxBodySize = 2 * 1024 * 1024
+// Most yEnc segments are 500KB-750KB but some can be much larger.
+const maxBodySize = 64 * 1024 * 1024
 
 // Body fetches the body of an article by message ID.
 // Returns the raw body as an io.Reader. The caller must read fully before

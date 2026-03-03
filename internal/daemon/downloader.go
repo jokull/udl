@@ -787,9 +787,9 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 		var stuckCount int
 		_ = db.QueryRow(`
 			SELECT COUNT(*) FROM (
-				SELECT id FROM movies WHERE status = 'downloading' AND download_started_at IS NOT NULL AND download_started_at < datetime('now', '-2 hours')
+				SELECT id FROM movies WHERE status IN ('downloading', 'post_processing') AND download_started_at IS NOT NULL AND download_started_at < datetime('now', '-2 hours')
 				UNION ALL
-				SELECT id FROM episodes WHERE status = 'downloading' AND download_started_at IS NOT NULL AND download_started_at < datetime('now', '-2 hours')
+				SELECT id FROM episodes WHERE status IN ('downloading', 'post_processing') AND download_started_at IS NOT NULL AND download_started_at < datetime('now', '-2 hours')
 			)`).Scan(&stuckCount)
 		if stuckCount > 0 {
 			checks = append(checks, HealthCheck{

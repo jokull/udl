@@ -36,6 +36,7 @@ type Result struct {
 // The reader should contain the raw article body (after NNTP headers).
 func Decode(r io.Reader) (*Result, error) {
 	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	// Find and parse =ybegin line
 	var header Header

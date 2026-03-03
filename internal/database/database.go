@@ -1073,13 +1073,13 @@ func (db *DB) SetMediaDownloadError(category string, id int64, errMsg string) er
 	return err
 }
 
-// ResetStuckMedia resets media items stuck in 'downloading' state for >2 hours.
+// ResetStuckMedia resets media items stuck in 'downloading' or 'post_processing' state for >2 hours.
 func (db *DB) ResetStuckMedia() (int64, error) {
 	var total int64
 	for _, table := range []string{"movies", "episodes"} {
 		res, err := db.Exec(fmt.Sprintf(`
-			UPDATE %s SET status = 'queued', download_error = 'reset: stuck in downloading state'
-			WHERE status = 'downloading'
+			UPDATE %s SET status = 'queued', download_error = 'reset: stuck in ' || status || ' state'
+			WHERE status IN ('downloading', 'post_processing')
 			  AND download_started_at IS NOT NULL
 			  AND download_started_at < datetime('now', '-2 hours')`, table))
 		if err != nil {

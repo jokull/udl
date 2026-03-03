@@ -89,9 +89,18 @@ func SubtitlePath(mediaPath, lang, subExt string) string {
 	return fmt.Sprintf("%s.%s%s", base, lang, subExt)
 }
 
+// ErrDestExists is returned when Import would overwrite an existing file.
+var ErrDestExists = fmt.Errorf("organize: destination already exists")
+
 // Import moves a file from src to dst, creating directories as needed.
 // Uses hardlink if same filesystem, otherwise copy+delete.
+// Returns ErrDestExists if the destination file already exists.
 func Import(src, dst string) error {
+	// Prevent overwriting existing files.
+	if _, err := os.Stat(dst); err == nil {
+		return fmt.Errorf("%w: %s", ErrDestExists, dst)
+	}
+
 	// Create parent directories.
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return fmt.Errorf("organize: mkdir %s: %w", filepath.Dir(dst), err)
@@ -139,6 +148,12 @@ func copyAndDelete(src, dst string) error {
 	if err := os.Rename(tmpDst, dst); err != nil {
 		os.Remove(tmpDst)
 		return fmt.Errorf("organize: rename %s -> %s: %w", tmpDst, dst, err)
+	}
+
+	// Fsync the parent directory to ensure the rename is durable on crash.
+	if dir, err := os.Open(filepath.Dir(dst)); err == nil {
+		dir.Sync()
+		dir.Close()
 	}
 
 	os.Remove(src)
