@@ -83,13 +83,13 @@ type AddMovieArgs struct {
 type AddMovieReply struct {
 	Title   string
 	Year    int
-	ID      int64
+	TmdbID  int
 	Grabbed bool // true if a release was immediately enqueued
 }
 
 // SearchMovieArgs contains arguments for the SearchMovie (indexer search) RPC method.
 type SearchMovieArgs struct {
-	MovieID int64 // DB movie ID (required)
+	TmdbID int // TMDB ID (required)
 }
 
 // SearchMovieReply contains indexer search results for manual selection.
@@ -99,8 +99,8 @@ type SearchMovieReply struct {
 
 // GrabMovieReleaseArgs contains arguments for the GrabMovieRelease RPC method.
 type GrabMovieReleaseArgs struct {
-	MovieID int64 // DB movie ID (required)
-	Index   int   // 1-based index into search results
+	TmdbID int // TMDB ID (required)
+	Index  int // 1-based index into search results
 }
 
 // GrabMovieReleaseReply contains the reply for the GrabMovieRelease RPC method.
@@ -127,7 +127,7 @@ type AddSeriesArgs struct {
 type AddSeriesReply struct {
 	Title        string
 	Year         int
-	ID           int64
+	TmdbID       int
 	EpisodeCount int
 	Grabbed      int // number of episodes immediately enqueued
 }
@@ -175,35 +175,38 @@ type StatusReply struct {
 
 // RemoveMovieArgs contains arguments for the RemoveMovie RPC method.
 type RemoveMovieArgs struct {
-	ID int64 // DB movie ID (required)
+	TmdbID int // TMDB ID (required)
 }
 
 // RemoveMovieReply contains the reply for the RemoveMovie RPC method.
 type RemoveMovieReply struct {
-	ID    int64
-	Title string
-	Year  int
+	TmdbID int
+	Title  string
+	Year   int
 }
 
 // RemoveSeriesArgs contains arguments for the RemoveSeries RPC method.
 type RemoveSeriesArgs struct {
-	ID int64 // DB series ID (required)
+	TmdbID int // TMDB ID (required)
 }
 
 // RemoveSeriesReply contains the reply for the RemoveSeries RPC method.
 type RemoveSeriesReply struct {
-	ID    int64
-	Title string
-	Year  int
+	TmdbID int
+	Title  string
+	Year   int
 }
 
 // --- Queue retry types ---
 
 // RetryDownloadArgs contains arguments for the RetryDownload RPC method.
-// Specify Category + MediaID to retry a single item, or leave both empty to retry all failed.
+// Specify Category + identifier to retry a single item, or leave both empty to retry all failed.
+// For movies: TmdbID is used to identify the movie.
+// For episodes: MediaID (DB episode ID) is used.
 type RetryDownloadArgs struct {
 	Category string // "movie" or "episode"
-	MediaID  int64  // media item ID
+	MediaID  int64  // DB episode ID (for episodes)
+	TmdbID   int    // TMDB ID (for movies)
 }
 
 // RetryDownloadReply contains the reply for the RetryDownload RPC method.
@@ -290,7 +293,7 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 
 	reply.Title = movie.Title
 	reply.Year = movie.Year
-	reply.ID = id
+	reply.TmdbID = movie.TMDBID
 	s.log.Info("added movie", "title", movie.Title, "year", movie.Year, "tmdb_id", movie.TMDBID)
 
 	// Immediately search indexers for this movie.
@@ -325,13 +328,16 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	if len(s.indexers) == 0 {
 		return fmt.Errorf("SearchMovie: no indexers configured")
 	}
-	if args.MovieID == 0 {
-		return fmt.Errorf("SearchMovie: movie ID is required")
+	if args.TmdbID == 0 {
+		return fmt.Errorf("SearchMovie: TMDB ID is required")
 	}
 
-	movie, err := s.db.GetMovie(args.MovieID)
+	movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
 	if err != nil {
 		return fmt.Errorf("SearchMovie: %w", err)
+	}
+	if movie == nil {
+		return fmt.Errorf("SearchMovie: no movie with TMDB ID %d (use 'udl movie add' first)", args.TmdbID)
 	}
 
 	imdbID := ""
@@ -357,16 +363,19 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 	if len(s.indexers) == 0 {
 		return fmt.Errorf("GrabMovieRelease: no indexers configured")
 	}
-	if args.MovieID == 0 {
-		return fmt.Errorf("GrabMovieRelease: movie ID is required")
+	if args.TmdbID == 0 {
+		return fmt.Errorf("GrabMovieRelease: TMDB ID is required")
 	}
 	if args.Index < 1 {
 		return fmt.Errorf("GrabMovieRelease: index must be >= 1")
 	}
 
-	movie, err := s.db.GetMovie(args.MovieID)
+	movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
 	if err != nil {
 		return fmt.Errorf("GrabMovieRelease: %w", err)
+	}
+	if movie == nil {
+		return fmt.Errorf("GrabMovieRelease: no movie with TMDB ID %d (use 'udl movie add' first)", args.TmdbID)
 	}
 
 	imdbID := ""
@@ -459,7 +468,7 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 
 	reply.Title = series.Title
 	reply.Year = series.Year
-	reply.ID = id
+	reply.TmdbID = series.TMDBID
 	s.log.Info("added series", "title", series.Title, "year", series.Year,
 		"tmdb_id", series.TMDBID, "tvdb_id", series.TVDBID)
 
@@ -582,39 +591,61 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 
 // RemoveMovie removes a movie from the database (not from disk).
 func (s *Service) RemoveMovie(args *RemoveMovieArgs, reply *RemoveMovieReply) error {
-	if args.ID == 0 {
-		return fmt.Errorf("RemoveMovie: movie ID is required")
+	if args.TmdbID == 0 {
+		return fmt.Errorf("RemoveMovie: TMDB ID is required")
 	}
-	movie, err := s.db.GetMovie(args.ID)
+	movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
 	if err != nil {
 		return fmt.Errorf("RemoveMovie: %w", err)
 	}
-	reply.ID = movie.ID
+	if movie == nil {
+		return fmt.Errorf("RemoveMovie: no movie with TMDB ID %d", args.TmdbID)
+	}
+	reply.TmdbID = movie.TmdbID
 	reply.Title = movie.Title
 	reply.Year = movie.Year
-	return s.db.RemoveMovie(args.ID)
+	return s.db.RemoveMovie(movie.ID)
 }
 
 // RemoveSeries removes a series and its episodes from the database (not from disk).
 func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply) error {
-	if args.ID == 0 {
-		return fmt.Errorf("RemoveSeries: series ID is required")
+	if args.TmdbID == 0 {
+		return fmt.Errorf("RemoveSeries: TMDB ID is required")
 	}
-	series, err := s.db.GetSeries(args.ID)
+	series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
 	if err != nil {
 		return fmt.Errorf("RemoveSeries: %w", err)
 	}
-	reply.ID = series.ID
+	if series == nil {
+		return fmt.Errorf("RemoveSeries: no series with TMDB ID %d", args.TmdbID)
+	}
+	reply.TmdbID = series.TmdbID
 	reply.Title = series.Title
 	reply.Year = series.Year
-	return s.db.RemoveSeries(args.ID)
+	return s.db.RemoveSeries(series.ID)
 }
 
 // RetryDownload resets failed media items to wanted and re-searches for them.
 // The failed release is already blocklisted, so re-search will pick a different one.
 func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadReply) error {
-	if args.Category != "" && args.MediaID > 0 {
-		// Single retry: reset this specific failed item and re-search.
+	if args.Category == "movie" && args.TmdbID != 0 {
+		// Single movie retry by TMDB ID.
+		movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
+		if err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		if movie == nil {
+			return fmt.Errorf("RetryDownload: no movie with TMDB ID %d", args.TmdbID)
+		}
+		if err := s.db.ResetMediaForRetry("movie", movie.ID); err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		if len(s.indexers) > 0 {
+			s.retryMedia("movie", movie.ID)
+		}
+		reply.Count = 1
+	} else if args.Category != "" && args.MediaID > 0 {
+		// Single retry by DB media ID (episodes, or web UI path).
 		if err := s.db.ResetMediaForRetry(args.Category, args.MediaID); err != nil {
 			return fmt.Errorf("RetryDownload: %w", err)
 		}
@@ -705,7 +736,7 @@ type PlexServersReply struct {
 
 // PlexCheckArgs contains arguments for the PlexCheck RPC method.
 type PlexCheckArgs struct {
-	MovieID int64 // DB movie ID (required)
+	TmdbID int // TMDB ID (required)
 }
 
 // PlexCheckReply contains the reply for the PlexCheck RPC method.
@@ -793,18 +824,21 @@ func (s *Service) PlexServers(args *Empty, reply *PlexServersReply) error {
 	return nil
 }
 
-// PlexCheck searches all shared Plex servers for a movie by its DB ID.
+// PlexCheck searches all shared Plex servers for a movie by TMDB ID.
 func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 	if s.plex == nil {
 		return fmt.Errorf("PlexCheck: Plex integration not configured (set plex.token or PLEX_TOKEN)")
 	}
-	if args.MovieID == 0 {
-		return fmt.Errorf("PlexCheck: movie ID is required")
+	if args.TmdbID == 0 {
+		return fmt.Errorf("PlexCheck: TMDB ID is required")
 	}
 
-	movie, err := s.db.GetMovie(args.MovieID)
+	movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
 	if err != nil {
 		return fmt.Errorf("PlexCheck: %w", err)
+	}
+	if movie == nil {
+		return fmt.Errorf("PlexCheck: no movie with TMDB ID %d (use 'udl movie add' first)", args.TmdbID)
 	}
 
 	imdbID := ""

@@ -15,28 +15,70 @@ Requires `par2cmdline` for PAR2 verify/repair:
 brew install par2cmdline
 ```
 
+## Agent-Optimized CLI
+
+The CLI is designed for deterministic, non-interactive use. Every command takes
+TMDB IDs (the universal movie/TV identifier), and every list command outputs
+TMDB IDs as the first column so output can be piped into the next command. This
+makes UDL ideal for scripting and LLM agent workflows — no guessing, no
+interactive prompts, no internal database IDs, just TMDB IDs from search to
+grab to remove.
+
+**Workflow: search TMDB, then add by TMDB ID, then check releases — same ID throughout.**
+
+```bash
+$ udl movie search "Dog"
+TMDB ID  TITLE          YEAR
+838240   Dog            2022
+1025468  The Dog        2024
+
+$ udl movie add 838240
+added: Dog (2022) [tmdb=838240]
+  -> release found and enqueued for download
+
+$ udl movie releases 838240
+#  TITLE                          QUALITY        SIZE      SCORE
+1  Dog.2022.1080p.BluRay-GROUP    Bluray-1080p   8.5 GB    1200
+
+$ udl movie grab 838240 1
+grabbed: Dog (2022) [tmdb=838240]
+  release: Dog.2022.1080p.BluRay-GROUP
+  quality: Bluray-1080p
+```
+
+Every command uses the same TMDB ID — no internal database IDs exposed.
+Queue shows `movie:<tmdb-id>` matching the retry syntax (`udl queue retry movie:838240`).
+
 ## Usage
 
 ```bash
 ./udl daemon                   # start daemon (foreground)
 ./udl status                   # check daemon status
 
-./udl movie add "Title"        # add movie to wanted list
-./udl movie search "Title"     # search indexers
-./udl movie list               # list movies
-./udl movie remove "Title"     # remove movie
+# Movies — TMDB ID is the only identifier you need
+./udl movie search "Title"     # search TMDB, shows TMDB IDs
+./udl movie add <tmdb-id>      # add by TMDB ID
+./udl movie list               # list movies (shows TMDB IDs)
+./udl movie releases <tmdb-id> # search indexers for releases
+./udl movie grab <tmdb-id> <#> # grab release # for a movie
+./udl movie remove <tmdb-id>   # remove from monitoring
 
-./udl tv add "Title"           # add TV series
-./udl tv list                  # list series
-./udl tv remove "Title"        # remove series
+# TV — same pattern, all by TMDB ID
+./udl tv search "Title"        # search TMDB for series
+./udl tv add <tmdb-id>         # add by TMDB ID
+./udl tv list                  # list series (shows TMDB IDs)
+./udl tv remove <tmdb-id>      # remove from monitoring
+./udl tv refresh               # refresh episode metadata from TMDB
 
-./udl queue                    # show download queue
-./udl queue retry [id]         # retry failed download
+# Queue & history
+./udl queue                    # show queue (movie:<tmdb-id> format)
+./udl queue retry movie:838240 # retry specific failed download
 ./udl history                  # show download history
 ./udl blocklist                # show blocklisted releases
 ./udl blocklist clear          # clear all blocklist entries
 ./udl blocklist remove <id>    # remove specific entry
 
+# Library management
 ./udl library import <dir>              # identify and import media (dry-run)
 ./udl library import <dir> --execute    # actually perform the import
 ./udl library cleanup                   # find orphan/misnamed files (dry-run)
@@ -44,8 +86,9 @@ brew install par2cmdline
 ./udl library verify                    # read-only DB/disk consistency check
 ./udl library prune-incomplete          # find stale download dirs (dry-run)
 
+# Plex integration
 ./udl plex servers             # list Plex friend servers
-./udl plex check "Title"       # check if friends have it
+./udl plex check <tmdb-id>     # check if friends have it (by TMDB ID)
 ./udl plex cleanup             # show unwatched old media (dry-run)
 ./udl plex cleanup --execute   # delete unwatched media older than 90 days
 ./udl plex cleanup --days 30   # shorter age threshold

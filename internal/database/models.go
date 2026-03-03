@@ -70,6 +70,7 @@ type Episode struct {
 // Populated by a UNION query across movies and episodes tables.
 type QueueItem struct {
 	MediaID         int64
+	TmdbID          int            // TMDB ID (movie tmdb_id or 0 for episodes)
 	Category        string         // "movie" or "episode"
 	Title           string         // display title (computed in query)
 	Status          string
