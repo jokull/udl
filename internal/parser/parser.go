@@ -75,6 +75,11 @@ var (
 
 // Parse extracts structured metadata from a Usenet/scene release title.
 func Parse(title string) Result {
+	// Cap input length to prevent ReDoS on pathological inputs.
+	if len(title) > 1000 {
+		title = title[:1000]
+	}
+
 	r := Result{
 		Season:  -1,
 		Episode: -1,

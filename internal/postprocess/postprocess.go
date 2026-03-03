@@ -373,8 +373,10 @@ func extractRAR(rarFile, outputDir string, log *slog.Logger) ([]string, error) {
 
 		destPath := filepath.Join(outputDir, header.Name)
 
-		// Ensure the destination is within the output directory (prevent zip slip)
-		if !strings.HasPrefix(filepath.Clean(destPath), filepath.Clean(outputDir)+string(os.PathSeparator)) {
+		// Ensure the destination is within the output directory (prevent zip slip).
+		// Use filepath.Rel for robust path traversal detection.
+		rel, relErr := filepath.Rel(outputDir, filepath.Clean(destPath))
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 			log.Warn("skipping entry with suspicious path", "name", header.Name)
 			continue
 		}

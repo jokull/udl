@@ -135,9 +135,16 @@ CREATE TABLE IF NOT EXISTS blocklist (
 		return err
 	}
 
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_blocklist_lookup ON blocklist(media_type, media_id, release_title)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_history_lookup ON history(media_type, media_id, event)`)
+	for _, idx := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_movies_status ON movies(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_blocklist_lookup ON blocklist(media_type, media_id, release_title)`,
+		`CREATE INDEX IF NOT EXISTS idx_history_lookup ON history(media_type, media_id, event)`,
+	} {
+		if _, err := db.Exec(idx); err != nil {
+			return fmt.Errorf("create index: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -204,11 +211,24 @@ func (db *DB) WantedMovies() ([]Movie, error) {
 	return movies, rows.Err()
 }
 
+// tableFor returns the SQL table name for a category or table alias.
+// Panics if the value is not "movies", "episodes", "movie", or "episode".
+func tableFor(category string) string {
+	switch category {
+	case "movies", "movie":
+		return "movies"
+	case "episodes", "episode":
+		return "episodes"
+	default:
+		panic(fmt.Sprintf("database: invalid table/category %q", category))
+	}
+}
+
 // UpdateMediaStatus updates the status, quality, and file_path of a media item.
 // table must be "movies" or "episodes".
 func (db *DB) UpdateMediaStatus(table string, id int64, status, quality, filePath string) error {
 	_, err := db.Exec(
-		fmt.Sprintf(`UPDATE %s SET status = ?, quality = ?, file_path = ? WHERE id = ?`, table),
+		fmt.Sprintf(`UPDATE %s SET status = ?, quality = ?, file_path = ? WHERE id = ?`, tableFor(table)),
 		status, nullString(quality), nullString(filePath), id,
 	)
 	return err
@@ -463,7 +483,10 @@ func (db *DB) WithTx(fn func(tx *sql.Tx) error) error {
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
 }
 
 // GetMovie returns a single movie by ID.
@@ -901,10 +924,7 @@ func queueStatusPriority(status string) int {
 // Only updates if the current status is 'wanted' or 'failed', preventing duplicate
 // enqueues. Returns (true, nil) if enqueued, (false, nil) if already active.
 func (db *DB) EnqueueDownload(category string, mediaID int64, nzbURL, nzbName string, sizeBytes int64, source string) (bool, error) {
-	table := "movies"
-	if category == "episode" {
-		table = "episodes"
-	}
+	table := tableFor(category)
 	res, err := db.Exec(
 		fmt.Sprintf(`UPDATE %s SET status = 'queued', nzb_url = ?, nzb_name = ?, download_size = ?,
 			download_source = ?, download_progress = 0, download_bytes = 0, download_error = NULL,
@@ -1011,7 +1031,7 @@ func (db *DB) QueueItems(limit int) ([]QueueItem, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	// Sort: downloading first, then post_processing, then queued, then failed.
+	// Sort: post_processing first, then downloading, then queued, then failed.
 	sort.Slice(items, func(i, j int) bool {
 		return queueStatusPriority(items[i].Status) < queueStatusPriority(items[j].Status)
 	})
@@ -1024,10 +1044,7 @@ func (db *DB) QueueItems(limit int) ([]QueueItem, error) {
 // UpdateMediaDownloadStatus updates the download status of a media item.
 // Sets download_started_at when transitioning to "downloading".
 func (db *DB) UpdateMediaDownloadStatus(category string, id int64, status string) error {
-	table := "movies"
-	if category == "episode" {
-		table = "episodes"
-	}
+	table := tableFor(category)
 	if status == "downloading" {
 		_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET status = ?, download_started_at = CURRENT_TIMESTAMP WHERE id = ?`, table), status, id)
 		return err
@@ -1038,10 +1055,7 @@ func (db *DB) UpdateMediaDownloadStatus(category string, id int64, status string
 
 // UpdateMediaProgress updates download progress and downloaded byte count.
 func (db *DB) UpdateMediaProgress(category string, id int64, progress float64, downloadedBytes int64) error {
-	table := "movies"
-	if category == "episode" {
-		table = "episodes"
-	}
+	table := tableFor(category)
 	_, err := db.Exec(
 		fmt.Sprintf(`UPDATE %s SET download_progress = ?, download_bytes = ? WHERE id = ?`, table),
 		progress, downloadedBytes, id,
@@ -1051,10 +1065,7 @@ func (db *DB) UpdateMediaProgress(category string, id int64, progress float64, d
 
 // SetMediaDownloadError marks a media item as failed with an error message.
 func (db *DB) SetMediaDownloadError(category string, id int64, errMsg string) error {
-	table := "movies"
-	if category == "episode" {
-		table = "episodes"
-	}
+	table := tableFor(category)
 	_, err := db.Exec(
 		fmt.Sprintf(`UPDATE %s SET status = 'failed', download_error = ? WHERE id = ?`, table),
 		errMsg, id,
@@ -1123,10 +1134,7 @@ func (db *DB) FailedMediaCount24h() (int, error) {
 
 // ResetMediaForRetry resets a single failed media item to 'wanted' and clears download fields.
 func (db *DB) ResetMediaForRetry(category string, mediaID int64) error {
-	table := "movies"
-	if category == "episode" {
-		table = "episodes"
-	}
+	table := tableFor(category)
 	_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET status = 'wanted',
 		nzb_url = NULL, nzb_name = NULL, download_progress = 0,
 		download_size = NULL, download_bytes = 0, download_error = NULL,
@@ -1138,16 +1146,35 @@ func (db *DB) ResetMediaForRetry(category string, mediaID int64) error {
 // ClearMediaDownloadFields resets all download-related columns on a media item
 // without changing its status. Used after completing a download.
 func (db *DB) ClearMediaDownloadFields(category string, mediaID int64) error {
-	table := "movies"
-	if category == "episode" {
-		table = "episodes"
-	}
+	table := tableFor(category)
 	_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET
 		nzb_url = NULL, nzb_name = NULL, download_progress = 0,
 		download_size = NULL, download_bytes = 0, download_error = NULL,
 		download_source = NULL, download_started_at = NULL
 		WHERE id = ?`, table), mediaID)
 	return err
+}
+
+// CompleteDownloadTx atomically clears download fields and records a history event
+// in a single transaction. Prevents inconsistent state on crash.
+func (db *DB) CompleteDownloadTx(category string, mediaID int64, title, nzbName, quality string) error {
+	return db.WithTx(func(tx *sql.Tx) error {
+		table := tableFor(category)
+		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET
+			nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+			download_size = NULL, download_bytes = 0, download_error = NULL,
+			download_source = NULL, download_started_at = NULL
+			WHERE id = ?`, table), mediaID); err != nil {
+			return fmt.Errorf("clear download fields: %w", err)
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO history (media_type, media_id, title, event, source, quality) VALUES (?, ?, ?, ?, ?, ?)`,
+			category, mediaID, title, "completed", nullString(nzbName), nullString(quality),
+		); err != nil {
+			return fmt.Errorf("add history: %w", err)
+		}
+		return nil
+	})
 }
 
 // FailedMediaItems returns category + media_id pairs for all failed media items.

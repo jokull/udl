@@ -62,7 +62,11 @@ func Dial(host string, port int, useTLS bool) (*Conn, error) {
 }
 
 // Auth authenticates with the server using AUTHINFO USER/PASS.
+// Sets a 30s deadline for the entire auth exchange to prevent stalls.
 func (c *Conn) Auth(username, password string) error {
+	c.conn.SetDeadline(time.Now().Add(30 * time.Second))
+	defer c.conn.SetDeadline(time.Time{})
+
 	// Send username.
 	if err := c.sendCommand("AUTHINFO USER " + username); err != nil {
 		return fmt.Errorf("nntp: auth user: %w", err)

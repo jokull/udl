@@ -87,18 +87,21 @@ func (s *Scheduler) runEpisodeSearch() {
 			tvdbID = int(ep.TvdbID.Int64)
 		}
 
-		ok, err := s.svc.SearchAndGrabEpisode(&ep, tvdbID)
-		if err != nil {
+		ok, searchErr := s.svc.SearchAndGrabEpisode(&ep, tvdbID)
+		if searchErr != nil {
 			s.svc.log.Error("episode search: search failed",
-				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
+				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", searchErr)
 		}
 		if ok {
 			grabbed++
 		}
 
-		// Always update searched_at regardless of result.
-		if err := s.svc.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
-			s.svc.log.Error("episode search: update searched_at failed", "episode_id", ep.ID, "error", err)
+		// Only update searched_at when search completed without error,
+		// so the episode is retried sooner on failures.
+		if searchErr == nil {
+			if err := s.svc.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
+				s.svc.log.Error("episode search: update searched_at failed", "episode_id", ep.ID, "error", err)
+			}
 		}
 	}
 
@@ -212,7 +215,6 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 			continue
 		}
 
-		newCount := 0
 		for _, ep := range episodes {
 			// UpsertEpisode uses INSERT OR IGNORE, so existing episodes are skipped.
 			err := s.svc.db.UpsertEpisode(series.ID, ep.Season, ep.Episode, ep.Title, ep.AirDate)
@@ -221,12 +223,6 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 					"season", ep.Season, "episode", ep.Episode, "error", err)
 			}
 		}
-
-		// Count how many new episodes were actually inserted by comparing totals.
-		// A simpler approach: check rows affected, but INSERT OR IGNORE doesn't
-		// reliably report that. Instead, we count episodes before vs after.
-		// For logging purposes, we just report the TMDB episode count.
-		_ = newCount
 
 		// Check series status on TMDB.
 		tmdbSeries, err := s.tmdb.GetSeries(series.TmdbID)
@@ -251,7 +247,11 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 		s.svc.log.Info("tmdb refresh: checked series", "series", series.Title, "tmdb_episodes", len(episodes))
 
 		// Rate limit to avoid TMDB API throttling.
-		time.Sleep(250 * time.Millisecond)
+		select {
+		case <-time.After(250 * time.Millisecond):
+		case <-s.stop:
+			return result
+		}
 	}
 
 	return result

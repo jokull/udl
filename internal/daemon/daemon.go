@@ -877,13 +877,16 @@ func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 		return fmt.Errorf("PlexCheck: %w", err)
 	}
 
-	// Search all servers concurrently to avoid sequential timeouts.
+	// Search all servers concurrently with bounded parallelism.
 	var mu sync.Mutex
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10)
 	for _, srv := range servers {
 		wg.Add(1)
 		go func(srv plex.Server) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 			matches, err := s.plex.SearchMovie(srv, movie.Title, movie.Year, imdbID, movie.TmdbID)
 			if err != nil {
 				s.log.Debug("plex check: search failed", "server", srv.Name, "error", err)
@@ -1240,12 +1243,12 @@ func (s *Service) RefreshSeries(args *Empty, reply *RefreshSeriesReply) error {
 }
 
 // SocketPath returns the path to the daemon Unix socket.
-func SocketPath() string {
+func SocketPath() (string, error) {
 	dir, err := config.DataDir()
 	if err != nil {
-		return "/tmp/udl.sock"
+		return "", fmt.Errorf("socket path: %w", err)
 	}
-	return filepath.Join(dir, "udl.sock")
+	return filepath.Join(dir, "udl.sock"), nil
 }
 
 // Serve starts the full daemon: RPC server, scheduler, and downloader.
@@ -1255,7 +1258,10 @@ func Serve(cfg *config.Config, db *database.DB, log *slog.Logger) error {
 
 // ServeWithContext starts the full daemon with a cancellable context.
 func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, log *slog.Logger) error {
-	sockPath := SocketPath()
+	sockPath, err := SocketPath()
+	if err != nil {
+		return fmt.Errorf("daemon: %w", err)
+	}
 	os.Remove(sockPath) // remove stale socket
 	os.MkdirAll(filepath.Dir(sockPath), 0755)
 
@@ -1392,6 +1398,15 @@ func serve(ln net.Listener, cfg *config.Config, db *database.DB, tc *tmdb.Client
 }
 
 // Dial connects to the daemon's Unix socket and returns an RPC client.
+// Uses a 5s timeout to avoid hanging if the daemon is unresponsive.
 func Dial() (*rpc.Client, error) {
-	return rpc.Dial("unix", SocketPath())
+	sockPath, err := SocketPath()
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
+	conn, err := net.DialTimeout("unix", sockPath, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial daemon: %w", err)
+	}
+	return rpc.NewClient(conn), nil
 }

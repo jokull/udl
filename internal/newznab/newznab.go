@@ -145,11 +145,14 @@ func (c *Client) DownloadNZB(release Release) ([]byte, error) {
 
 	// Append API key if not already present.
 	if !strings.Contains(dlURL, "apikey=") {
-		sep := "&"
-		if !strings.Contains(dlURL, "?") {
-			sep = "?"
+		u, err := url.Parse(dlURL)
+		if err != nil {
+			return nil, fmt.Errorf("newznab: invalid download URL %q: %w", sanitizeURL(dlURL), err)
 		}
-		dlURL = dlURL + sep + "apikey=" + url.QueryEscape(c.APIKey)
+		q := u.Query()
+		q.Set("apikey", c.APIKey)
+		u.RawQuery = q.Encode()
+		dlURL = u.String()
 	}
 
 	resp, err := c.http.Get(dlURL)

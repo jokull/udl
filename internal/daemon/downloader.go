@@ -164,10 +164,19 @@ func (d *Downloader) Start(ctx context.Context) {
 }
 
 // Stop signals the downloader to stop. Safe to call multiple times.
+// Drains the work channel to prevent goroutine leaks from blocked senders.
 func (d *Downloader) Stop() {
 	d.stopOnce.Do(func() {
 		close(d.stop)
-		d.engine.Close()
+		// Drain work channel so any goroutines blocked on send can proceed.
+		for {
+			select {
+			case <-d.workCh:
+			default:
+				d.engine.Close()
+				return
+			}
+		}
 	})
 }
 
@@ -525,18 +534,16 @@ func (d *Downloader) importToLibrary(item database.QueueItem, mediaFile string, 
 }
 
 // completeDownload records completion in the DB and cleans up the download directory.
+// Uses a transaction to atomically clear download fields and record history.
 func (d *Downloader) completeDownload(item database.QueueItem, q quality.Quality, dstPath, downloadDir string) error {
 	nzbName := ""
 	if item.NzbName.Valid {
 		nzbName = item.NzbName.String
 	}
 
-	// Clear download fields and record history.
-	if err := d.svc.db.ClearMediaDownloadFields(item.Category, item.MediaID); err != nil {
-		d.svc.log.Error("failed to clear download fields", "title", item.Title, "error", err)
-	}
-	if err := d.svc.db.AddHistory(item.Category, item.MediaID, item.Title, "completed", nzbName, q.String()); err != nil {
-		d.svc.log.Error("failed to record completion history", "title", item.Title, "error", err)
+	// Atomically clear download fields and record history in one transaction.
+	if err := d.svc.db.CompleteDownloadTx(item.Category, item.MediaID, item.Title, nzbName, q.String()); err != nil {
+		d.svc.log.Error("failed to complete download in DB", "title", item.Title, "error", err)
 	}
 
 	if err := os.RemoveAll(downloadDir); err != nil {
@@ -550,6 +557,10 @@ func (d *Downloader) completeDownload(item database.QueueItem, q quality.Quality
 // resumePostProcessing resumes a download that was in post_processing when the
 // daemon crashed. Files are already on disk in the incomplete directory.
 func (d *Downloader) resumePostProcessing(ctx context.Context, item database.QueueItem) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	dlDir := d.downloadDir(item)
 
 	// Edge case: directory was deleted between crash and restart.

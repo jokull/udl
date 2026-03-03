@@ -52,6 +52,9 @@ var problematicChars = strings.NewReplacer(
 // Example: "/library/movies/Dune Part Two (2024)/Dune.Part.Two.2024.WEBDL-1080p.mkv"
 func MoviePath(root, title string, year int, q quality.Quality, ext string) string {
 	title = SanitizeTitle(title)
+	if title == "" {
+		title = "Unknown"
+	}
 	folder := fmt.Sprintf("%s (%d)", title, year)
 	filename := fmt.Sprintf("%s.%d.%s%s", dotSeparated(title), year, q.String(), ext)
 	return filepath.Join(root, folder, filename)
@@ -61,7 +64,10 @@ func MoviePath(root, title string, year int, q quality.Quality, ext string) stri
 // Example: "/library/tv/Severance (2022)/Season 02/Severance.S02E01.Hello.Ms.Cobel.WEBDL-1080p.mkv"
 func EpisodePath(root, series string, year, season, episode int, epTitle string, q quality.Quality, ext string) string {
 	series = SanitizeTitle(series)
-	epTitle = SanitizeTitle(epTitle)
+	if series == "" {
+		series = "Unknown"
+	}
+	epTitle = SanitizeTitle(epTitle) // may be empty (optional)
 	seriesFolder := fmt.Sprintf("%s (%d)", series, year)
 	seasonFolder := fmt.Sprintf("Season %02d", season)
 
@@ -170,10 +176,15 @@ func IsSubtitleFile(path string) bool {
 	return subtitleExtensions[ext]
 }
 
-// SanitizeTitle cleans a title for use in folder names.
+// SanitizeTitle cleans a title for use in folder/file names.
 // Removes characters that are problematic on filesystems: / \ : * ? " < > |
+// Caps at 200 chars. May return empty string for empty input.
 func SanitizeTitle(title string) string {
-	return strings.TrimSpace(problematicChars.Replace(title))
+	result := strings.TrimSpace(problematicChars.Replace(title))
+	if len(result) > 200 {
+		result = result[:200]
+	}
+	return result
 }
 
 // dotSeparated converts a space-separated title to dot-separated for filenames.

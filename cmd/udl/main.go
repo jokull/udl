@@ -134,6 +134,7 @@ var queueClearCmd = &cobra.Command{
 var queueRetryCmd = &cobra.Command{
 	Use:   "retry [movie:TMDB_ID|episode:TMDB_ID:S01E02]",
 	Short: "Retry failed downloads (all or by category:id)",
+	Args:  cobra.RangeArgs(0, 1),
 	RunE:  runQueueRetry,
 }
 
@@ -804,7 +805,7 @@ func runBlocklistRemove(cmd *cobra.Command, args []string) error {
 
 	id, err := strconv.ParseInt(args[0], 10, 64)
 	if err != nil {
-		return fmt.Errorf("invalid blocklist ID: %s", args[0])
+		return fmt.Errorf("invalid blocklist ID %q: %w", args[0], err)
 	}
 
 	rpcArgs := &daemon.BlocklistRemoveArgs{ID: id}
@@ -1041,7 +1042,9 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
 			action, item.MediaType, title, item.Quality, age, size)
 	}
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
 	fmt.Println()
 
 	// Summary.
@@ -1110,7 +1113,9 @@ func runLibraryImport(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", a.Action, a.MediaType, a.Title, a.Quality, dest)
 		}
-		w.Flush()
+		if err := w.Flush(); err != nil {
+			return err
+		}
 		fmt.Println()
 	}
 
@@ -1180,7 +1185,9 @@ func runLibraryCleanup(cmd *cobra.Command, args []string) error {
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Finding, f.MediaType, f.Title, path)
 		}
-		w.Flush()
+		if err := w.Flush(); err != nil {
+			return err
+		}
 		fmt.Println()
 	}
 
@@ -1229,7 +1236,9 @@ func runLibraryPruneIncomplete(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\n", f.Reason, size, status)
 	}
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
 	fmt.Println()
 
 	totalMB := float64(reply.TotalSize) / (1024 * 1024)
@@ -1267,7 +1276,9 @@ func runLibraryVerify(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Finding, f.MediaType, f.Title, path)
 	}
-	w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
 	fmt.Println()
 
 	fmt.Printf("%d orphans, %d misnamed, %d missing\n",
