@@ -41,8 +41,8 @@ type StatusData struct {
 // StatusFunc returns dashboard status data.
 type StatusFunc func() (*StatusData, error)
 
-// RetryFunc retries a failed download by ID.
-type RetryFunc func(id int64) error
+// RetryFunc retries a failed download by category ("movie"/"episode") and media ID.
+type RetryFunc func(category string, mediaID int64) error
 
 // Server is the embedded HTTP server.
 type Server struct {
@@ -99,15 +99,16 @@ func (s *Server) Shutdown() error {
 
 func (s *Server) loadTemplates() error {
 	funcMap := template.FuncMap{
-		"nullable":     tplNullable,
-		"nullInt":      tplNullInt,
-		"fmtBytes":     tplFmtBytes,
-		"fmtNullBytes": tplFmtNullBytes,
-		"fmtTime":      tplFmtTime,
-		"fmtNullTime":  tplFmtNullTime,
-		"fmtProgress":  tplFmtProgress,
-		"statusClass":  tplStatusClass,
-		"seasonEp":     tplSeasonEp,
+		"nullable":        tplNullable,
+		"nullInt":         tplNullInt,
+		"fmtBytes":        tplFmtBytes,
+		"fmtNullBytes":    tplFmtNullBytes,
+		"fmtTime":         tplFmtTime,
+		"fmtNullTime":     tplFmtNullTime,
+		"fmtNullTimeStr":  tplFmtNullTimeStr,
+		"fmtProgress":     tplFmtProgress,
+		"statusClass":     tplStatusClass,
+		"seasonEp":        tplSeasonEp,
 	}
 
 	layoutBytes, err := templateFS.ReadFile("templates/layout.html")
@@ -171,7 +172,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /sse/queue", s.handleSSEQueue)
 
 	// Actions
-	s.mux.HandleFunc("POST /queue/retry/{id}", s.handleRetryDownload)
+	s.mux.HandleFunc("POST /queue/retry/{category}/{id}", s.handleRetryDownload)
 }
 
 // --- Template helpers ---
@@ -216,6 +217,17 @@ func tplFmtNullTime(nt sql.NullTime) string {
 		return "—"
 	}
 	return tplFmtTime(nt.Time)
+}
+
+func tplFmtNullTimeStr(ns sql.NullString) string {
+	if !ns.Valid || ns.String == "" {
+		return "—"
+	}
+	t, err := time.Parse("2006-01-02 15:04:05", ns.String)
+	if err != nil {
+		return ns.String
+	}
+	return humanize.Time(t)
 }
 
 func tplFmtProgress(p float64) string {

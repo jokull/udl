@@ -35,7 +35,7 @@ func (s *Server) handleSSEQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sendQueueSSE(w http.ResponseWriter, flusher http.Flusher) {
-	downloads, err := s.db.PendingDownloads()
+	items, err := s.db.PendingMedia()
 	if err != nil {
 		s.log.Error("web: sse queue", "error", err)
 		return
@@ -43,7 +43,7 @@ func (s *Server) sendQueueSSE(w http.ResponseWriter, flusher http.Flusher) {
 
 	// Render the queue rows partial
 	var htmlBuf bytes.Buffer
-	err = s.partials.ExecuteTemplate(&htmlBuf, "queue_rows.html", downloads)
+	err = s.partials.ExecuteTemplate(&htmlBuf, "queue_rows.html", items)
 	if err != nil {
 		s.log.Error("web: sse render", "error", err)
 		return

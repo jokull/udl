@@ -178,7 +178,7 @@ func (c *Client) discoverServersInternal() ([]Server, error) {
 
 // HasMovie checks all shared servers concurrently for a movie matching the
 // given criteria. Returns true and the first match at or above minQuality.
-func (c *Client) HasMovie(title string, year int, imdbID string, minQuality quality.Quality) (bool, *MediaMatch, error) {
+func (c *Client) HasMovie(title string, year int, imdbID string, tmdbID int, minQuality quality.Quality) (bool, *MediaMatch, error) {
 	servers, err := c.DiscoverServers()
 	if err != nil {
 		return false, nil, err
@@ -190,7 +190,7 @@ func (c *Client) HasMovie(title string, year int, imdbID string, minQuality qual
 	ch := make(chan result, len(servers))
 	for _, srv := range servers {
 		go func(srv Server) {
-			matches, err := c.SearchMovie(srv, title, year, imdbID)
+			matches, err := c.SearchMovie(srv, title, year, imdbID, tmdbID)
 			if err != nil {
 				ch <- result{}
 				return
@@ -255,8 +255,8 @@ func (c *Client) HasEpisode(seriesTitle string, season, episode int, minQuality 
 }
 
 // SearchMovie searches a specific server for a movie by title/year, using IMDB
-// GUID matching when available, falling back to title+year.
-func (c *Client) SearchMovie(srv Server, title string, year int, imdbID string) ([]MediaMatch, error) {
+// or TMDB GUID matching when available, falling back to title+year.
+func (c *Client) SearchMovie(srv Server, title string, year int, imdbID string, tmdbID int) ([]MediaMatch, error) {
 	// Search the hub for the movie title (includeGuids returns IMDB/TMDB IDs).
 	searchURL := fmt.Sprintf("%s/hubs/search?query=%s&limit=10&includeGuids=1", srv.URI, url.QueryEscape(title))
 	req, err := http.NewRequest("GET", searchURL, nil)
@@ -291,7 +291,11 @@ func (c *Client) SearchMovie(srv Server, title string, year int, imdbID string) 
 			}
 			matched := false
 			// Match by IMDB GUID if available.
-			if imdbID != "" && matchesGUID(meta.GUID, imdbID) {
+			if imdbID != "" && matchesIMDBGUID(meta.GUID, imdbID) {
+				matched = true
+			}
+			// Match by TMDB GUID if available.
+			if !matched && tmdbID > 0 && matchesTMDBGUID(meta.GUID, tmdbID) {
 				matched = true
 			}
 			// Fallback: title + year match.
@@ -925,10 +929,21 @@ func pickBestLocalConnection(conns []resourceConnection) string {
 	return best
 }
 
-// matchesGUID checks if a Plex metadata item's GUID list contains a given IMDB ID.
-func matchesGUID(guids []guidTag, imdbID string) bool {
+// matchesIMDBGUID checks if a Plex metadata item's GUID list contains a given IMDB ID.
+func matchesIMDBGUID(guids []guidTag, imdbID string) bool {
 	for _, g := range guids {
 		if g.ID == "imdb://"+imdbID {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesTMDBGUID checks if a Plex metadata item's GUID list contains a given TMDB ID.
+func matchesTMDBGUID(guids []guidTag, tmdbID int) bool {
+	target := "tmdb://" + strconv.Itoa(tmdbID)
+	for _, g := range guids {
+		if g.ID == target {
 			return true
 		}
 	}

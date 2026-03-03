@@ -16,6 +16,15 @@ type Movie struct {
 	Quality  sql.NullString
 	FilePath sql.NullString
 	AddedAt  time.Time
+	// Download fields (populated when status is queued/downloading/post_processing/failed).
+	NzbURL          sql.NullString
+	NzbName         sql.NullString
+	DownloadProgress float64
+	DownloadSize    sql.NullInt64
+	DownloadBytes   int64
+	DownloadError   sql.NullString
+	DownloadSource  sql.NullString
+	DownloadStartedAt sql.NullString
 }
 
 // Series represents a TV series tracked by the system.
@@ -43,28 +52,36 @@ type Episode struct {
 	Quality        sql.NullString
 	FilePath       sql.NullString
 	LastSearchedAt sql.NullString
+	// Download fields (populated when status is queued/downloading/post_processing/failed).
+	NzbURL            sql.NullString
+	NzbName           sql.NullString
+	DownloadProgress  float64
+	DownloadSize      sql.NullInt64
+	DownloadBytes     int64
+	DownloadError     sql.NullString
+	DownloadSource    sql.NullString
+	DownloadStartedAt sql.NullString
 	// Populated by joins — not stored directly in the episodes table.
 	SeriesTitle string
 	TvdbID      sql.NullInt64
 }
 
-// Download represents a download job (Usenet NZB or Plex HTTP).
-type Download struct {
-	ID              int64
-	NzbURL          sql.NullString
-	NzbName         string
-	Title           string
-	Category        string
+// QueueItem is a unified view of a movie or episode in the download queue.
+// Populated by a UNION query across movies and episodes tables.
+type QueueItem struct {
 	MediaID         int64
+	Category        string         // "movie" or "episode"
+	Title           string         // display title (computed in query)
 	Status          string
+	NzbURL          sql.NullString
+	NzbName         sql.NullString
 	Progress        float64
 	SizeBytes       sql.NullInt64
 	DownloadedBytes int64
 	ErrorMsg        sql.NullString
-	StartedAt       sql.NullTime
-	CompletedAt     sql.NullTime
-	CreatedAt       time.Time
-	Source          string // "usenet" or "plex"
+	Source          sql.NullString
+	StartedAt       sql.NullString
+	AddedAt         time.Time
 }
 
 // Indexer represents a Newznab-compatible indexer.

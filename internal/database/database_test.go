@@ -18,7 +18,7 @@ func TestOpenAndMigrate(t *testing.T) {
 	db := mustOpen(t)
 
 	// Verify that all tables exist by selecting from each one.
-	tables := []string{"movies", "series", "episodes", "downloads", "indexers", "history"}
+	tables := []string{"movies", "series", "episodes", "indexers", "history", "blocklist"}
 	for _, table := range tables {
 		var count int
 		err := db.QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count)

@@ -27,6 +27,7 @@ type GrabContext struct {
 	Title    string
 	Year     int
 	ImdbID   string
+	TmdbID   int
 	Season   int
 	Episode  int
 	Existing quality.Quality
@@ -275,14 +276,13 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 			}
 		}
 
-		// Atomically check for active download and insert in a single transaction
-		// to prevent duplicate downloads from concurrent scheduler/RPC calls.
-		dlID, inserted, err := s.db.AddDownloadIfNoActive(sr.Release.Link, sr.Release.Title, sr.Parsed.Title, ctx.Category, ctx.MediaID, sr.Release.Size, "usenet")
+		// Atomically enqueue the download — only succeeds if status is wanted/failed.
+		enqueued, err := s.db.EnqueueDownload(ctx.Category, ctx.MediaID, sr.Release.Link, sr.Release.Title, sr.Release.Size, "usenet")
 		if err != nil {
-			return false, fmt.Errorf("add download: %w", err)
+			return false, fmt.Errorf("enqueue download: %w", err)
 		}
-		if !inserted {
-			s.log.Debug("already downloading", "title", sr.Release.Title, "category", ctx.Category)
+		if !enqueued {
+			s.log.Debug("already active", "title", sr.Release.Title, "category", ctx.Category)
 			return false, nil
 		}
 
@@ -297,8 +297,22 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 			"score", sr.Score,
 			"category", ctx.Category,
 			"media_id", ctx.MediaID,
-			"download_id", dlID,
 		)
+
+		// Instant dispatch via channel if downloader is available.
+		if s.dl != nil {
+			s.dl.Enqueue(database.QueueItem{
+				MediaID:  ctx.MediaID,
+				Category: ctx.Category,
+				Title:    sr.Parsed.Title,
+				Status:   "queued",
+				NzbURL:   database.NullStr(sr.Release.Link),
+				NzbName:  database.NullStr(sr.Release.Title),
+				SizeBytes: database.NullInt(sr.Release.Size),
+				Source:   database.NullStr("usenet"),
+			})
+		}
+
 		grabbed = true
 		break
 	}
@@ -317,7 +331,7 @@ func (s *Service) grabFromPlex(ctx GrabContext) (bool, error) {
 	switch ctx.Category {
 	case "movie":
 		var found bool
-		found, match, err = s.plex.HasMovie(ctx.Title, ctx.Year, ctx.ImdbID, s.cfg.Prefs.Min)
+		found, match, err = s.plex.HasMovie(ctx.Title, ctx.Year, ctx.ImdbID, ctx.TmdbID, s.cfg.Prefs.Min)
 		if err != nil || !found || match == nil {
 			return false, err
 		}
@@ -338,11 +352,13 @@ func (s *Service) grabFromPlex(ctx GrabContext) (bool, error) {
 	}
 
 	sourceName := fmt.Sprintf("plex:%s", match.ServerName)
-	dlID, err := s.db.AddDownloadWithSource(
-		info.URL, sourceName, ctx.Title, ctx.Category, ctx.MediaID, info.Size, "plex",
-	)
+	enqueued, err := s.db.EnqueueDownload(ctx.Category, ctx.MediaID, info.URL, sourceName, info.Size, "plex")
 	if err != nil {
-		return false, fmt.Errorf("add plex download: %w", err)
+		return false, fmt.Errorf("enqueue plex download: %w", err)
+	}
+	if !enqueued {
+		s.log.Debug("already active, skipping plex grab", "title", ctx.Title)
+		return false, nil
 	}
 
 	if err := s.db.AddHistory(ctx.Category, ctx.MediaID, ctx.Title, "grabbed", sourceName, match.Quality.String()); err != nil {
@@ -354,8 +370,22 @@ func (s *Service) grabFromPlex(ctx GrabContext) (bool, error) {
 		"server", match.ServerName,
 		"quality", match.Quality,
 		"size_mb", info.Size/(1024*1024),
-		"download_id", dlID,
 	)
+
+	// Instant dispatch via channel if downloader is available.
+	if s.dl != nil {
+		s.dl.Enqueue(database.QueueItem{
+			MediaID:  ctx.MediaID,
+			Category: ctx.Category,
+			Title:    ctx.Title,
+			Status:   "queued",
+			NzbURL:   database.NullStr(info.URL),
+			NzbName:  database.NullStr(sourceName),
+			SizeBytes: database.NullInt(info.Size),
+			Source:   database.NullStr("plex"),
+		})
+	}
+
 	return true, nil
 }
 
@@ -386,6 +416,7 @@ func (s *Service) SearchAndGrabMovie(movie *database.Movie) (bool, error) {
 		Title:    movie.Title,
 		Year:     movie.Year,
 		ImdbID:   imdbID,
+		TmdbID:   movie.TmdbID,
 		Existing: existing,
 	})
 }

@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -224,20 +223,31 @@ func emptyNZB() string {
 </nzb>`
 }
 
-func fetchDownload(t *testing.T, db *database.DB, id int64) database.Download {
+// testSvc creates a minimal *Service for testing (no TMDB, no Plex, no indexers).
+func testSvc(cfg *config.Config, db *database.DB) *Service {
+	return &Service{cfg: cfg, db: db, log: quietLogger()}
+}
+
+// enqueueItem creates a QueueItem for testing by enqueueing a download on the media item.
+func enqueueItem(t *testing.T, db *database.DB, category string, mediaID int64, nzbURL, nzbName string, size int64, source string) database.QueueItem {
 	t.Helper()
-	var d database.Download
-	err := db.QueryRow(
-		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress,
-		        size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
-		 FROM downloads WHERE id = ?`, id,
-	).Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
-		&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
-		&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source)
+	ok, err := db.EnqueueDownload(category, mediaID, nzbURL, nzbName, size, source)
 	if err != nil {
-		t.Fatalf("fetchDownload(%d): %v", id, err)
+		t.Fatalf("EnqueueDownload: %v", err)
 	}
-	return d
+	if !ok {
+		t.Fatal("EnqueueDownload: not enqueued (status not wanted/failed)")
+	}
+	return database.QueueItem{
+		MediaID:   mediaID,
+		Category:  category,
+		Title:     nzbName, // display title, close enough for tests
+		Status:    "queued",
+		NzbURL:    database.NullStr(nzbURL),
+		NzbName:   database.NullStr(nzbName),
+		SizeBytes: database.NullInt(size),
+		Source:    database.NullStr(source),
+	}
 }
 
 func fileExists(path string) bool {
@@ -300,22 +310,10 @@ func TestPipeline_MovieUsenet(t *testing.T) {
 	srv := serveNZB(minimalNZB(`Late Night with the Devil "Late.Night.with.the.Devil.2024.WEBDL-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, err := db.AddDownload(srv.URL, "Late.Night.with.the.Devil.2024.WEBDL-1080p", "Late Night with the Devil", "movie", movieID, 1024)
-	if err != nil {
-		t.Fatal(err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Late.Night.with.the.Devil.2024.WEBDL-1080p", 1024, "usenet")
 
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
-
-	// Download completed.
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "completed" {
-		t.Errorf("download.status = %q, want %q", dl.Status, "completed")
-	}
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	// Movie marked downloaded with correct quality and path.
 	movie, err := db.GetMovie(movieID)
@@ -362,7 +360,7 @@ func TestPipeline_MovieUsenet(t *testing.T) {
 	}
 
 	// Incomplete directory cleaned up.
-	if fileExists(filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("%d", dlID))) {
+	if fileExists(filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("movie-%d", movieID))) {
 		t.Error("incomplete dir not cleaned up")
 	}
 }
@@ -383,21 +381,10 @@ func TestPipeline_MoviePlex(t *testing.T) {
 	srv := serveMKV("video/x-matroska", 2048)
 	defer srv.Close()
 
-	dlID, err := db.AddDownloadWithSource(srv.URL, "plex:FriendServer", "Dune Part Two", "movie", movieID, 2048, "plex")
-	if err != nil {
-		t.Fatal(err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", 2048, "plex")
 
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
-
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "completed" {
-		t.Errorf("download.status = %q, want %q", dl.Status, "completed")
-	}
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	if movie.Status != "downloaded" {
@@ -412,14 +399,14 @@ func TestPipeline_MoviePlex(t *testing.T) {
 		t.Errorf("movie.file_path missing folder: %v", movie.FilePath)
 	}
 
-	// File content survived HTTP stream → disk → import.
+	// File content survived HTTP stream -> disk -> import.
 	magic, _ := readMagic(movie.FilePath.String)
 	if len(magic) < 4 || magic[0] != 0x1a {
 		t.Errorf("destination has wrong magic: %x", magic)
 	}
 
 	// Download dir cleaned up.
-	if fileExists(filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("plex-%d", dlID))) {
+	if fileExists(filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("plex-movie-%d", movieID))) {
 		t.Error("plex download dir not cleaned up")
 	}
 }
@@ -444,12 +431,9 @@ func TestPipeline_PlexMP4ContentType(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownloadWithSource(srv.URL, "plex:FriendServer", "Alien Romulus", "movie", movieID, 2048, "plex")
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", 2048, "plex")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	if !movie.FilePath.Valid || !strings.HasSuffix(movie.FilePath.String, ".mp4") {
@@ -472,12 +456,9 @@ func TestPipeline_TVEpisodeUsenet(t *testing.T) {
 	srv := serveNZB(minimalNZB(`Severance S02E01 "Severance.S02E01.Hello.Ms.Cobel.WEBDL-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Severance.S02E01.Hello.Ms.Cobel.WEBDL-1080p", "Severance S02E01", "episode", ep.ID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "episode", ep.ID, srv.URL, "Severance.S02E01.Hello.Ms.Cobel.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	ep, _ = db.GetEpisode(ep.ID)
 	if ep.Status != "downloaded" {
@@ -512,12 +493,9 @@ func TestPipeline_TVEpisodePlex(t *testing.T) {
 	srv := serveMKV("video/x-matroska", 2048)
 	defer srv.Close()
 
-	dlID, _ := db.AddDownloadWithSource(srv.URL, "plex:FriendServer", "The Bear S01E01", "episode", ep.ID, 2048, "plex")
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "episode", ep.ID, srv.URL, "plex:FriendServer", 2048, "plex")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	ep, _ = db.GetEpisode(ep.ID)
 	if ep.Status != "downloaded" {
@@ -549,12 +527,9 @@ func TestPipeline_TVEpisodeNoTitle(t *testing.T) {
 	srv := serveNZB(minimalNZB(`Slow Horses S03E05 "Slow.Horses.S03E05.WEBDL-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Slow.Horses.S03E05.WEBDL-1080p", "Slow Horses S03E05", "episode", ep.ID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "episode", ep.ID, srv.URL, "Slow.Horses.S03E05.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	ep, _ = db.GetEpisode(ep.ID)
 	// Without episode title, filename should be Show.S03E05.Quality.ext (no double-dot).
@@ -580,12 +555,9 @@ func TestPipeline_MovieWithSubtitles(t *testing.T) {
 	))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Parasite.2019.WEBDL-1080p", "Parasite", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Parasite.2019.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	if !movie.FilePath.Valid || !fileExists(movie.FilePath.String) {
@@ -617,17 +589,14 @@ func TestPipeline_ObfuscatedFiles(t *testing.T) {
 
 	movieID, _ := db.AddMovie(99999, "tt9999999", "Oppenheimer", 2023)
 
-	// Subject has no quoted filename → engine writes "file_0" (no extension).
+	// Subject has no quoted filename -> engine writes "file_0" (no extension).
 	// renameByMagic() detects MKV from magic bytes and adds .mkv.
 	srv := serveNZB(minimalNZB(`a]sD82hFk - obfuscated post yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Oppenheimer.2023.WEBDL-1080p", "Oppenheimer", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Oppenheimer.2023.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	if movie.Status != "downloaded" {
@@ -661,26 +630,14 @@ func TestPipeline_FailedNzbFetch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Nosferatu.2024.WEBDL-1080p", "Nosferatu", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	err = d.ProcessOne(context.Background(), dl)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Nosferatu.2024.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
-	}
-	if !dl.ErrorMsg.Valid || dl.ErrorMsg.String == "" {
-		t.Error("error_msg should be set")
-	}
-
-	// Movie should remain wanted — failure doesn't corrupt media state.
+	// Movie should be marked failed.
 	movie, _ := db.GetMovie(movieID)
-	if movie.Status != "wanted" {
-		t.Errorf("movie.status = %q, want wanted (should not change on failure)", movie.Status)
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
 
 	// Failure should be in history.
@@ -711,24 +668,24 @@ func TestPipeline_FailedPlexServer(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownloadWithSource(srv.URL, "plex:FriendServer", "Conclave", "movie", movieID, 2048, "plex")
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	err = d.ProcessOne(context.Background(), dl)
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", 2048, "plex")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
+	// Movie should be marked failed with error mentioning 500.
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
-	if !dl.ErrorMsg.Valid || !strings.Contains(dl.ErrorMsg.String, "500") {
-		t.Errorf("error_msg = %v, should mention HTTP 500", dl.ErrorMsg)
+	// Check download_error via raw SQL since GetMovie doesn't scan download fields.
+	var errMsg sql.NullString
+	db.QueryRow(`SELECT download_error FROM movies WHERE id = ?`, movieID).Scan(&errMsg)
+	if !errMsg.Valid || !strings.Contains(errMsg.String, "500") {
+		t.Errorf("download_error = %v, should mention HTTP 500", errMsg)
 	}
 }
 
-// Empty NZB URL — should fail cleanly, not panic.
+// Empty NZB URL -- should fail cleanly, not panic.
 func TestPipeline_EmptyNzbURL(t *testing.T) {
 	cfg := testConfig(t)
 	db, err := database.Open(":memory:")
@@ -738,17 +695,13 @@ func TestPipeline_EmptyNzbURL(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(10006, "tt1000600", "Ghostbusters", 1984)
-	dlID, _ := db.AddDownload("", "Ghostbusters.1984.WEBDL-1080p", "Ghostbusters", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	err = d.ProcessOne(context.Background(), dl)
-	if err == nil {
-		t.Fatal("expected error for empty URL")
-	}
+	item := enqueueItem(t, db, "movie", movieID, "", "Ghostbusters.1984.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
 }
 
@@ -762,16 +715,12 @@ func TestPipeline_EmptyPlexURL(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(10007, "tt1000700", "Ghostbusters", 1984)
-	dlID, _ := db.AddDownloadWithSource("", "plex:FriendServer", "Ghostbusters", "movie", movieID, 1024, "plex")
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	err = d.ProcessOne(context.Background(), dl)
-	if err == nil {
-		t.Fatal("expected error for empty plex URL")
-	}
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
+	item := enqueueItem(t, db, "movie", movieID, "", "plex:FriendServer", 1024, "plex")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
 }
 
@@ -793,21 +742,13 @@ func TestPipeline_PartialSegmentFailure(t *testing.T) {
 	srv := serveNZB(minimalNZB(`BR2049 "Blade.Runner.2049.2017.Bluray-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Blade.Runner.2049.2017.Bluray-1080p", "Blade Runner 2049", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Blade.Runner.2049.2017.Bluray-1080p", 1024, "usenet")
 
 	// PartialFailEngine writes the file but also returns "segments failed".
-	d := NewDownloaderWithEngine(cfg, db, &PartialFailEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne should succeed despite partial segment failure: %v", err)
-	}
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &PartialFailEngine{})
+	d.processItem(context.Background(), item)
 
-	// Should still complete — the error is soft, postprocess handles the rest.
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "completed" {
-		t.Errorf("download.status = %q, want completed (segments failed should be recoverable)", dl.Status)
-	}
-
+	// Should still complete -- the error is soft, postprocess handles the rest.
 	movie, _ := db.GetMovie(movieID)
 	if movie.Status != "downloaded" {
 		t.Errorf("movie.status = %q, want downloaded", movie.Status)
@@ -815,7 +756,7 @@ func TestPipeline_PartialSegmentFailure(t *testing.T) {
 }
 
 // NZB parses successfully but has zero <file> elements.
-// Engine produces nothing, postprocess finds no media → should fail cleanly.
+// Engine produces nothing, postprocess finds no media -> should fail cleanly.
 func TestPipeline_EmptyNZB(t *testing.T) {
 	cfg := testConfig(t)
 	db, err := database.Open(":memory:")
@@ -828,24 +769,23 @@ func TestPipeline_EmptyNZB(t *testing.T) {
 	srv := serveNZB(emptyNZB())
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Empty.Release.2024.WEBDL-1080p", "Empty Release", "movie", movieID, 0)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	err = d.ProcessOne(context.Background(), dl)
-	if err == nil {
-		t.Fatal("expected error for empty NZB (no files)")
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Empty.Release.2024.WEBDL-1080p", 0, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
-	if !dl.ErrorMsg.Valid || !strings.Contains(dl.ErrorMsg.String, "no media files") {
-		t.Errorf("error_msg = %v, should mention 'no media files'", dl.ErrorMsg)
+	// Check download_error mentions "no media files".
+	var errMsg sql.NullString
+	db.QueryRow(`SELECT download_error FROM movies WHERE id = ?`, movieID).Scan(&errMsg)
+	if !errMsg.Valid || !strings.Contains(errMsg.String, "no media files") {
+		t.Errorf("download_error = %v, should mention 'no media files'", errMsg)
 	}
 }
 
-// Movie deleted between queuing and processing. The download's media_id
+// Movie deleted between queuing and processing. The item's media_id
 // points to a row that no longer exists.
 func TestPipeline_OrphanedMediaID(t *testing.T) {
 	cfg := testConfig(t)
@@ -860,22 +800,15 @@ func TestPipeline_OrphanedMediaID(t *testing.T) {
 	srv := serveNZB(minimalNZB(`Deleted Movie "Deleted.Movie.2024.WEBDL-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Deleted.Movie.2024.WEBDL-1080p", "Deleted Movie", "movie", movieID, 1024)
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Deleted.Movie.2024.WEBDL-1080p", 1024, "usenet")
 
-	// Delete the movie before processing the download.
+	// Delete the movie before processing the item.
 	db.RemoveMovie(movieID)
 
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	err = d.ProcessOne(context.Background(), dl)
-	if err == nil {
-		t.Fatal("expected error for orphaned media_id")
-	}
-
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
-	}
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
+	// processItem logs the error internally; no return value to check.
+	// The movie was already deleted, so we just verify the call doesn't panic.
 }
 
 // Quality unparseable from NZB name. parser.Parse returns Unknown quality.
@@ -893,26 +826,23 @@ func TestPipeline_UnknownQuality(t *testing.T) {
 	srv := serveNZB(minimalNZB(`Mystery Film "mystery_film.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	// NZB name has no quality info — parser should return Unknown.
-	dlID, _ := db.AddDownload(srv.URL, "mystery_film", "Mystery Film", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	// NZB name has no quality info -- parser should return Unknown.
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "mystery_film", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	if movie.Status != "downloaded" {
 		t.Errorf("movie.status = %q, want downloaded", movie.Status)
 	}
 
-	// File should still exist — Unknown quality shouldn't crash import.
+	// File should still exist -- Unknown quality shouldn't crash import.
 	if !movie.FilePath.Valid || !fileExists(movie.FilePath.String) {
 		t.Fatalf("file missing at %v", movie.FilePath)
 	}
 
 	// Quality in DB should reflect what the parser returned.
-	// This documents current behavior — "Unknown" gets stored.
+	// This documents current behavior -- "Unknown" gets stored.
 	t.Logf("quality stored in DB: %v", movie.Quality)
 	t.Logf("file path: %s", movie.FilePath.String)
 }
@@ -931,19 +861,16 @@ func TestPipeline_NestedExtraction(t *testing.T) {
 	srv := serveNZB(minimalNZB(`Interstellar "Interstellar.2014.Bluray-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Interstellar.2014.Bluray-1080p", "Interstellar", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &NestedFakeEngine{SubDir: "disc1"}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Interstellar.2014.Bluray-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &NestedFakeEngine{SubDir: "disc1"})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	if movie.Status != "downloaded" {
 		t.Errorf("movie.status = %q, want downloaded", movie.Status)
 	}
 	if !movie.FilePath.Valid || !fileExists(movie.FilePath.String) {
-		t.Fatal("file not found — identifyFiles failed to walk nested subdirectory")
+		t.Fatal("file not found -- identifyFiles failed to walk nested subdirectory")
 	}
 }
 
@@ -964,12 +891,9 @@ func TestPipeline_SampleNotImportedAsMain(t *testing.T) {
 	))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Arrival.2016.WEBDL-1080p", "Arrival", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &MultiSizeFakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Arrival.2016.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &MultiSizeFakeEngine{})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	// The file should be the large one, not the sample.
@@ -995,12 +919,9 @@ func TestPipeline_SpecialCharsInTitle(t *testing.T) {
 	srv := serveNZB(minimalNZB(`MI "Mission.Impossible.Dead.Reckoning.2023.WEBDL-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Mission.Impossible.Dead.Reckoning.2023.WEBDL-1080p", "Mission: Impossible - Dead Reckoning", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Mission.Impossible.Dead.Reckoning.2023.WEBDL-1080p", 1024, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
 	if !movie.FilePath.Valid {
@@ -1028,29 +949,28 @@ func TestPipeline_FailedDownloadCleansUpIncompleteDir(t *testing.T) {
 	movieID, _ := db.AddMovie(20008, "tt2000800", "Bad Download", 2024)
 
 	// Serve valid NZB so the download dir gets created, but the NZB
-	// has no files so postprocess will find nothing → fails.
+	// has no files so postprocess will find nothing -> fails.
 	srv := serveNZB(emptyNZB())
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Bad.Download.2024.WEBDL-1080p", "Bad Download", "movie", movieID, 0)
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	_ = d.ProcessOne(context.Background(), dl)
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Bad.Download.2024.WEBDL-1080p", 0, "usenet")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
 
 	// The incomplete dir should be cleaned up on failure to prevent disk space leaks.
-	downloadDir := filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("%d", dlID))
+	downloadDir := filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("movie-%d", movieID))
 	if fileExists(downloadDir) {
 		t.Errorf("incomplete dir %s should be cleaned up on failure", downloadDir)
 	}
 }
 
-// Stuck download detection: downloads in "downloading" state for >2h
-// should be reset to "queued" when processQueue runs.
+// Stuck download detection: media items in "downloading" state for >2h
+// should be reset to "queued" when ResetStuckMedia runs.
 func TestPipeline_StuckDownloadReset(t *testing.T) {
 	db, err := database.Open(":memory:")
 	if err != nil {
@@ -1059,21 +979,27 @@ func TestPipeline_StuckDownloadReset(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(30001, "tt3000100", "Stuck Movie", 2024)
-	dlID, _ := db.AddDownload("http://example.com/test.nzb", "Stuck.Movie.2024.WEBDL-1080p", "Stuck Movie", "movie", movieID, 1024)
 
-	// Simulate a download stuck in "downloading" with started_at 3 hours ago.
-	db.Exec(`UPDATE downloads SET status = 'downloading', started_at = datetime('now', '-3 hours') WHERE id = ?`, dlID)
+	// Set movie status to 'downloading' with download_started_at 3 hours ago.
+	db.Exec(`UPDATE movies SET status = 'downloading', download_started_at = datetime('now', '-3 hours') WHERE id = ?`, movieID)
 
-	cfg := testConfig(t)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	d.resetStuckDownloads()
-
-	dl := fetchDownload(t, db, dlID)
-	if dl.Status != "queued" {
-		t.Errorf("stuck download.status = %q, want queued", dl.Status)
+	n, err := db.ResetStuckMedia()
+	if err != nil {
+		t.Fatalf("ResetStuckMedia: %v", err)
 	}
-	if !dl.ErrorMsg.Valid || !strings.Contains(dl.ErrorMsg.String, "stuck") {
-		t.Errorf("error_msg = %v, should mention 'stuck'", dl.ErrorMsg)
+	if n == 0 {
+		t.Error("ResetStuckMedia should have reset at least 1 item")
+	}
+
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "queued" {
+		t.Errorf("stuck movie.status = %q, want queued", movie.Status)
+	}
+	// Check download_error via raw SQL.
+	var errMsg sql.NullString
+	db.QueryRow(`SELECT download_error FROM movies WHERE id = ?`, movieID).Scan(&errMsg)
+	if !errMsg.Valid || !strings.Contains(errMsg.String, "stuck") {
+		t.Errorf("download_error = %v, should mention 'stuck'", errMsg)
 	}
 }
 
@@ -1102,7 +1028,7 @@ func TestWithTx_RollbackOnError(t *testing.T) {
 	}
 }
 
-// UpdateDownloadStatus should set started_at when transitioning to "downloading".
+// UpdateMediaDownloadStatus should set download_started_at when transitioning to "downloading".
 func TestUpdateDownloadStatus_SetsStartedAt(t *testing.T) {
 	db, err := database.Open(":memory:")
 	if err != nil {
@@ -1111,19 +1037,19 @@ func TestUpdateDownloadStatus_SetsStartedAt(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(30002, "tt3000200", "Started Movie", 2024)
-	dlID, _ := db.AddDownload("http://example.com/test.nzb", "Started.Movie.2024.WEBDL-1080p", "Started Movie", "movie", movieID, 1024)
 
-	// Initially started_at should be NULL.
-	dl := fetchDownload(t, db, dlID)
-	if dl.StartedAt.Valid {
-		t.Error("started_at should be NULL initially")
+	// Initially download_started_at should be NULL.
+	var startedAt sql.NullString
+	db.QueryRow(`SELECT download_started_at FROM movies WHERE id = ?`, movieID).Scan(&startedAt)
+	if startedAt.Valid {
+		t.Error("download_started_at should be NULL initially")
 	}
 
-	// Transition to "downloading" should set started_at.
-	db.UpdateDownloadStatus(dlID, "downloading")
-	dl = fetchDownload(t, db, dlID)
-	if !dl.StartedAt.Valid {
-		t.Error("started_at should be set after transitioning to downloading")
+	// Transition to "downloading" should set download_started_at.
+	db.UpdateMediaDownloadStatus("movie", movieID, "downloading")
+	db.QueryRow(`SELECT download_started_at FROM movies WHERE id = ?`, movieID).Scan(&startedAt)
+	if !startedAt.Valid {
+		t.Error("download_started_at should be set after transitioning to downloading")
 	}
 }
 
@@ -1131,7 +1057,7 @@ func TestUpdateDownloadStatus_SetsStartedAt(t *testing.T) {
 // Post-processing resume tests
 // --------------------------------------------------------------------------
 
-// Start() should only reset "downloading" → "queued", leaving "post_processing" intact.
+// Start() should only reset "downloading" -> "queued", leaving "post_processing" intact.
 func TestStartPreservesPostProcessing(t *testing.T) {
 	db, err := database.Open(":memory:")
 	if err != nil {
@@ -1142,30 +1068,27 @@ func TestStartPreservesPostProcessing(t *testing.T) {
 	movieID1, _ := db.AddMovie(40001, "tt4000100", "Downloading Movie", 2024)
 	movieID2, _ := db.AddMovie(40002, "tt4000200", "PostProcessing Movie", 2024)
 
-	dlID1, _ := db.AddDownload("http://example.com/1.nzb", "dl1", "Downloading Movie", "movie", movieID1, 1024)
-	dlID2, _ := db.AddDownload("http://example.com/2.nzb", "dl2", "PostProcessing Movie", "movie", movieID2, 1024)
-
-	// Simulate previous daemon state.
-	db.UpdateDownloadStatus(dlID1, "downloading")
-	db.UpdateDownloadStatus(dlID2, "post_processing")
+	// Set movie statuses to simulate previous daemon state.
+	db.Exec(`UPDATE movies SET status = 'downloading' WHERE id = ?`, movieID1)
+	db.Exec(`UPDATE movies SET status = 'post_processing' WHERE id = ?`, movieID2)
 
 	cfg := testConfig(t)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately so the background goroutine exits.
 	d.Start(ctx)
 
 	// "downloading" should be reset to "queued".
-	dl1 := fetchDownload(t, db, dlID1)
-	if dl1.Status != "queued" {
-		t.Errorf("downloading download.status = %q, want queued", dl1.Status)
+	movie1, _ := db.GetMovie(movieID1)
+	if movie1.Status != "queued" {
+		t.Errorf("downloading movie.status = %q, want queued", movie1.Status)
 	}
 
 	// "post_processing" should be preserved.
-	dl2 := fetchDownload(t, db, dlID2)
-	if dl2.Status != "post_processing" {
-		t.Errorf("post_processing download.status = %q, want post_processing", dl2.Status)
+	movie2, _ := db.GetMovie(movieID2)
+	if movie2.Status != "post_processing" {
+		t.Errorf("post_processing movie.status = %q, want post_processing", movie2.Status)
 	}
 }
 
@@ -1179,27 +1102,30 @@ func TestResumePostProcessing(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(40003, "tt4000300", "Resume Movie", 2024)
-	dlID, _ := db.AddDownload("http://example.com/3.nzb",
-		"Resume.Movie.2024.WEBDL-1080p", "Resume Movie", "movie", movieID, 1024)
-	db.UpdateDownloadStatus(dlID, "post_processing")
+
+	// Enqueue the download, then set status to post_processing.
+	enqueueItem(t, db, "movie", movieID, "http://example.com/3.nzb",
+		"Resume.Movie.2024.WEBDL-1080p", 1024, "usenet")
+	db.UpdateMediaDownloadStatus("movie", movieID, "post_processing")
 
 	// Create download dir with a fake MKV file (as if NNTP download completed).
-	downloadDir := filepath.Join(cfg.Paths.Incomplete, strconv.FormatInt(dlID, 10))
+	downloadDir := filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("movie-%d", movieID))
 	os.MkdirAll(downloadDir, 0o755)
 	data := make([]byte, 1024)
 	copy(data, mkvMagic)
 	os.WriteFile(filepath.Join(downloadDir, "Resume.Movie.2024.WEBDL-1080p.mkv"), data, 0o644)
 
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.resumePostProcessing(context.Background(), dl); err != nil {
-		t.Fatalf("resumePostProcessing: %v", err)
+	item := database.QueueItem{
+		MediaID:  movieID,
+		Category: "movie",
+		Title:    "Resume Movie (2024)",
+		Status:   "post_processing",
+		NzbURL:   database.NullStr("http://example.com/3.nzb"),
+		NzbName:  database.NullStr("Resume.Movie.2024.WEBDL-1080p"),
 	}
-
-	// Should be completed.
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "completed" {
-		t.Errorf("download.status = %q, want completed", dl.Status)
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	if err := d.resumePostProcessing(context.Background(), item); err != nil {
+		t.Fatalf("resumePostProcessing: %v", err)
 	}
 
 	// Movie should be marked downloaded.
@@ -1227,24 +1153,36 @@ func TestResumePostProcessingMissingDir(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(40004, "tt4000400", "Missing Dir Movie", 2024)
-	dlID, _ := db.AddDownload("http://example.com/4.nzb",
-		"Missing.Dir.Movie.2024.WEBDL-1080p", "Missing Dir Movie", "movie", movieID, 1024)
-	db.UpdateDownloadStatus(dlID, "post_processing")
 
-	// Do NOT create the download dir — simulate it being deleted.
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	err = d.resumePostProcessing(context.Background(), dl)
+	// Enqueue the download, then set status to post_processing.
+	enqueueItem(t, db, "movie", movieID, "http://example.com/4.nzb",
+		"Missing.Dir.Movie.2024.WEBDL-1080p", 1024, "usenet")
+	db.UpdateMediaDownloadStatus("movie", movieID, "post_processing")
+
+	// Do NOT create the download dir -- simulate it being deleted.
+	item := database.QueueItem{
+		MediaID:  movieID,
+		Category: "movie",
+		Title:    "Missing Dir Movie (2024)",
+		Status:   "post_processing",
+		NzbURL:   database.NullStr("http://example.com/4.nzb"),
+		NzbName:  database.NullStr("Missing.Dir.Movie.2024.WEBDL-1080p"),
+	}
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	err = d.resumePostProcessing(context.Background(), item)
 	if err == nil {
 		t.Fatal("expected error for missing directory")
 	}
 
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Errorf("download.status = %q, want failed", dl.Status)
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
-	if !dl.ErrorMsg.Valid || !strings.Contains(dl.ErrorMsg.String, "directory missing") {
-		t.Errorf("error_msg = %v, should mention 'directory missing'", dl.ErrorMsg)
+	// Check download_error mentions "directory missing".
+	var errMsg sql.NullString
+	db.QueryRow(`SELECT download_error FROM movies WHERE id = ?`, movieID).Scan(&errMsg)
+	if !errMsg.Valid || !strings.Contains(errMsg.String, "directory missing") {
+		t.Errorf("download_error = %v, should mention 'directory missing'", errMsg)
 	}
 }
 
@@ -1259,12 +1197,14 @@ func TestResumeAlreadyImported(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(40005, "tt4000500", "Already Imported", 2024)
-	dlID, _ := db.AddDownload("http://example.com/5.nzb",
-		"Already.Imported.2024.WEBDL-1080p", "Already Imported", "movie", movieID, 1024)
-	db.UpdateDownloadStatus(dlID, "post_processing")
+
+	// Enqueue the download, then set status to post_processing.
+	enqueueItem(t, db, "movie", movieID, "http://example.com/5.nzb",
+		"Already.Imported.2024.WEBDL-1080p", 1024, "usenet")
+	db.UpdateMediaDownloadStatus("movie", movieID, "post_processing")
 
 	// Create the download dir (required for resume to not fail early).
-	downloadDir := filepath.Join(cfg.Paths.Incomplete, strconv.FormatInt(dlID, 10))
+	downloadDir := filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("movie-%d", movieID))
 	os.MkdirAll(downloadDir, 0o755)
 	os.WriteFile(filepath.Join(downloadDir, "dummy"), []byte("leftover"), 0o644)
 
@@ -1275,16 +1215,17 @@ func TestResumeAlreadyImported(t *testing.T) {
 	copy(data, mkvMagic)
 	os.WriteFile(expectedPath, data, 0o644)
 
-	dl := fetchDownload(t, db, dlID)
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	if err := d.resumePostProcessing(context.Background(), dl); err != nil {
-		t.Fatalf("resumePostProcessing: %v", err)
+	item := database.QueueItem{
+		MediaID:  movieID,
+		Category: "movie",
+		Title:    "Already Imported (2024)",
+		Status:   "post_processing",
+		NzbURL:   database.NullStr("http://example.com/5.nzb"),
+		NzbName:  database.NullStr("Already.Imported.2024.WEBDL-1080p"),
 	}
-
-	// Should be completed without re-running post-processing.
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "completed" {
-		t.Errorf("download.status = %q, want completed", dl.Status)
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	if err := d.resumePostProcessing(context.Background(), item); err != nil {
+		t.Fatalf("resumePostProcessing: %v", err)
 	}
 
 	// Library file should still exist.
@@ -1296,9 +1237,22 @@ func TestResumeAlreadyImported(t *testing.T) {
 	if fileExists(downloadDir) {
 		t.Error("incomplete dir should be cleaned up")
 	}
+
+	// History should record completion.
+	history, _ := db.ListHistory(10)
+	var found bool
+	for _, h := range history {
+		if h.Event == "completed" && h.MediaID == movieID {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("no 'completed' history event for resume-already-imported")
+	}
 }
 
-// HasActiveDownload should consider post_processing as active.
+// EnqueueDownload should not enqueue when an active download exists
+// (status is queued/downloading/post_processing).
 func TestHasActiveDownloadIncludesPostProcessing(t *testing.T) {
 	db, err := database.Open(":memory:")
 	if err != nil {
@@ -1307,26 +1261,25 @@ func TestHasActiveDownloadIncludesPostProcessing(t *testing.T) {
 	defer db.Close()
 
 	movieID, _ := db.AddMovie(40006, "tt4000600", "Active PP Movie", 2024)
-	dlID, _ := db.AddDownload("http://example.com/6.nzb",
-		"Active.PP.Movie.2024.WEBDL-1080p", "Active PP Movie", "movie", movieID, 1024)
-	db.UpdateDownloadStatus(dlID, "post_processing")
 
-	active, err := db.HasActiveDownload("movie", movieID)
+	// Enqueue a download.
+	ok, err := db.EnqueueDownload("movie", movieID, "http://example.com/6.nzb",
+		"Active.PP.Movie.2024.WEBDL-1080p", 1024, "usenet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !active {
-		t.Error("HasActiveDownload should return true for post_processing status")
+	if !ok {
+		t.Fatal("first EnqueueDownload should succeed")
 	}
 
-	// AddDownloadIfNoActive should also block.
-	_, inserted, err := db.AddDownloadIfNoActive("http://example.com/dup.nzb",
-		"Dup", "Active PP Movie", "movie", movieID, 1024, "usenet")
+	// Trying to enqueue again should return false (already queued).
+	ok, err = db.EnqueueDownload("movie", movieID, "http://example.com/dup.nzb",
+		"Dup", 1024, "usenet")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inserted {
-		t.Error("AddDownloadIfNoActive should not insert when post_processing download exists")
+	if ok {
+		t.Error("EnqueueDownload should return false when movie is already queued")
 	}
 }
 
@@ -1344,21 +1297,18 @@ func TestPipeline_SavesNZBManifest(t *testing.T) {
 	srv := serveNZB(nzbXML)
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Manifest.Movie.2024.WEBDL-1080p", "Manifest Movie", "movie", movieID, 1024)
-	dl := fetchDownload(t, db, dlID)
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Manifest.Movie.2024.WEBDL-1080p", 1024, "usenet")
 
 	// Use a custom engine that checks for manifest.nzb before cleanup.
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
 
 	// We need to check the manifest exists during processing.
 	// Instead, just run the pipeline and verify the download completes.
 	// The manifest is saved best-effort and cleaned up with the download dir.
-	if err := d.ProcessOne(context.Background(), dl); err != nil {
-		t.Fatalf("ProcessOne: %v", err)
-	}
+	d.processItem(context.Background(), item)
 
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "completed" {
-		t.Errorf("download.status = %q, want completed", dl.Status)
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "downloaded" {
+		t.Errorf("movie.status = %q, want downloaded", movie.Status)
 	}
 }

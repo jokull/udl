@@ -70,10 +70,8 @@ func TestHealthCheck_DiskSpace(t *testing.T) {
 		},
 	}
 
-	dl := &Downloader{
-		cfg: cfg,
-		log: log,
-	}
+	svc := &Service{cfg: cfg, log: log}
+	dl := &Downloader{svc: svc}
 
 	checks := dl.HealthChecks()
 
@@ -94,7 +92,8 @@ func TestHealthCheck_DiskSpace(t *testing.T) {
 
 func TestHealthCheck_Par2Detection(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	dl := &Downloader{log: log}
+	svc := &Service{log: log}
+	dl := &Downloader{svc: svc}
 
 	checks := dl.HealthChecks()
 
@@ -130,10 +129,8 @@ func TestHealthCheck_LibraryPathNotAccessible(t *testing.T) {
 		},
 	}
 
-	dl := &Downloader{
-		cfg: cfg,
-		log: log,
-	}
+	svc := &Service{cfg: cfg, log: log}
+	dl := &Downloader{svc: svc}
 
 	checks := dl.HealthChecks()
 
@@ -156,7 +153,8 @@ func TestHealthCheck_StuckDownloads(t *testing.T) {
 	defer db.Close()
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	dl := &Downloader{db: db, log: log}
+	svc := &Service{db: db, log: log}
+	dl := &Downloader{svc: svc}
 
 	// No stuck downloads initially.
 	checks := dl.HealthChecks()
@@ -166,9 +164,11 @@ func TestHealthCheck_StuckDownloads(t *testing.T) {
 		}
 	}
 
-	// Create a stuck download (started > 2h ago).
-	db.Exec(`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, status, started_at)
-		VALUES ('', 'test', 'Stuck Movie', 'movie', 1, 'downloading', datetime('now', '-3 hours'))`)
+	// Create a stuck download on the movies table.
+	movieID, _ := db.AddMovie(99001, "tt9900100", "Stuck Movie", 2024)
+	db.UpdateMediaDownloadStatus("movie", movieID, "downloading")
+	// Backdate the download_started_at to 3 hours ago.
+	db.Exec(`UPDATE movies SET download_started_at = datetime('now', '-3 hours') WHERE id = ?`, movieID)
 
 	checks = dl.HealthChecks()
 	found := false
@@ -192,8 +192,8 @@ func TestDBHealthStats(t *testing.T) {
 	}
 	defer db.Close()
 
-	// FailedDownloadCount24h — initially 0.
-	count, err := db.FailedDownloadCount24h()
+	// FailedMediaCount24h — initially 0.
+	count, err := db.FailedMediaCount24h()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,9 +201,12 @@ func TestDBHealthStats(t *testing.T) {
 		t.Errorf("initial failed count %d, want 0", count)
 	}
 
-	// Add a recent failure.
-	db.Exec(`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, status) VALUES ('', 'test', 'Fail Movie', 'movie', 1, 'failed')`)
-	count, err = db.FailedDownloadCount24h()
+	// Add a recent failure via the movies table.
+	movieID1, _ := db.AddMovie(10001, "tt1000100", "Fail Movie", 2024)
+	db.UpdateMediaDownloadStatus("movie", movieID1, "downloading")
+	db.SetMediaDownloadError("movie", movieID1, "test failure")
+
+	count, err = db.FailedMediaCount24h()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,24 +214,26 @@ func TestDBHealthStats(t *testing.T) {
 		t.Errorf("failed count %d, want 1", count)
 	}
 
-	// StuckDownloadCount — initially 0.
-	stuck, err := db.StuckDownloadCount()
+	// ResetStuckMedia — initially 0.
+	stuck, err := db.ResetStuckMedia()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stuck != 0 {
-		t.Errorf("initial stuck count %d, want 0", stuck)
+		t.Errorf("initial stuck reset count %d, want 0", stuck)
 	}
 
-	// Add a stuck download.
-	db.Exec(`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, status, started_at)
-		VALUES ('', 'test2', 'Stuck', 'movie', 2, 'downloading', datetime('now', '-3 hours'))`)
-	stuck, err = db.StuckDownloadCount()
+	// Add a stuck download (downloading for >2h).
+	movieID2, _ := db.AddMovie(10002, "tt1000200", "Stuck Movie", 2024)
+	db.UpdateMediaDownloadStatus("movie", movieID2, "downloading")
+	db.Exec(`UPDATE movies SET download_started_at = datetime('now', '-3 hours') WHERE id = ?`, movieID2)
+
+	stuck, err = db.ResetStuckMedia()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stuck != 1 {
-		t.Errorf("stuck count %d, want 1", stuck)
+		t.Errorf("stuck reset count %d, want 1", stuck)
 	}
 
 	// BlocklistCount.

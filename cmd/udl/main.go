@@ -43,9 +43,10 @@ var movieCmd = &cobra.Command{
 }
 
 var movieAddCmd = &cobra.Command{
-	Use:   "add [query]",
-	Short: "Add a movie to wanted list",
-	Args:  cobra.MinimumNArgs(1),
+	Use:   "add [tmdb-id]",
+	Short: "Add a movie by TMDB ID",
+	Long:  "Adds a movie by its TMDB ID. Use 'udl movie search' first to find the ID.",
+	Args:  cobra.ExactArgs(1),
 	RunE:  runMovieAdd,
 }
 
@@ -57,15 +58,24 @@ var movieListCmd = &cobra.Command{
 
 var movieSearchCmd = &cobra.Command{
 	Use:   "search [query]",
-	Short: "Search indexers for a movie",
+	Short: "Search TMDB for movies",
+	Long:  "Searches TMDB and shows results with TMDB IDs. Use the ID with 'udl movie add'.",
 	Args:  cobra.MinimumNArgs(1),
 	RunE:  runMovieSearch,
 }
 
+var movieReleasesCmd = &cobra.Command{
+	Use:   "releases [id|title]",
+	Short: "Search indexers for a movie in the database",
+	Long:  "Searches Usenet indexers for releases matching a movie already in the database.\nUse a DB ID or title to identify the movie.",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runMovieReleases,
+}
+
 var movieGrabCmd = &cobra.Command{
-	Use:   "grab [query] [#]",
-	Short: "Search indexers and grab a specific release by number",
-	Long:  "Searches indexers for a movie and grabs the release at the given index.\nRun 'udl movie search' first to see numbered results, then grab by number.",
+	Use:   "grab [id|title] [#]",
+	Short: "Grab a specific indexer release for a movie",
+	Long:  "Searches indexers for a movie in the database and grabs the release at the given index.\nRun 'udl movie releases' first to see numbered results, then grab by number.",
 	Args:  cobra.MinimumNArgs(2),
 	RunE:  runMovieGrab,
 }
@@ -76,10 +86,19 @@ var tvCmd = &cobra.Command{
 }
 
 var tvAddCmd = &cobra.Command{
-	Use:   "add [query]",
-	Short: "Add a TV series to monitor",
-	Args:  cobra.MinimumNArgs(1),
+	Use:   "add [tmdb-id]",
+	Short: "Add a TV series by TMDB ID",
+	Long:  "Adds a TV series by its TMDB ID. Use 'udl tv search' first to find the ID.",
+	Args:  cobra.ExactArgs(1),
 	RunE:  runTVAdd,
+}
+
+var tvSearchCmd = &cobra.Command{
+	Use:   "search [query]",
+	Short: "Search TMDB for TV series",
+	Long:  "Searches TMDB and shows results with TMDB IDs. Use the ID with 'udl tv add'.",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runTVSearch,
 }
 
 var tvListCmd = &cobra.Command{
@@ -113,8 +132,8 @@ var queueClearCmd = &cobra.Command{
 }
 
 var queueRetryCmd = &cobra.Command{
-	Use:   "retry [id]",
-	Short: "Retry failed downloads (all or by ID)",
+	Use:   "retry [movie:ID|episode:ID]",
+	Short: "Retry failed downloads (all or by category:id)",
 	RunE:  runQueueRetry,
 }
 
@@ -240,8 +259,8 @@ var configPathCmd = &cobra.Command{
 }
 
 func init() {
-	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieGrabCmd, movieRemoveCmd)
-	tvCmd.AddCommand(tvAddCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd)
+	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd)
+	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd)
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
 	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
@@ -392,14 +411,18 @@ func isTerminal() bool {
 }
 
 func runMovieAdd(cmd *cobra.Command, args []string) error {
+	tmdbID, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("TMDB ID must be a number (use 'udl movie search' to find it)")
+	}
+
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	query := strings.Join(args, " ")
-	rpcArgs := &daemon.AddMovieArgs{Query: query}
+	rpcArgs := &daemon.AddMovieArgs{TMDBID: tmdbID}
 	var reply daemon.AddMovieReply
 	if err := client.Call("Service.AddMovie", rpcArgs, &reply); err != nil {
 		return err
@@ -451,14 +474,50 @@ func runMovieSearch(cmd *cobra.Command, args []string) error {
 	defer client.Close()
 
 	query := strings.Join(args, " ")
-	rpcArgs := &daemon.SearchMovieArgs{Query: query}
+	rpcArgs := &daemon.TMDBSearchMovieArgs{Query: query}
+	var reply daemon.TMDBSearchMovieReply
+	if err := client.Call("Service.TMDBSearchMovie", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Results) == 0 {
+		fmt.Println("no results found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR")
+	for i, r := range reply.Results {
+		fmt.Fprintf(w, "%d\t%s\t%d\n", r.TMDBID, r.Title, r.Year)
+		if i >= 19 {
+			break // show top 20
+		}
+	}
+	return w.Flush()
+}
+
+func runMovieReleases(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	input := strings.Join(args, " ")
+	rpcArgs := &daemon.SearchMovieArgs{}
+	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
+		rpcArgs.MovieID = id
+	} else {
+		rpcArgs.Title = input
+	}
+
 	var reply daemon.SearchMovieReply
 	if err := client.Call("Service.SearchMovie", rpcArgs, &reply); err != nil {
 		return err
 	}
 
 	if len(reply.Results) == 0 {
-		fmt.Println("no results found")
+		fmt.Println("no releases found")
 		return nil
 	}
 
@@ -484,19 +543,25 @@ func runMovieGrab(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
-	// Last arg is the release number, everything before is the query.
+	// Last arg is the release number, everything before is the movie identifier.
 	indexStr := args[len(args)-1]
 	index, err := strconv.Atoi(indexStr)
 	if err != nil {
 		return fmt.Errorf("last argument must be a release number (e.g. 'udl movie grab \"Title\" 3')")
 	}
 
-	query := strings.Join(args[:len(args)-1], " ")
-	if query == "" {
-		return fmt.Errorf("movie title is required")
+	input := strings.Join(args[:len(args)-1], " ")
+	if input == "" {
+		return fmt.Errorf("movie ID or title is required")
 	}
 
-	rpcArgs := &daemon.GrabMovieReleaseArgs{Query: query, Index: index}
+	rpcArgs := &daemon.GrabMovieReleaseArgs{Index: index}
+	if id, err := strconv.ParseInt(input, 10, 64); err == nil {
+		rpcArgs.MovieID = id
+	} else {
+		rpcArgs.Title = input
+	}
+
 	var reply daemon.GrabMovieReleaseReply
 	if err := client.Call("Service.GrabMovieRelease", rpcArgs, &reply); err != nil {
 		return err
@@ -509,14 +574,18 @@ func runMovieGrab(cmd *cobra.Command, args []string) error {
 }
 
 func runTVAdd(cmd *cobra.Command, args []string) error {
+	tmdbID, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("TMDB ID must be a number (use 'udl tv search' to find it)")
+	}
+
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	query := strings.Join(args, " ")
-	rpcArgs := &daemon.AddSeriesArgs{Query: query}
+	rpcArgs := &daemon.AddSeriesArgs{TMDBID: tmdbID}
 	var reply daemon.AddSeriesReply
 	if err := client.Call("Service.AddSeries", rpcArgs, &reply); err != nil {
 		return err
@@ -527,6 +596,36 @@ func runTVAdd(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  -> %d episodes enqueued for download\n", reply.Grabbed)
 	}
 	return nil
+}
+
+func runTVSearch(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	query := strings.Join(args, " ")
+	rpcArgs := &daemon.TMDBSearchSeriesArgs{Query: query}
+	var reply daemon.TMDBSearchSeriesReply
+	if err := client.Call("Service.TMDBSearchSeries", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Results) == 0 {
+		fmt.Println("no results found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR")
+	for i, r := range reply.Results {
+		fmt.Fprintf(w, "%d\t%s\t%d\n", r.TMDBID, r.Title, r.Year)
+		if i >= 19 {
+			break // show top 20
+		}
+	}
+	return w.Flush()
 }
 
 func runTVList(cmd *cobra.Command, args []string) error {
@@ -566,14 +665,14 @@ func runQueue(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if len(reply.Downloads) == 0 {
+	if len(reply.Items) == 0 {
 		fmt.Println("queue empty")
 		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "TITLE\tSTATUS\tPROGRESS")
-	for _, d := range reply.Downloads {
+	for _, d := range reply.Items {
 		progress := d.Progress
 		if progress > 100 {
 			progress = 100
@@ -792,11 +891,21 @@ func runQueueRetry(cmd *cobra.Command, args []string) error {
 
 	rpcArgs := &daemon.RetryDownloadArgs{}
 	if len(args) > 0 {
-		id, err := strconv.ParseInt(args[0], 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid download ID: %s", args[0])
+		// Parse "movie:42" or "episode:17" format.
+		parts := strings.SplitN(args[0], ":", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid format %q — use movie:ID or episode:ID", args[0])
 		}
-		rpcArgs.ID = id
+		category := parts[0]
+		if category != "movie" && category != "episode" {
+			return fmt.Errorf("invalid category %q — use movie or episode", category)
+		}
+		id, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid ID %q: %w", parts[1], err)
+		}
+		rpcArgs.Category = category
+		rpcArgs.MediaID = id
 	}
 
 	var reply daemon.RetryDownloadReply

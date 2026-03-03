@@ -273,15 +273,15 @@ func TestGrabBest_SizeRejection(t *testing.T) {
 	}
 
 	// Verify the good release was grabbed, not the too-small one.
-	downloads, err := db.PendingDownloads()
+	items, err := db.PendingMedia()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(downloads) != 1 {
-		t.Fatalf("expected 1 download, got %d", len(downloads))
+	if len(items) != 1 {
+		t.Fatalf("expected 1 download, got %d", len(items))
 	}
-	if downloads[0].NzbName != "Test.Movie.2024.1080p.WEB-DL-GOOD" {
-		t.Errorf("expected GOOD release to be grabbed, got %s", downloads[0].NzbName)
+	if items[0].NzbName.String != "Test.Movie.2024.1080p.WEB-DL-GOOD" {
+		t.Errorf("expected GOOD release to be grabbed, got %s", items[0].NzbName.String)
 	}
 }
 
@@ -338,15 +338,15 @@ func TestGrabBest_RetentionRejection(t *testing.T) {
 		t.Error("expected a release to be grabbed")
 	}
 
-	downloads, err := db.PendingDownloads()
+	items, err := db.PendingMedia()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(downloads) != 1 {
-		t.Fatalf("expected 1 download, got %d", len(downloads))
+	if len(items) != 1 {
+		t.Fatalf("expected 1 download, got %d", len(items))
 	}
-	if downloads[0].NzbName != "Test.Movie.2024.1080p.WEB-DL-NEW" {
-		t.Errorf("expected NEW release, got %s", downloads[0].NzbName)
+	if items[0].NzbName.String != "Test.Movie.2024.1080p.WEB-DL-NEW" {
+		t.Errorf("expected NEW release, got %s", items[0].NzbName.String)
 	}
 }
 
@@ -402,15 +402,15 @@ func TestGrabBest_AlreadyImported(t *testing.T) {
 		t.Error("expected a release to be grabbed")
 	}
 
-	downloads, err := db.PendingDownloads()
+	items, err := db.PendingMedia()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(downloads) != 1 {
-		t.Fatalf("expected 1 download, got %d", len(downloads))
+	if len(items) != 1 {
+		t.Fatalf("expected 1 download, got %d", len(items))
 	}
-	if downloads[0].NzbName != "Test.Movie.2024.1080p.WEB-DL-OTHER" {
-		t.Errorf("expected OTHER release, got %s", downloads[0].NzbName)
+	if items[0].NzbName.String != "Test.Movie.2024.1080p.WEB-DL-OTHER" {
+		t.Errorf("expected OTHER release, got %s", items[0].NzbName.String)
 	}
 }
 

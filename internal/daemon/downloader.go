@@ -3,21 +3,18 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
 
-	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/nntp"
@@ -40,18 +37,19 @@ type PoolStatuser interface {
 }
 
 // Downloader picks items from the download queue and processes them.
+// Uses the Service for shared config/db/log access (same pattern as Scheduler).
 type Downloader struct {
-	cfg      *config.Config
-	db       *database.DB
+	svc      *Service
 	engine   DownloadEngine
 	indexers []*newznab.Client
-	log      *slog.Logger
+	workCh   chan database.QueueItem // buffered, cap 32
 	stop     chan struct{}
 	stopOnce sync.Once
 }
 
 // NewDownloader creates a downloader with NNTP engine initialized from config providers.
-func NewDownloader(cfg *config.Config, db *database.DB, log *slog.Logger) *Downloader {
+func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
+	cfg := svc.cfg
 	providers := make([]nntp.ProviderConfig, len(cfg.Usenet.Providers))
 	for i, p := range cfg.Usenet.Providers {
 		providers[i] = nntp.ProviderConfig{
@@ -74,52 +72,83 @@ func NewDownloader(cfg *config.Config, db *database.DB, log *slog.Logger) *Downl
 	}
 
 	return &Downloader{
-		cfg:      cfg,
-		db:       db,
+		svc:      svc,
 		engine:   engine,
 		indexers: indexers,
-		log:      log,
+		workCh:   make(chan database.QueueItem, 32),
 		stop:     make(chan struct{}),
 	}
 }
 
 // NewDownloaderWithEngine creates a Downloader with a custom DownloadEngine.
 // Used in tests to inject a fake engine that doesn't require real NNTP providers.
-func NewDownloaderWithEngine(cfg *config.Config, db *database.DB, engine DownloadEngine, log *slog.Logger) *Downloader {
+func NewDownloaderWithEngine(svc *Service, engine DownloadEngine) *Downloader {
 	return &Downloader{
-		cfg:    cfg,
-		db:     db,
+		svc:    svc,
 		engine: engine,
-		log:    log,
+		workCh: make(chan database.QueueItem, 32),
 		stop:   make(chan struct{}),
 	}
 }
 
-// Start begins processing downloads. Non-blocking — runs in a background goroutine.
-// Polls the database for queued downloads every few seconds.
+// Enqueue sends a queue item to the worker goroutine for immediate processing.
+// Non-blocking — drops the item if the channel is full (watchdog will recover it).
+func (d *Downloader) Enqueue(item database.QueueItem) {
+	select {
+	case d.workCh <- item:
+	default:
+		d.svc.log.Debug("work channel full, watchdog will pick up", "title", item.Title)
+	}
+}
+
+// Start begins processing downloads. Non-blocking — runs worker and watchdog goroutines.
 // On startup, resets any downloads stuck in 'downloading' from a previous run.
 func (d *Downloader) Start(ctx context.Context) {
+	cfg := d.svc.cfg
+	db := d.svc.db
+
 	// Reset "downloading" → "queued" (NNTP state is lost on restart).
 	// Leave "post_processing" as-is — files are on disk and can be resumed.
-	if _, err := d.db.Exec(`UPDATE downloads SET status = 'queued' WHERE status = 'downloading'`); err != nil {
-		d.log.Error("failed to reset stale downloads", "error", err)
-	}
-
-	// Log post_processing items that will be resumed.
-	var ppCount int
-	if err := d.db.QueryRow(`SELECT COUNT(*) FROM downloads WHERE status = 'post_processing'`).Scan(&ppCount); err == nil && ppCount > 0 {
-		d.log.Info("resuming post-processing downloads from previous run", "count", ppCount)
-	}
-
-	// Clean up stale .udl-tmp files from interrupted imports.
-	if d.cfg != nil {
-		if n := organize.CleanStaleTmpFiles(d.cfg.Library.Movies, d.cfg.Library.TV); n > 0 {
-			d.log.Warn("cleaned stale .udl-tmp files from previous crash", "count", n)
+	for _, table := range []string{"movies", "episodes"} {
+		if _, err := db.Exec(fmt.Sprintf(`UPDATE %s SET status = 'queued' WHERE status = 'downloading'`, table)); err != nil {
+			d.svc.log.Error("failed to reset stale downloads", "table", table, "error", err)
 		}
 	}
 
+	// Clean up stale .udl-tmp files from interrupted imports.
+	if cfg != nil {
+		if n := organize.CleanStaleTmpFiles(cfg.Library.Movies, cfg.Library.TV); n > 0 {
+			d.svc.log.Warn("cleaned stale .udl-tmp files from previous crash", "count", n)
+		}
+	}
+
+	// Scan DB for pending items and seed the channel.
+	if pending, err := db.PendingMedia(); err == nil {
+		for _, item := range pending {
+			if item.Status == "post_processing" {
+				d.svc.log.Info("resuming post-processing from previous run", "title", item.Title)
+			}
+			d.Enqueue(item)
+		}
+	}
+
+	// Worker goroutine: processes items from the channel sequentially.
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-d.stop:
+				return
+			case item := <-d.workCh:
+				d.processItem(ctx, item)
+			}
+		}
+	}()
+
+	// Watchdog goroutine: 30s tick, resets stuck items + re-enqueues missed ones.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for {
 			select {
@@ -128,7 +157,7 @@ func (d *Downloader) Start(ctx context.Context) {
 			case <-d.stop:
 				return
 			case <-ticker.C:
-				d.processQueue(ctx)
+				d.watchdog()
 			}
 		}
 	}()
@@ -142,19 +171,86 @@ func (d *Downloader) Stop() {
 	})
 }
 
+// watchdog resets stuck downloads and re-enqueues pending items that were missed.
+func (d *Downloader) watchdog() {
+	if n, err := d.svc.db.ResetStuckMedia(); err != nil {
+		d.svc.log.Error("watchdog: reset stuck failed", "error", err)
+	} else if n > 0 {
+		d.svc.log.Warn("watchdog: reset stuck downloads", "count", n)
+	}
+
+	pending, err := d.svc.db.PendingMedia()
+	if err != nil {
+		d.svc.log.Error("watchdog: query pending", "error", err)
+		return
+	}
+	for _, item := range pending {
+		d.Enqueue(item)
+	}
+}
+
+// processItem dispatches a queue item to the appropriate handler.
+func (d *Downloader) processItem(ctx context.Context, item database.QueueItem) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Re-read status from DB — the item may have been failed/completed since it was enqueued.
+	var currentStatus string
+	table := "movies"
+	if item.Category == "episode" {
+		table = "episodes"
+	}
+	if err := d.svc.db.QueryRow(fmt.Sprintf(`SELECT status FROM %s WHERE id = ?`, table), item.MediaID).Scan(&currentStatus); err != nil {
+		d.svc.log.Warn("processItem: could not read current status, skipping", "category", item.Category, "media_id", item.MediaID, "error", err)
+		return
+	}
+	switch currentStatus {
+	case "queued", "downloading", "post_processing":
+		item.Status = currentStatus
+	default:
+		return // no longer active
+	}
+
+	d.svc.log.Info("processing download", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "status", item.Status)
+
+	var err error
+	switch {
+	case item.Status == "post_processing":
+		err = d.resumePostProcessing(ctx, item)
+	case item.Source.Valid && item.Source.String == "plex":
+		err = d.processPlexDownload(ctx, item)
+	default:
+		err = d.processUsenetDownload(ctx, item)
+	}
+
+	if err != nil {
+		d.svc.log.Error("download failed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "error", err)
+	}
+}
+
+// downloadDir returns the path to the incomplete directory for this item.
+func (d *Downloader) downloadDir(item database.QueueItem) string {
+	return filepath.Join(d.svc.cfg.Paths.Incomplete, fmt.Sprintf("%s-%d", item.Category, item.MediaID))
+}
+
 // checkDiskSpace verifies that there's enough free space at path for the download.
-// Requires 2x the download size plus 1GB margin for post-processing.
+// multiplier controls the size factor: use 2 for Usenet (download + extraction),
+// 1 for Plex (just the library copy). Always adds 1GB margin.
 // Returns nil if size is unknown (0) or if the check can't be performed.
-func checkDiskSpace(path string, requiredBytes int64) error {
+func checkDiskSpace(path string, requiredBytes int64, multiplier int) error {
 	if requiredBytes <= 0 {
 		return nil // size unknown, skip check
+	}
+	if multiplier <= 0 {
+		multiplier = 2
 	}
 	var stat unix.Statfs_t
 	if err := unix.Statfs(path, &stat); err != nil {
 		return nil // can't check, proceed
 	}
 	available := int64(stat.Bavail) * int64(stat.Bsize)
-	needed := requiredBytes*2 + 1<<30 // 2x size + 1GB margin
+	needed := requiredBytes*int64(multiplier) + 1<<30 // Nx size + 1GB margin
 	if available < needed {
 		return fmt.Errorf("insufficient disk space: %d MB available, need ~%d MB",
 			available>>20, needed>>20)
@@ -162,104 +258,46 @@ func checkDiskSpace(path string, requiredBytes int64) error {
 	return nil
 }
 
-// resetStuckDownloads resets downloads stuck in "downloading" state for >2 hours.
-// This catches downloads orphaned by daemon crashes or killed processes.
-func (d *Downloader) resetStuckDownloads() {
-	res, err := d.db.Exec(`
-		UPDATE downloads SET status = 'queued', error_msg = 'reset: stuck in downloading state'
-		WHERE status = 'downloading'
-		  AND started_at IS NOT NULL
-		  AND started_at < datetime('now', '-2 hours')
-	`)
-	if err != nil {
-		d.log.Error("reset stuck downloads query failed", "error", err)
-		return
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		d.log.Warn("reset stuck downloads", "count", n)
-	}
-}
-
-// processQueue fetches pending downloads and processes one per tick.
-// Post-processing items are prioritized (closest to completion).
-func (d *Downloader) processQueue(ctx context.Context) {
-	d.resetStuckDownloads()
-
-	downloads, err := d.db.PendingDownloads()
-	if err != nil {
-		d.log.Error("failed to fetch pending downloads", "error", err)
-		return
-	}
-
-	for _, dl := range downloads {
-		switch dl.Status {
-		case "queued":
-			d.log.Info("processing download", "id", dl.ID, "title", dl.Title)
-			if err := d.ProcessOne(ctx, dl); err != nil {
-				d.log.Error("download failed", "id", dl.ID, "title", dl.Title, "error", err)
-			}
-		case "post_processing":
-			d.log.Info("resuming post-processing", "id", dl.ID, "title", dl.Title)
-			if err := d.resumePostProcessing(ctx, dl); err != nil {
-				d.log.Error("post-processing resume failed", "id", dl.ID, "title", dl.Title, "error", err)
-			}
-		default:
-			continue
-		}
-		// Process one at a time per tick.
-		return
-	}
-}
-
-// ProcessOne processes a single download from the queue.
-// Dispatches to the appropriate pipeline based on the download source.
-func (d *Downloader) ProcessOne(ctx context.Context, dl database.Download) error {
-	if dl.Source == "plex" {
-		return d.processPlexDownload(ctx, dl)
-	}
-	return d.processUsenetDownload(ctx, dl)
-}
-
 // processPlexDownload handles downloads from Plex friends' servers.
 // Simple pipeline: HTTP stream → file → import to library.
-func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Download) error {
-	if err := d.db.UpdateDownloadStatus(dl.ID, "downloading"); err != nil {
+func (d *Downloader) processPlexDownload(ctx context.Context, item database.QueueItem) error {
+	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "downloading"); err != nil {
 		return fmt.Errorf("update status to downloading: %w", err)
 	}
 
-	// Check disk space before starting.
-	if dl.SizeBytes.Valid {
-		if err := checkDiskSpace(d.cfg.Paths.Incomplete, dl.SizeBytes.Int64); err != nil {
-			return d.fail(dl.ID, err.Error())
+	// Check disk space before starting. Plex needs 1x size (stream + library copy on same volume).
+	if item.SizeBytes.Valid {
+		if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, item.SizeBytes.Int64, 1); err != nil {
+			return d.fail(item, err.Error())
 		}
 	}
 
-	if !dl.NzbURL.Valid || dl.NzbURL.String == "" {
-		return d.fail(dl.ID, "plex download has no URL")
+	if !item.NzbURL.Valid || item.NzbURL.String == "" {
+		return d.fail(item, "plex download has no URL")
 	}
-	dlURL := dl.NzbURL.String
+	dlURL := item.NzbURL.String
 
 	// Create a temporary file for the download.
-	downloadDir := filepath.Join(d.cfg.Paths.Incomplete, fmt.Sprintf("plex-%d", dl.ID))
+	downloadDir := filepath.Join(d.svc.cfg.Paths.Incomplete, fmt.Sprintf("plex-%s-%d", item.Category, item.MediaID))
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create download dir: %v", err), downloadDir)
+		return d.fail(item, fmt.Sprintf("create download dir: %v", err), downloadDir)
 	}
 
 	// Stream the file from the Plex server.
 	req, err := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create request: %v", err), downloadDir)
+		return d.fail(item, fmt.Sprintf("create request: %v", err), downloadDir)
 	}
 
 	plexHTTP := &http.Client{Timeout: 30 * time.Minute} // large files
 	resp, err := plexHTTP.Do(req)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("plex download: %v", err), downloadDir)
+		return d.fail(item, fmt.Sprintf("plex download: %v", err), downloadDir)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return d.fail(dl.ID, fmt.Sprintf("plex download: HTTP %d", resp.StatusCode), downloadDir)
+		return d.fail(item, fmt.Sprintf("plex download: HTTP %d", resp.StatusCode), downloadDir)
 	}
 
 	// Determine filename — use Content-Disposition or fall back to a generic name.
@@ -272,7 +310,7 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 
 	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create temp file: %v", err), downloadDir)
+		return d.fail(item, fmt.Sprintf("create temp file: %v", err), downloadDir)
 	}
 
 	// Stream with progress updates.
@@ -284,12 +322,12 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 		if n > 0 {
 			if _, writeErr := tmpFile.Write(buf[:n]); writeErr != nil {
 				tmpFile.Close()
-				return d.fail(dl.ID, fmt.Sprintf("write: %v", writeErr), downloadDir)
+				return d.fail(item, fmt.Sprintf("write: %v", writeErr), downloadDir)
 			}
 			downloaded += int64(n)
 			if totalSize > 0 {
 				progress := float64(downloaded) / float64(totalSize) * 100
-				_ = d.db.UpdateDownloadProgress(dl.ID, progress, downloaded)
+				_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, downloaded)
 			}
 		}
 		if readErr != nil {
@@ -297,94 +335,70 @@ func (d *Downloader) processPlexDownload(ctx context.Context, dl database.Downlo
 				break
 			}
 			tmpFile.Close()
-			return d.fail(dl.ID, fmt.Sprintf("read: %v", readErr), downloadDir)
+			return d.fail(item, fmt.Sprintf("read: %v", readErr), downloadDir)
 		}
 	}
 	tmpFile.Close()
 
 	// Atomic rename from .part to final.
 	if err := os.Rename(tmpPath, finalTmpPath); err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("rename: %v", err), downloadDir)
+		return d.fail(item, fmt.Sprintf("rename: %v", err), downloadDir)
 	}
 
 	// Import to library.
-	// Parse quality from the nzb_name field (format: "plex:ServerName").
-	// We don't have release name quality info, so infer from Plex resolution.
-	q := parser.Parse(dl.Title).Quality
+	q := parser.Parse(item.Title).Quality
 	if q == 0 {
-		// Fallback: try to detect from file size.
 		q = quality.WEBDL1080p // conservative default for Plex
 	}
 
-	dstPath, err := d.importToLibrary(dl, finalTmpPath, nil, q)
+	dstPath, err := d.importToLibrary(item, finalTmpPath, nil, q)
 	if err != nil {
-		return d.fail(dl.ID, err.Error(), downloadDir)
+		return d.fail(item, err.Error(), downloadDir)
 	}
 
-	// Complete: update download + history in a single transaction.
-	if err := d.db.WithTx(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`UPDATE downloads SET status = 'completed' WHERE id = ?`, dl.ID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO history (media_type, media_id, title, event, source, quality) VALUES (?, ?, ?, 'completed', ?, ?)`,
-			dl.Category, dl.MediaID, dl.Title, dl.NzbName, q.String(),
-		); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		d.log.Error("failed to record completion", "id", dl.ID, "error", err)
-	}
-	if err := os.RemoveAll(downloadDir); err != nil {
-		d.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
-	}
-
-	d.log.Info("plex download completed", "id", dl.ID, "title", dl.Title, "path", dstPath,
-		"size_mb", downloaded/(1024*1024), "server", dl.NzbName)
-	return nil
+	return d.completeDownload(item, q, dstPath, downloadDir)
 }
 
 // processUsenetDownload handles downloads from Usenet via NZB/NNTP.
 // Pipeline: fetch NZB -> download -> post-process -> import.
-func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Download) error {
+func (d *Downloader) processUsenetDownload(ctx context.Context, item database.QueueItem) error {
 	// 1. Update status to "downloading".
-	if err := d.db.UpdateDownloadStatus(dl.ID, "downloading"); err != nil {
+	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "downloading"); err != nil {
 		return fmt.Errorf("update status to downloading: %w", err)
 	}
 
 	// 2. Check disk space before starting.
-	if dl.SizeBytes.Valid {
-		if err := checkDiskSpace(d.cfg.Paths.Incomplete, dl.SizeBytes.Int64); err != nil {
-			return d.fail(dl.ID, err.Error())
+	if item.SizeBytes.Valid {
+		if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, item.SizeBytes.Int64, 2); err != nil {
+			return d.fail(item, err.Error())
 		}
 	}
 
-	// 3. Fetch NZB bytes from the download's nzb_url.
-	if !dl.NzbURL.Valid || dl.NzbURL.String == "" {
-		return d.fail(dl.ID, "download has no NZB URL")
+	// 3. Fetch NZB bytes from the item's nzb_url.
+	if !item.NzbURL.Valid || item.NzbURL.String == "" {
+		return d.fail(item, "download has no NZB URL")
 	}
-	nzbURL := dl.NzbURL.String
+	nzbURL := item.NzbURL.String
 
 	nzbData, err := d.fetchNZB(nzbURL)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("fetch NZB: %v", err))
+		return d.fail(item, fmt.Sprintf("fetch NZB: %v", err))
 	}
 
 	// 3. Parse NZB XML.
 	parsed, err := nzb.Parse(bytes.NewReader(nzbData))
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("parse NZB: %v", err))
+		return d.fail(item, fmt.Sprintf("parse NZB: %v", err))
 	}
 
 	// 4. Create download directory under incomplete.
-	downloadDir := filepath.Join(d.cfg.Paths.Incomplete, strconv.FormatInt(dl.ID, 10))
-	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("create download dir: %v", err), downloadDir)
+	dlDir := d.downloadDir(item)
+	if err := os.MkdirAll(dlDir, 0o755); err != nil {
+		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
 	}
 
 	// Save NZB for potential resume (avoids re-fetch from indexer on crash).
-	_ = os.WriteFile(filepath.Join(downloadDir, "manifest.nzb"), nzbData, 0o644)
+	_ = os.WriteFile(filepath.Join(dlDir, "manifest.nzb"), nzbData, 0o644)
 
 	// 5. NNTP Download with progress callback.
 	progressFn := func(p nntp.Progress) {
@@ -392,69 +406,72 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, dl database.Down
 			return
 		}
 		progress := float64(p.DoneSegments) / float64(p.TotalSegments) * 100
-		_ = d.db.UpdateDownloadProgress(dl.ID, progress, p.BytesDownloaded)
+		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, p.BytesDownloaded)
 	}
 
-	_, err = d.engine.Download(ctx, parsed, downloadDir, progressFn)
+	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
 	if err != nil {
 		// Segment failures are expected — PAR2 can repair up to ~10-15% missing data.
-		// Only abort if no segments were downloaded at all.
 		if strings.Contains(err.Error(), "segments failed") {
-			d.log.Warn("some segments failed, proceeding to PAR2 repair", "id", dl.ID, "error", err)
+			d.svc.log.Warn("some segments failed, proceeding to PAR2 repair", "title", item.Title, "error", err)
 		} else {
-			return d.fail(dl.ID, fmt.Sprintf("NNTP download: %v", err), downloadDir)
+			return d.fail(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
 		}
 	}
 
 	// 6. Update status to "post_processing".
-	if err := d.db.UpdateDownloadStatus(dl.ID, "post_processing"); err != nil {
+	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "post_processing"); err != nil {
 		return fmt.Errorf("update status to post_processing: %w", err)
 	}
 
 	// 7-10. Post-process, import, complete, cleanup.
-	return d.postProcessImportComplete(ctx, dl, downloadDir)
+	return d.postProcessImportComplete(ctx, item, dlDir)
 }
 
 // postProcessImportComplete runs post-processing (PAR2/RAR), imports media files
 // to the library, records completion, and cleans up. Used by both the normal
 // download pipeline and the resume path.
-func (d *Downloader) postProcessImportComplete(ctx context.Context, dl database.Download, downloadDir string) error {
-	result, err := postprocess.Process(downloadDir, d.log)
+func (d *Downloader) postProcessImportComplete(ctx context.Context, item database.QueueItem, downloadDir string) error {
+	result, err := postprocess.Process(downloadDir, d.svc.log)
 	if err != nil {
-		return d.fail(dl.ID, fmt.Sprintf("post-processing: %v", err), downloadDir)
+		return d.fail(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
 	}
 	if !result.Success {
-		return d.fail(dl.ID, fmt.Sprintf("post-processing failed: %s", result.Error), downloadDir)
+		return d.fail(item, fmt.Sprintf("post-processing failed: %s", result.Error), downloadDir)
 	}
 	if len(result.MediaFiles) == 0 {
-		return d.fail(dl.ID, "no media files found after post-processing", downloadDir)
+		return d.fail(item, "no media files found after post-processing", downloadDir)
 	}
 
 	mainMedia := result.MediaFiles[0]
 
-	parsed2 := parser.Parse(dl.NzbName)
+	nzbName := ""
+	if item.NzbName.Valid {
+		nzbName = item.NzbName.String
+	}
+	parsed2 := parser.Parse(nzbName)
 	q := parsed2.Quality
 
-	dstPath, err := d.importToLibrary(dl, mainMedia, result.SubtitleFiles, q)
+	dstPath, err := d.importToLibrary(item, mainMedia, result.SubtitleFiles, q)
 	if err != nil {
-		return d.fail(dl.ID, err.Error(), downloadDir)
+		return d.fail(item, err.Error(), downloadDir)
 	}
 
-	return d.completeDownload(dl, q, dstPath, downloadDir)
+	return d.completeDownload(item, q, dstPath, downloadDir)
 }
 
 // importToLibrary imports a media file (and optional subtitles) to the library.
 // Handles both movie and episode categories. Returns the destination path.
-func (d *Downloader) importToLibrary(dl database.Download, mediaFile string, subtitleFiles []string, q quality.Quality) (string, error) {
+func (d *Downloader) importToLibrary(item database.QueueItem, mediaFile string, subtitleFiles []string, q quality.Quality) (string, error) {
 	mediaExt := filepath.Ext(mediaFile)
 
-	switch dl.Category {
+	switch item.Category {
 	case "movie":
-		movie, err := d.db.GetMovie(dl.MediaID)
+		movie, err := d.svc.db.GetMovie(item.MediaID)
 		if err != nil {
-			return "", fmt.Errorf("get movie %d: %v", dl.MediaID, err)
+			return "", fmt.Errorf("get movie %d: %v", item.MediaID, err)
 		}
-		dstPath := organize.MoviePath(d.cfg.Library.Movies, movie.Title, movie.Year, q, mediaExt)
+		dstPath := organize.MoviePath(d.svc.cfg.Library.Movies, movie.Title, movie.Year, q, mediaExt)
 		if err := organize.Import(mediaFile, dstPath); err != nil {
 			return "", fmt.Errorf("import movie: %v", err)
 		}
@@ -462,20 +479,20 @@ func (d *Downloader) importToLibrary(dl database.Download, mediaFile string, sub
 			subExt := filepath.Ext(sub)
 			subDst := organize.SubtitlePath(dstPath, "en", subExt)
 			if err := organize.Import(sub, subDst); err != nil {
-				d.log.Warn("failed to import subtitle", "src", sub, "dst", subDst, "error", err)
+				d.svc.log.Warn("failed to import subtitle", "src", sub, "dst", subDst, "error", err)
 			}
 		}
-		if err := d.db.UpdateMovieStatus(movie.ID, "downloaded", q.String(), dstPath); err != nil {
-			d.log.Error("failed to update movie status", "id", movie.ID, "error", err)
+		if err := d.svc.db.UpdateMovieStatus(movie.ID, "downloaded", q.String(), dstPath); err != nil {
+			d.svc.log.Error("failed to update movie status", "id", movie.ID, "error", err)
 		}
 		return dstPath, nil
 
 	case "episode":
-		ep, err := d.db.GetEpisode(dl.MediaID)
+		ep, err := d.svc.db.GetEpisode(item.MediaID)
 		if err != nil {
-			return "", fmt.Errorf("get episode %d: %v", dl.MediaID, err)
+			return "", fmt.Errorf("get episode %d: %v", item.MediaID, err)
 		}
-		series, err := d.db.GetSeries(ep.SeriesID)
+		series, err := d.svc.db.GetSeries(ep.SeriesID)
 		if err != nil {
 			return "", fmt.Errorf("get series %d: %v", ep.SeriesID, err)
 		}
@@ -484,7 +501,7 @@ func (d *Downloader) importToLibrary(dl database.Download, mediaFile string, sub
 			epTitle = ep.Title.String
 		}
 		dstPath := organize.EpisodePath(
-			d.cfg.Library.TV, series.Title, series.Year,
+			d.svc.cfg.Library.TV, series.Title, series.Year,
 			ep.Season, ep.Episode, epTitle, q, mediaExt,
 		)
 		if err := organize.Import(mediaFile, dstPath); err != nil {
@@ -494,89 +511,88 @@ func (d *Downloader) importToLibrary(dl database.Download, mediaFile string, sub
 			subExt := filepath.Ext(sub)
 			subDst := organize.SubtitlePath(dstPath, "en", subExt)
 			if err := organize.Import(sub, subDst); err != nil {
-				d.log.Warn("failed to import subtitle", "src", sub, "dst", subDst, "error", err)
+				d.svc.log.Warn("failed to import subtitle", "src", sub, "dst", subDst, "error", err)
 			}
 		}
-		if err := d.db.UpdateEpisodeStatus(ep.ID, "downloaded", q.String(), dstPath); err != nil {
-			d.log.Error("failed to update episode status", "id", ep.ID, "error", err)
+		if err := d.svc.db.UpdateEpisodeStatus(ep.ID, "downloaded", q.String(), dstPath); err != nil {
+			d.svc.log.Error("failed to update episode status", "id", ep.ID, "error", err)
 		}
 		return dstPath, nil
 
 	default:
-		return "", fmt.Errorf("unknown category: %s", dl.Category)
+		return "", fmt.Errorf("unknown category: %s", item.Category)
 	}
 }
 
 // completeDownload records completion in the DB and cleans up the download directory.
-func (d *Downloader) completeDownload(dl database.Download, q quality.Quality, dstPath, downloadDir string) error {
-	if err := d.db.WithTx(func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`UPDATE downloads SET status = 'completed' WHERE id = ?`, dl.ID); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO history (media_type, media_id, title, event, source, quality) VALUES (?, ?, ?, 'completed', ?, ?)`,
-			dl.Category, dl.MediaID, dl.Title, dl.NzbName, q.String(),
-		); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		d.log.Error("failed to record completion", "id", dl.ID, "error", err)
+func (d *Downloader) completeDownload(item database.QueueItem, q quality.Quality, dstPath, downloadDir string) error {
+	nzbName := ""
+	if item.NzbName.Valid {
+		nzbName = item.NzbName.String
+	}
+
+	// Clear download fields and record history.
+	if err := d.svc.db.ClearMediaDownloadFields(item.Category, item.MediaID); err != nil {
+		d.svc.log.Error("failed to clear download fields", "title", item.Title, "error", err)
+	}
+	if err := d.svc.db.AddHistory(item.Category, item.MediaID, item.Title, "completed", nzbName, q.String()); err != nil {
+		d.svc.log.Error("failed to record completion history", "title", item.Title, "error", err)
 	}
 
 	if err := os.RemoveAll(downloadDir); err != nil {
-		d.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
+		d.svc.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
 	}
 
-	d.log.Info("download completed", "id", dl.ID, "title", dl.Title, "path", dstPath)
+	d.svc.log.Info("download completed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "path", dstPath)
 	return nil
 }
 
 // resumePostProcessing resumes a download that was in post_processing when the
 // daemon crashed. Files are already on disk in the incomplete directory.
-func (d *Downloader) resumePostProcessing(ctx context.Context, dl database.Download) error {
-	downloadDir := filepath.Join(d.cfg.Paths.Incomplete, strconv.FormatInt(dl.ID, 10))
+func (d *Downloader) resumePostProcessing(ctx context.Context, item database.QueueItem) error {
+	dlDir := d.downloadDir(item)
 
 	// Edge case: directory was deleted between crash and restart.
-	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
-		return d.fail(dl.ID, "resume: download directory missing")
+	if _, err := os.Stat(dlDir); os.IsNotExist(err) {
+		return d.fail(item, "resume: download directory missing")
 	}
 
-	// UDL-specific: check if file was already imported to library.
-	// Handles crash-between-import-and-completion that NZBGet/Sonarr can't detect.
-	if dstPath, q := d.expectedLibraryPath(dl); dstPath != "" {
+	// Check if file was already imported to library.
+	if dstPath, q := d.expectedLibraryPath(item); dstPath != "" {
 		if _, err := os.Stat(dstPath); err == nil {
-			d.log.Info("resume: file already imported, completing",
-				"id", dl.ID, "title", dl.Title, "path", dstPath)
-			return d.completeDownload(dl, q, dstPath, downloadDir)
+			d.svc.log.Info("resume: file already imported, completing",
+				"title", item.Title, "path", dstPath)
+			return d.completeDownload(item, q, dstPath, dlDir)
 		}
 	}
 
-	return d.postProcessImportComplete(ctx, dl, downloadDir)
+	return d.postProcessImportComplete(ctx, item, dlDir)
 }
 
 // expectedLibraryPath computes where the file would be imported based on the
-// download's metadata. Returns empty string if the path can't be determined.
-func (d *Downloader) expectedLibraryPath(dl database.Download) (string, quality.Quality) {
-	parsed2 := parser.Parse(dl.NzbName)
+// item's metadata. Returns empty string if the path can't be determined.
+func (d *Downloader) expectedLibraryPath(item database.QueueItem) (string, quality.Quality) {
+	nzbName := ""
+	if item.NzbName.Valid {
+		nzbName = item.NzbName.String
+	}
+	parsed2 := parser.Parse(nzbName)
 	q := parsed2.Quality
 
-	switch dl.Category {
+	switch item.Category {
 	case "movie":
-		movie, err := d.db.GetMovie(dl.MediaID)
+		movie, err := d.svc.db.GetMovie(item.MediaID)
 		if err != nil {
 			return "", q
 		}
-		// Use .mkv as default — the actual extension may vary but this covers
-		// the common case for the "already imported" check.
-		return organize.MoviePath(d.cfg.Library.Movies, movie.Title, movie.Year, q, ".mkv"), q
+		return organize.MoviePath(d.svc.cfg.Library.Movies, movie.Title, movie.Year, q, ".mkv"), q
 
 	case "episode":
-		ep, err := d.db.GetEpisode(dl.MediaID)
+		ep, err := d.svc.db.GetEpisode(item.MediaID)
 		if err != nil {
 			return "", q
 		}
-		series, err := d.db.GetSeries(ep.SeriesID)
+		series, err := d.svc.db.GetSeries(ep.SeriesID)
 		if err != nil {
 			return "", q
 		}
@@ -585,46 +601,50 @@ func (d *Downloader) expectedLibraryPath(dl database.Download) (string, quality.
 			epTitle = ep.Title.String
 		}
 		return organize.EpisodePath(
-			d.cfg.Library.TV, series.Title, series.Year,
+			d.svc.cfg.Library.TV, series.Title, series.Year,
 			ep.Season, ep.Episode, epTitle, q, ".mkv",
 		), q
 	}
 	return "", q
 }
 
-// fail marks the download as failed, records a history event, and returns an error.
-// If cleanupDir is provided and non-empty, the directory is removed to prevent disk space leaks.
-func (d *Downloader) fail(id int64, msg string, cleanupDir ...string) error {
-	if err := d.db.UpdateDownloadError(id, msg); err != nil {
-		d.log.Error("failed to update download error", "id", id, "error", err)
+// fail marks the media item as failed, records a history event, blocklists the release,
+// and returns an error. If cleanupDir is provided, the directory is removed.
+func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...string) error {
+	if err := d.svc.db.SetMediaDownloadError(item.Category, item.MediaID, msg); err != nil {
+		d.svc.log.Error("failed to set download error", "title", item.Title, "error", err)
 	}
+
+	nzbName := ""
+	if item.NzbName.Valid {
+		nzbName = item.NzbName.String
+	}
+
 	// Record failure in history and blocklist the release.
-	// Best-effort: look up the download for metadata.
-	var dl database.Download
-	if err := d.db.QueryRow(
-		`SELECT category, media_id, title, nzb_name FROM downloads WHERE id = ?`, id,
-	).Scan(&dl.Category, &dl.MediaID, &dl.Title, &dl.NzbName); err == nil {
-		if err := d.db.AddHistory(dl.Category, dl.MediaID, dl.Title, "failed", dl.NzbName, ""); err != nil {
-			d.log.Error("failed to record failure history", "id", id, "error", err)
-		}
-		// Auto-blocklist so re-search skips this release.
-		if err := d.db.AddBlocklist(dl.Category, dl.MediaID, dl.NzbName, msg); err != nil {
-			d.log.Error("failed to blocklist release", "id", id, "release", dl.NzbName, "error", err)
+	if err := d.svc.db.AddHistory(item.Category, item.MediaID, item.Title, "failed", nzbName, ""); err != nil {
+		d.svc.log.Error("failed to record failure history", "title", item.Title, "error", err)
+	}
+	if nzbName != "" {
+		if err := d.svc.db.AddBlocklist(item.Category, item.MediaID, nzbName, msg); err != nil {
+			d.svc.log.Error("failed to blocklist release", "title", item.Title, "release", nzbName, "error", err)
 		}
 	}
+
 	for _, dir := range cleanupDir {
 		if dir != "" {
 			if err := os.RemoveAll(dir); err != nil {
-				d.log.Warn("cleanup incomplete dir failed", "dir", dir, "error", err)
+				d.svc.log.Warn("cleanup incomplete dir failed", "dir", dir, "error", err)
 			}
 		}
 	}
-	return fmt.Errorf("download %d: %s", id, msg)
+	return fmt.Errorf("%s %d (%s): %s", item.Category, item.MediaID, item.Title, msg)
 }
 
 // HealthChecks runs all diagnostic checks and returns the results.
 func (d *Downloader) HealthChecks() []HealthCheck {
 	var checks []HealthCheck
+	cfg := d.svc.cfg
+	db := d.svc.db
 
 	// a) NNTP providers — read pool state, no live dial.
 	if ps, ok := d.engine.(PoolStatuser); ok {
@@ -673,15 +693,15 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 
 	// c) Disk space on configured paths.
 	diskPaths := map[string]string{}
-	if d.cfg != nil {
-		if d.cfg.Library.Movies != "" {
-			diskPaths["disk:movies"] = d.cfg.Library.Movies
+	if cfg != nil {
+		if cfg.Library.Movies != "" {
+			diskPaths["disk:movies"] = cfg.Library.Movies
 		}
-		if d.cfg.Library.TV != "" {
-			diskPaths["disk:tv"] = d.cfg.Library.TV
+		if cfg.Library.TV != "" {
+			diskPaths["disk:tv"] = cfg.Library.TV
 		}
-		if d.cfg.Paths.Incomplete != "" {
-			diskPaths["disk:downloads"] = d.cfg.Paths.Incomplete
+		if cfg.Paths.Incomplete != "" {
+			diskPaths["disk:downloads"] = cfg.Paths.Incomplete
 		}
 	}
 	for name, path := range diskPaths {
@@ -733,10 +753,10 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 	}
 
 	// e) Library paths accessible.
-	if d.cfg != nil {
+	if cfg != nil {
 		for label, path := range map[string]string{
-			"path:movies": d.cfg.Library.Movies,
-			"path:tv":     d.cfg.Library.TV,
+			"path:movies": cfg.Library.Movies,
+			"path:tv":     cfg.Library.TV,
 		} {
 			if path == "" {
 				continue
@@ -752,12 +772,19 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 	}
 
 	// f) Stuck downloads.
-	if d.db != nil {
-		if stuck, err := d.db.StuckDownloadCount(); err == nil && stuck > 0 {
+	if db != nil {
+		var stuckCount int
+		_ = db.QueryRow(`
+			SELECT COUNT(*) FROM (
+				SELECT id FROM movies WHERE status = 'downloading' AND download_started_at IS NOT NULL AND download_started_at < datetime('now', '-2 hours')
+				UNION ALL
+				SELECT id FROM episodes WHERE status = 'downloading' AND download_started_at IS NOT NULL AND download_started_at < datetime('now', '-2 hours')
+			)`).Scan(&stuckCount)
+		if stuckCount > 0 {
 			checks = append(checks, HealthCheck{
 				Name:    "stuck",
 				Status:  "warning",
-				Message: fmt.Sprintf("%d download(s) stuck > 2h", stuck),
+				Message: fmt.Sprintf("%d download(s) stuck > 2h", stuckCount),
 			})
 		}
 	}

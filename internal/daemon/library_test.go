@@ -532,21 +532,23 @@ func TestCleanup_OrphanAndMissingCombined(t *testing.T) {
 func TestPruneIncomplete_DetectsOrphans(t *testing.T) {
 	svc, db := testService(t)
 
-	// Create dirs in incomplete/ named "1", "2", "3".
-	for _, name := range []string{"1", "2", "3"} {
+	// Create movies whose IDs we use for dir names.
+	movieID1, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024)
+	db.UpdateMovieStatus(movieID1, "downloaded", "WEBDL-1080p", "/lib/movie1.mkv")
+
+	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024)
+	db.SetMediaDownloadError("movie", movieID2, "download failed")
+
+	// Dir names use new "{category}-{mediaID}" format.
+	dir1 := fmt.Sprintf("movie-%d", movieID1) // downloaded -> completed
+	dir2 := fmt.Sprintf("movie-%d", movieID2) // failed
+	dir3 := "orphan-dir"                       // unknown (no matching record)
+
+	for _, name := range []string{dir1, dir2, dir3} {
 		dir := filepath.Join(svc.cfg.Paths.Incomplete, name)
 		os.MkdirAll(dir, 0o755)
 		os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 1024), 0o644)
 	}
-
-	// Add download records: 1 (completed), 2 (failed). 3 has no record.
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024)
-	dlID1, _ := db.AddDownload("http://example.com/1.nzb", "Movie.One", "Movie One", "movie", movieID, 1024)
-	db.Exec(`UPDATE downloads SET status = 'completed' WHERE id = ?`, dlID1)
-
-	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024)
-	dlID2, _ := db.AddDownload("http://example.com/2.nzb", "Movie.Two", "Movie Two", "movie", movieID2, 1024)
-	db.Exec(`UPDATE downloads SET status = 'failed' WHERE id = ?`, dlID2)
 
 	var reply PruneIncompleteReply
 	if err := svc.LibraryPruneIncomplete(&PruneIncompleteArgs{}, &reply); err != nil {
@@ -561,18 +563,18 @@ func TestPruneIncomplete_DetectsOrphans(t *testing.T) {
 	for _, f := range reply.Findings {
 		reasons[filepath.Base(f.Dir)] = f.Reason
 	}
-	if reasons["1"] != "completed" {
-		t.Errorf("dir 1 reason = %q, want completed", reasons["1"])
+	if reasons[dir1] != "completed" {
+		t.Errorf("dir %s reason = %q, want completed", dir1, reasons[dir1])
 	}
-	if reasons["2"] != "failed" {
-		t.Errorf("dir 2 reason = %q, want failed", reasons["2"])
+	if reasons[dir2] != "failed" {
+		t.Errorf("dir %s reason = %q, want failed", dir2, reasons[dir2])
 	}
-	if reasons["3"] != "unknown" {
-		t.Errorf("dir 3 reason = %q, want unknown", reasons["3"])
+	if reasons[dir3] != "unknown" {
+		t.Errorf("dir %s reason = %q, want unknown", dir3, reasons[dir3])
 	}
 
 	// Dirs should still exist (dry-run).
-	for _, name := range []string{"1", "2", "3"} {
+	for _, name := range []string{dir1, dir2, dir3} {
 		if !fileExists(filepath.Join(svc.cfg.Paths.Incomplete, name)) {
 			t.Errorf("dir %s should still exist in dry-run", name)
 		}
@@ -582,19 +584,20 @@ func TestPruneIncomplete_DetectsOrphans(t *testing.T) {
 func TestPruneIncomplete_Execute(t *testing.T) {
 	svc, db := testService(t)
 
-	for _, name := range []string{"1", "2"} {
+	movieID1, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024)
+	db.UpdateMovieStatus(movieID1, "downloaded", "WEBDL-1080p", "/lib/movie1.mkv")
+
+	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024)
+	db.SetMediaDownloadError("movie", movieID2, "download failed")
+
+	dir1 := fmt.Sprintf("movie-%d", movieID1)
+	dir2 := fmt.Sprintf("movie-%d", movieID2)
+
+	for _, name := range []string{dir1, dir2} {
 		dir := filepath.Join(svc.cfg.Paths.Incomplete, name)
 		os.MkdirAll(dir, 0o755)
 		os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 1024), 0o644)
 	}
-
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024)
-	dlID1, _ := db.AddDownload("http://example.com/1.nzb", "Movie.One", "Movie One", "movie", movieID, 1024)
-	db.Exec(`UPDATE downloads SET status = 'completed' WHERE id = ?`, dlID1)
-
-	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024)
-	dlID2, _ := db.AddDownload("http://example.com/2.nzb", "Movie.Two", "Movie Two", "movie", movieID2, 1024)
-	db.Exec(`UPDATE downloads SET status = 'failed' WHERE id = ?`, dlID2)
 
 	var reply PruneIncompleteReply
 	if err := svc.LibraryPruneIncomplete(&PruneIncompleteArgs{Execute: true}, &reply); err != nil {
@@ -605,7 +608,7 @@ func TestPruneIncomplete_Execute(t *testing.T) {
 		t.Errorf("pruned_dirs = %d, want 2", reply.PrunedDirs)
 	}
 
-	for _, name := range []string{"1", "2"} {
+	for _, name := range []string{dir1, dir2} {
 		if fileExists(filepath.Join(svc.cfg.Paths.Incomplete, name)) {
 			t.Errorf("dir %s should be removed after --execute", name)
 		}
@@ -615,13 +618,13 @@ func TestPruneIncomplete_Execute(t *testing.T) {
 func TestPruneIncomplete_SkipsActive(t *testing.T) {
 	svc, db := testService(t)
 
-	dir := filepath.Join(svc.cfg.Paths.Incomplete, "1")
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Active Movie", 2024)
+	db.UpdateMediaDownloadStatus("movie", movieID, "downloading")
+
+	dirName := fmt.Sprintf("movie-%d", movieID)
+	dir := filepath.Join(svc.cfg.Paths.Incomplete, dirName)
 	os.MkdirAll(dir, 0o755)
 	os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 1024), 0o644)
-
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Active Movie", 2024)
-	dlID, _ := db.AddDownload("http://example.com/1.nzb", "Active.Movie", "Active Movie", "movie", movieID, 1024)
-	db.UpdateDownloadStatus(dlID, "downloading")
 
 	var reply PruneIncompleteReply
 	if err := svc.LibraryPruneIncomplete(&PruneIncompleteArgs{Execute: true}, &reply); err != nil {
@@ -640,13 +643,13 @@ func TestPruneIncomplete_SkipsActive(t *testing.T) {
 func TestPruneIncomplete_PlexDirs(t *testing.T) {
 	svc, db := testService(t)
 
-	dir := filepath.Join(svc.cfg.Paths.Incomplete, "plex-1")
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Plex Movie", 2024)
+	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", "/lib/plex_movie.mkv")
+
+	dirName := fmt.Sprintf("movie-%d", movieID)
+	dir := filepath.Join(svc.cfg.Paths.Incomplete, dirName)
 	os.MkdirAll(dir, 0o755)
 	os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 1024), 0o644)
-
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Plex Movie", 2024)
-	dlID, _ := db.AddDownloadWithSource("http://example.com/movie.mkv", "plex:FriendServer", "Plex Movie", "movie", movieID, 1024, "plex")
-	db.Exec(`UPDATE downloads SET status = 'completed' WHERE id = ?`, dlID)
 
 	var reply PruneIncompleteReply
 	if err := svc.LibraryPruneIncomplete(&PruneIncompleteArgs{Execute: true}, &reply); err != nil {
@@ -831,37 +834,6 @@ func TestDownloadedEpisodes(t *testing.T) {
 	}
 	if episodes[0].Season != 1 || episodes[0].Episode != 1 {
 		t.Errorf("episode = S%02dE%02d, want S01E01", episodes[0].Season, episodes[0].Episode)
-	}
-}
-
-func TestGetDownload(t *testing.T) {
-	db, err := database.Open(":memory:")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Test", 2024)
-	dlID, _ := db.AddDownload("http://example.com/test.nzb", "Test.WEBDL", "Test", "movie", movieID, 1024)
-
-	dl, err := db.GetDownload(dlID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dl == nil {
-		t.Fatal("download should not be nil")
-	}
-	if dl.Title != "Test" {
-		t.Errorf("title = %q, want Test", dl.Title)
-	}
-
-	// Non-existent ID returns nil,nil.
-	dl, err = db.GetDownload(99999)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dl != nil {
-		t.Error("non-existent download should return nil")
 	}
 }
 

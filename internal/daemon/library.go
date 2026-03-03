@@ -892,15 +892,10 @@ func (s *Service) LibraryPruneIncomplete(args *PruneIncompleteArgs, reply *Prune
 		dirName := entry.Name()
 		dirPath := filepath.Join(incDir, dirName)
 
-		// Parse dir name as download ID. Plex downloads use "plex-<id>" format.
-		var dlID int64
-		name := dirName
-		if strings.HasPrefix(name, "plex-") {
-			name = strings.TrimPrefix(name, "plex-")
-		}
-		id, err := strconv.ParseInt(name, 10, 64)
-		if err != nil {
-			// Not a numeric dir — could be a manual leftover.
+		// Parse dir name as "{category}-{mediaID}" (e.g. "movie-42", "episode-17").
+		parts := strings.SplitN(dirName, "-", 2)
+		if len(parts) != 2 || (parts[0] != "movie" && parts[0] != "episode") {
+			// Unrecognized dir — could be a manual leftover.
 			size := dirSize(dirPath)
 			finding := PruneIncompleteFinding{
 				Dir:    dirPath,
@@ -918,29 +913,44 @@ func (s *Service) LibraryPruneIncomplete(args *PruneIncompleteArgs, reply *Prune
 			reply.TotalDirs++
 			continue
 		}
-		dlID = id
-
-		// Look up the download.
-		dl, err := s.db.GetDownload(dlID)
+		category := parts[0]
+		mediaID, err := strconv.ParseInt(parts[1], 10, 64)
 		if err != nil {
-			s.log.Error("prune-incomplete: get download", "id", dlID, "error", err)
+			size := dirSize(dirPath)
+			finding := PruneIncompleteFinding{Dir: dirPath, Reason: "unknown", Size: size}
+			if args.Execute {
+				if err := os.RemoveAll(dirPath); err == nil {
+					finding.Pruned = true
+					reply.PrunedDirs++
+				}
+			}
+			reply.Findings = append(reply.Findings, finding)
+			reply.TotalSize += size
+			reply.TotalDirs++
 			continue
 		}
 
+		// Look up the media item's status directly.
+		var status string
+		table := "movies"
+		if category == "episode" {
+			table = "episodes"
+		}
+		err = s.db.QueryRow(fmt.Sprintf(`SELECT status FROM %s WHERE id = ?`, table), mediaID).Scan(&status)
 		var reason string
-		if dl == nil {
+		if err != nil {
 			reason = "unknown"
 		} else {
-			switch dl.Status {
-			case "completed":
+			switch status {
+			case "downloaded":
 				reason = "completed"
 			case "failed":
 				reason = "failed"
-			case "queued", "downloading":
+			case "queued", "downloading", "post_processing":
 				// Active download — skip.
 				continue
 			default:
-				reason = dl.Status
+				reason = status
 			}
 		}
 

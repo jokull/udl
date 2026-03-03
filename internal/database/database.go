@@ -4,6 +4,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"sort"
 
 	_ "modernc.org/sqlite"
 )
@@ -56,7 +57,15 @@ CREATE TABLE IF NOT EXISTS movies (
     status TEXT NOT NULL DEFAULT 'wanted',
     quality TEXT,
     file_path TEXT,
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    nzb_url TEXT,
+    nzb_name TEXT,
+    download_progress REAL DEFAULT 0,
+    download_size INTEGER,
+    download_bytes INTEGER DEFAULT 0,
+    download_error TEXT,
+    download_source TEXT,
+    download_started_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS series (
@@ -67,7 +76,8 @@ CREATE TABLE IF NOT EXISTS series (
     title TEXT NOT NULL,
     year INTEGER,
     status TEXT NOT NULL DEFAULT 'monitored',
-    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_refreshed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS episodes (
@@ -80,24 +90,16 @@ CREATE TABLE IF NOT EXISTS episodes (
     status TEXT NOT NULL DEFAULT 'wanted',
     quality TEXT,
     file_path TEXT,
-    UNIQUE(series_id, season, episode)
-);
-
-CREATE TABLE IF NOT EXISTS downloads (
-    id INTEGER PRIMARY KEY,
+    last_searched_at TEXT,
     nzb_url TEXT,
-    nzb_name TEXT NOT NULL,
-    title TEXT NOT NULL,
-    category TEXT NOT NULL,
-    media_id INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',
-    progress REAL DEFAULT 0,
-    size_bytes INTEGER,
-    downloaded_bytes INTEGER DEFAULT 0,
-    error_msg TEXT,
-    started_at TIMESTAMP,
-    completed_at TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    nzb_name TEXT,
+    download_progress REAL DEFAULT 0,
+    download_size INTEGER,
+    download_bytes INTEGER DEFAULT 0,
+    download_error TEXT,
+    download_source TEXT,
+    download_started_at TEXT,
+    UNIQUE(series_id, season, episode)
 );
 
 CREATE TABLE IF NOT EXISTS indexers (
@@ -133,26 +135,9 @@ CREATE TABLE IF NOT EXISTS blocklist (
 		return err
 	}
 
-	// Indexes for frequently-queried columns.
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_blocklist_lookup ON blocklist(media_type, media_id, release_title)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_history_lookup ON history(media_type, media_id, event)`)
-
-	// Add tvdb_id to series if migrating from older schema.
-	db.Exec("ALTER TABLE series ADD COLUMN tvdb_id INTEGER")
-
-	// Add title column to history if migrating from older schema.
-	db.Exec("ALTER TABLE history ADD COLUMN title TEXT NOT NULL DEFAULT ''")
-
-	// Add last_refreshed_at to series if migrating from older schema.
-	db.Exec("ALTER TABLE series ADD COLUMN last_refreshed_at TEXT")
-
-	// Add source column to downloads (usenet or plex).
-	db.Exec("ALTER TABLE downloads ADD COLUMN source TEXT NOT NULL DEFAULT 'usenet'")
-
-	// Add last_searched_at to episodes for air-date-driven search scheduling.
-	db.Exec("ALTER TABLE episodes ADD COLUMN last_searched_at TEXT")
 
 	return nil
 }
@@ -401,33 +386,6 @@ func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
 	return episodes, rows.Err()
 }
 
-// AllDownloads returns all downloads including failed/completed, ordered by created_at desc.
-func (db *DB) AllDownloads(limit int) ([]Download, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-	rows, err := db.Query(
-		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
-		 FROM downloads ORDER BY created_at DESC LIMIT ?`, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var downloads []Download
-	for rows.Next() {
-		var d Download
-		if err := rows.Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
-			&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
-			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source); err != nil {
-			return nil, err
-		}
-		downloads = append(downloads, d)
-	}
-	return downloads, rows.Err()
-}
-
 // SearchableEpisodes returns wanted, already-aired episodes that are "due" for
 // search based on their air_date age and last_searched_at timestamp.
 // Search intervals by episode age (since air_date):
@@ -494,102 +452,6 @@ func (db *DB) UpdateEpisodeStatus(id int64, status, quality, filePath string) er
 	return db.UpdateMediaStatus("episodes", id, status, quality, filePath)
 }
 
-// ---------------------------------------------------------------------------
-// Download CRUD
-// ---------------------------------------------------------------------------
-
-// AddDownload inserts a new download record with status 'queued'.
-func (db *DB) AddDownload(nzbURL, nzbName, title, category string, mediaID int64, sizeBytes int64) (int64, error) {
-	return db.AddDownloadWithSource(nzbURL, nzbName, title, category, mediaID, sizeBytes, "usenet")
-}
-
-// AddDownloadWithSource inserts a download with an explicit source ("usenet" or "plex").
-func (db *DB) AddDownloadWithSource(dlURL, name, title, category string, mediaID int64, sizeBytes int64, source string) (int64, error) {
-	res, err := db.Exec(
-		`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, size_bytes, source) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		dlURL, name, title, category, mediaID, sizeBytes, source,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.LastInsertId()
-}
-
-// PendingDownloads returns downloads that need processing: post_processing first
-// (closest to completion), then downloading, then queued.
-func (db *DB) PendingDownloads() ([]Download, error) {
-	rows, err := db.Query(
-		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
-		 FROM downloads WHERE status IN ('queued', 'downloading', 'post_processing')
-		 ORDER BY CASE status WHEN 'post_processing' THEN 0 WHEN 'downloading' THEN 1 WHEN 'queued' THEN 2 END, created_at ASC`,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var downloads []Download
-	for rows.Next() {
-		var d Download
-		if err := rows.Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
-			&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
-			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source); err != nil {
-			return nil, err
-		}
-		downloads = append(downloads, d)
-	}
-	return downloads, rows.Err()
-}
-
-// HasActiveDownload returns true if there is already a queued or downloading
-// entry for the given category and media ID.
-func (db *DB) HasActiveDownload(category string, mediaID int64) (bool, error) {
-	var count int
-	err := db.QueryRow(
-		`SELECT COUNT(*) FROM downloads WHERE category = ? AND media_id = ? AND status IN ('queued', 'downloading', 'post_processing')`,
-		category, mediaID,
-	).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	return count > 0, nil
-}
-
-// AddDownloadIfNoActive atomically checks for an active download and inserts
-// a new one in a single transaction. Returns (id, true, nil) if a download was
-// inserted, or (0, false, nil) if there was already an active download.
-// This prevents the TOCTOU race between HasActiveDownload + AddDownload.
-func (db *DB) AddDownloadIfNoActive(dlURL, name, title, category string, mediaID int64, sizeBytes int64, source string) (int64, bool, error) {
-	var id int64
-	var inserted bool
-	err := db.WithTx(func(tx *sql.Tx) error {
-		var count int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM downloads WHERE category = ? AND media_id = ? AND status IN ('queued', 'downloading', 'post_processing')`,
-			category, mediaID,
-		).Scan(&count); err != nil {
-			return err
-		}
-		if count > 0 {
-			return nil // already active
-		}
-		res, err := tx.Exec(
-			`INSERT INTO downloads (nzb_url, nzb_name, title, category, media_id, size_bytes, source) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			dlURL, name, title, category, mediaID, sizeBytes, source,
-		)
-		if err != nil {
-			return err
-		}
-		id, err = res.LastInsertId()
-		if err != nil {
-			return err
-		}
-		inserted = true
-		return nil
-	})
-	return id, inserted, err
-}
-
 // WithTx executes fn within a database transaction.
 // If fn returns an error, the transaction is rolled back.
 func (db *DB) WithTx(fn func(tx *sql.Tx) error) error {
@@ -602,46 +464,6 @@ func (db *DB) WithTx(fn func(tx *sql.Tx) error) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-// UpdateDownloadStatus updates a download's status.
-// Sets started_at when transitioning to "downloading".
-func (db *DB) UpdateDownloadStatus(id int64, status string) error {
-	if status == "downloading" {
-		_, err := db.Exec(`UPDATE downloads SET status = ?, started_at = CURRENT_TIMESTAMP WHERE id = ?`, status, id)
-		return err
-	}
-	_, err := db.Exec(`UPDATE downloads SET status = ? WHERE id = ?`, status, id)
-	return err
-}
-
-// UpdateDownloadProgress updates download progress and downloaded byte count.
-func (db *DB) UpdateDownloadProgress(id int64, progress float64, downloadedBytes int64) error {
-	_, err := db.Exec(
-		`UPDATE downloads SET progress = ?, downloaded_bytes = ? WHERE id = ?`,
-		progress, downloadedBytes, id,
-	)
-	return err
-}
-
-// ClearDownloadQueue marks all queued/downloading/post_processing entries as failed.
-func (db *DB) ClearDownloadQueue() (int64, error) {
-	res, err := db.Exec(
-		`UPDATE downloads SET status = 'failed', error_msg = 'cleared by user' WHERE status IN ('queued', 'downloading', 'post_processing')`,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// UpdateDownloadError marks a download as failed with an error message.
-func (db *DB) UpdateDownloadError(id int64, errMsg string) error {
-	_, err := db.Exec(
-		`UPDATE downloads SET status = 'failed', error_msg = ? WHERE id = ?`,
-		errMsg, id,
-	)
-	return err
 }
 
 // GetMovie returns a single movie by ID.
@@ -882,65 +704,6 @@ func (db *DB) FindSeriesByTitle(title string) (*Series, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Queue statistics
-// ---------------------------------------------------------------------------
-
-// QueueStats returns the number of queued and active (downloading + post_processing) items.
-func (db *DB) QueueStats() (queued, downloading int, err error) {
-	err = db.QueryRow(
-		`SELECT COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0),
-		        COALESCE(SUM(CASE WHEN status IN ('downloading', 'post_processing') THEN 1 ELSE 0 END), 0)
-		 FROM downloads WHERE status IN ('queued', 'downloading', 'post_processing')`,
-	).Scan(&queued, &downloading)
-	return
-}
-
-// ResetFailedDownloads resets all failed downloads back to queued status.
-// If id > 0, only resets the specific download.
-func (db *DB) ResetFailedDownloads(id int64) (int64, error) {
-	var res sql.Result
-	var err error
-	if id > 0 {
-		res, err = db.Exec(`UPDATE downloads SET status = 'queued', error_msg = NULL WHERE id = ? AND status = 'failed'`, id)
-	} else {
-		res, err = db.Exec(`UPDATE downloads SET status = 'queued', error_msg = NULL WHERE status = 'failed'`)
-	}
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
-
-// RecentDownloads returns completed and failed downloads from the last N hours.
-func (db *DB) RecentDownloads(hours int) ([]Download, error) {
-	if hours <= 0 {
-		hours = 24
-	}
-	rows, err := db.Query(
-		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
-		 FROM downloads WHERE status IN ('completed', 'failed') AND created_at > datetime('now', ? || ' hours')
-		 ORDER BY created_at DESC`,
-		fmt.Sprintf("-%d", hours),
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var downloads []Download
-	for rows.Next() {
-		var d Download
-		if err := rows.Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
-			&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
-			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source); err != nil {
-			return nil, err
-		}
-		downloads = append(downloads, d)
-	}
-	return downloads, rows.Err()
-}
-
-// ---------------------------------------------------------------------------
 // Library queries
 // ---------------------------------------------------------------------------
 
@@ -1051,25 +814,6 @@ func (db *DB) DownloadedEpisodes() ([]Episode, error) {
 	return episodes, rows.Err()
 }
 
-// GetDownload returns a single download by ID, or nil,nil if not found.
-func (db *DB) GetDownload(id int64) (*Download, error) {
-	var d Download
-	err := db.QueryRow(
-		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress,
-		        size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
-		 FROM downloads WHERE id = ?`, id,
-	).Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
-		&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
-		&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &d, nil
-}
-
 // AllMovieFilePaths returns a map of file_path → movie ID for all movies with a non-NULL file_path.
 func (db *DB) AllMovieFilePaths() (map[string]int64, error) {
 	rows, err := db.Query(`SELECT id, file_path FROM movies WHERE file_path IS NOT NULL AND file_path != ''`)
@@ -1110,31 +854,6 @@ func (db *DB) AllEpisodeFilePaths() (map[string]int64, error) {
 	return m, rows.Err()
 }
 
-// ---------------------------------------------------------------------------
-// Health stat queries
-// ---------------------------------------------------------------------------
-
-// FailedDownloadCount24h returns the count of downloads that failed in the last 24 hours.
-func (db *DB) FailedDownloadCount24h() (int, error) {
-	var count int
-	err := db.QueryRow(
-		`SELECT COUNT(*) FROM downloads WHERE status = 'failed' AND created_at > datetime('now', '-24 hours')`,
-	).Scan(&count)
-	return count, err
-}
-
-// StuckDownloadCount returns the count of downloads stuck in "downloading" state for more than 2 hours.
-func (db *DB) StuckDownloadCount() (int, error) {
-	var count int
-	err := db.QueryRow(
-		`SELECT COUNT(*) FROM downloads
-		 WHERE status = 'downloading'
-		   AND started_at IS NOT NULL
-		   AND started_at < datetime('now', '-2 hours')`,
-	).Scan(&count)
-	return count, err
-}
-
 // BlocklistCount returns the total number of blocklist entries.
 func (db *DB) BlocklistCount() (int, error) {
 	var count int
@@ -1143,8 +862,329 @@ func (db *DB) BlocklistCount() (int, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Queue methods (media-based, replaces downloads table)
+// ---------------------------------------------------------------------------
+
+// queueStatusPriority returns a sort key for queue status ordering.
+func queueStatusPriority(status string) int {
+	switch status {
+	case "post_processing":
+		return 0
+	case "downloading":
+		return 1
+	case "queued":
+		return 2
+	case "failed":
+		return 3
+	default:
+		return 4
+	}
+}
+
+// EnqueueDownload atomically sets a media item to 'queued' with download metadata.
+// Only updates if the current status is 'wanted' or 'failed', preventing duplicate
+// enqueues. Returns (true, nil) if enqueued, (false, nil) if already active.
+func (db *DB) EnqueueDownload(category string, mediaID int64, nzbURL, nzbName string, sizeBytes int64, source string) (bool, error) {
+	table := "movies"
+	if category == "episode" {
+		table = "episodes"
+	}
+	res, err := db.Exec(
+		fmt.Sprintf(`UPDATE %s SET status = 'queued', nzb_url = ?, nzb_name = ?, download_size = ?,
+			download_source = ?, download_progress = 0, download_bytes = 0, download_error = NULL,
+			download_started_at = NULL
+			WHERE id = ? AND status IN ('wanted', 'failed')`, table),
+		nzbURL, nzbName, sizeBytes, source, mediaID,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// PendingMedia returns all movies and episodes in queued/downloading/post_processing state.
+// Results are ordered: post_processing first, then downloading, then queued.
+func (db *DB) PendingMedia() ([]QueueItem, error) {
+	rows, err := db.Query(`
+		SELECT m.id, 'movie' as category,
+		       m.title || ' (' || m.year || ')' as display_title,
+		       m.status, m.nzb_url, m.nzb_name, m.download_progress,
+		       m.download_size, m.download_bytes, m.download_error,
+		       m.download_source, m.download_started_at, m.added_at
+		FROM movies m WHERE m.status IN ('queued','downloading','post_processing')
+		UNION ALL
+		SELECT e.id, 'episode',
+		       s.title || ' S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode),
+		       e.status, e.nzb_url, e.nzb_name, e.download_progress,
+		       e.download_size, e.download_bytes, e.download_error,
+		       e.download_source, e.download_started_at, CURRENT_TIMESTAMP
+		FROM episodes e JOIN series s ON s.id = e.series_id
+		WHERE e.status IN ('queued','downloading','post_processing')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []QueueItem
+	for rows.Next() {
+		var qi QueueItem
+		if err := rows.Scan(&qi.MediaID, &qi.Category, &qi.Title, &qi.Status,
+			&qi.NzbURL, &qi.NzbName, &qi.Progress, &qi.SizeBytes,
+			&qi.DownloadedBytes, &qi.ErrorMsg, &qi.Source, &qi.StartedAt,
+			&qi.AddedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, qi)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Sort: post_processing first, then downloading, then queued.
+	sort.Slice(items, func(i, j int) bool {
+		return queueStatusPriority(items[i].Status) < queueStatusPriority(items[j].Status)
+	})
+	return items, nil
+}
+
+// QueueItems returns all media items in active or failed download states.
+func (db *DB) QueueItems(limit int) ([]QueueItem, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := db.Query(`
+		SELECT m.id, 'movie' as category,
+		       m.title || ' (' || m.year || ')' as display_title,
+		       m.status, m.nzb_url, m.nzb_name, m.download_progress,
+		       m.download_size, m.download_bytes, m.download_error,
+		       m.download_source, m.download_started_at, m.added_at
+		FROM movies m WHERE m.status IN ('queued','downloading','post_processing','failed')
+		UNION ALL
+		SELECT e.id, 'episode',
+		       s.title || ' S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode),
+		       e.status, e.nzb_url, e.nzb_name, e.download_progress,
+		       e.download_size, e.download_bytes, e.download_error,
+		       e.download_source, e.download_started_at, CURRENT_TIMESTAMP
+		FROM episodes e JOIN series s ON s.id = e.series_id
+		WHERE e.status IN ('queued','downloading','post_processing','failed')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []QueueItem
+	for rows.Next() {
+		var qi QueueItem
+		if err := rows.Scan(&qi.MediaID, &qi.Category, &qi.Title, &qi.Status,
+			&qi.NzbURL, &qi.NzbName, &qi.Progress, &qi.SizeBytes,
+			&qi.DownloadedBytes, &qi.ErrorMsg, &qi.Source, &qi.StartedAt,
+			&qi.AddedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, qi)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Sort: downloading first, then post_processing, then queued, then failed.
+	sort.Slice(items, func(i, j int) bool {
+		return queueStatusPriority(items[i].Status) < queueStatusPriority(items[j].Status)
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+	return items, nil
+}
+
+// UpdateMediaDownloadStatus updates the download status of a media item.
+// Sets download_started_at when transitioning to "downloading".
+func (db *DB) UpdateMediaDownloadStatus(category string, id int64, status string) error {
+	table := "movies"
+	if category == "episode" {
+		table = "episodes"
+	}
+	if status == "downloading" {
+		_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET status = ?, download_started_at = CURRENT_TIMESTAMP WHERE id = ?`, table), status, id)
+		return err
+	}
+	_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET status = ? WHERE id = ?`, table), status, id)
+	return err
+}
+
+// UpdateMediaProgress updates download progress and downloaded byte count.
+func (db *DB) UpdateMediaProgress(category string, id int64, progress float64, downloadedBytes int64) error {
+	table := "movies"
+	if category == "episode" {
+		table = "episodes"
+	}
+	_, err := db.Exec(
+		fmt.Sprintf(`UPDATE %s SET download_progress = ?, download_bytes = ? WHERE id = ?`, table),
+		progress, downloadedBytes, id,
+	)
+	return err
+}
+
+// SetMediaDownloadError marks a media item as failed with an error message.
+func (db *DB) SetMediaDownloadError(category string, id int64, errMsg string) error {
+	table := "movies"
+	if category == "episode" {
+		table = "episodes"
+	}
+	_, err := db.Exec(
+		fmt.Sprintf(`UPDATE %s SET status = 'failed', download_error = ? WHERE id = ?`, table),
+		errMsg, id,
+	)
+	return err
+}
+
+// ResetStuckMedia resets media items stuck in 'downloading' state for >2 hours.
+func (db *DB) ResetStuckMedia() (int64, error) {
+	var total int64
+	for _, table := range []string{"movies", "episodes"} {
+		res, err := db.Exec(fmt.Sprintf(`
+			UPDATE %s SET status = 'queued', download_error = 'reset: stuck in downloading state'
+			WHERE status = 'downloading'
+			  AND download_started_at IS NOT NULL
+			  AND download_started_at < datetime('now', '-2 hours')`, table))
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
+}
+
+// ClearMediaQueue marks all queued/downloading/post_processing media as failed.
+func (db *DB) ClearMediaQueue() (int64, error) {
+	var total int64
+	for _, table := range []string{"movies", "episodes"} {
+		res, err := db.Exec(fmt.Sprintf(
+			`UPDATE %s SET status = 'failed', download_error = 'cleared by user' WHERE status IN ('queued', 'downloading', 'post_processing')`, table))
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
+}
+
+// MediaQueueStats returns the number of queued and active (downloading + post_processing) items.
+func (db *DB) MediaQueueStats() (queued, downloading int, err error) {
+	err = db.QueryRow(`
+		SELECT
+			COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status IN ('downloading', 'post_processing') THEN 1 ELSE 0 END), 0)
+		FROM (
+			SELECT status FROM movies WHERE status IN ('queued', 'downloading', 'post_processing')
+			UNION ALL
+			SELECT status FROM episodes WHERE status IN ('queued', 'downloading', 'post_processing')
+		)`).Scan(&queued, &downloading)
+	return
+}
+
+// FailedMediaCount24h returns the count of media items that failed in the last 24 hours.
+func (db *DB) FailedMediaCount24h() (int, error) {
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM (
+			SELECT id FROM movies WHERE status = 'failed' AND download_started_at > datetime('now', '-24 hours')
+			UNION ALL
+			SELECT id FROM episodes WHERE status = 'failed' AND download_started_at > datetime('now', '-24 hours')
+		)`).Scan(&count)
+	return count, err
+}
+
+// ResetMediaForRetry resets a single failed media item to 'wanted' and clears download fields.
+func (db *DB) ResetMediaForRetry(category string, mediaID int64) error {
+	table := "movies"
+	if category == "episode" {
+		table = "episodes"
+	}
+	_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET status = 'wanted',
+		nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+		download_size = NULL, download_bytes = 0, download_error = NULL,
+		download_source = NULL, download_started_at = NULL
+		WHERE id = ? AND status = 'failed'`, table), mediaID)
+	return err
+}
+
+// ClearMediaDownloadFields resets all download-related columns on a media item
+// without changing its status. Used after completing a download.
+func (db *DB) ClearMediaDownloadFields(category string, mediaID int64) error {
+	table := "movies"
+	if category == "episode" {
+		table = "episodes"
+	}
+	_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET
+		nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+		download_size = NULL, download_bytes = 0, download_error = NULL,
+		download_source = NULL, download_started_at = NULL
+		WHERE id = ?`, table), mediaID)
+	return err
+}
+
+// FailedMediaItems returns category + media_id pairs for all failed media items.
+func (db *DB) FailedMediaItems() ([]QueueItem, error) {
+	rows, err := db.Query(`
+		SELECT m.id, 'movie' as category,
+		       m.title || ' (' || m.year || ')' as display_title,
+		       m.status, m.nzb_url, m.nzb_name, m.download_progress,
+		       m.download_size, m.download_bytes, m.download_error,
+		       m.download_source, m.download_started_at, m.added_at
+		FROM movies m WHERE m.status = 'failed'
+		UNION ALL
+		SELECT e.id, 'episode',
+		       s.title || ' S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode),
+		       e.status, e.nzb_url, e.nzb_name, e.download_progress,
+		       e.download_size, e.download_bytes, e.download_error,
+		       e.download_source, e.download_started_at, CURRENT_TIMESTAMP
+		FROM episodes e JOIN series s ON s.id = e.series_id
+		WHERE e.status = 'failed'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []QueueItem
+	for rows.Next() {
+		var qi QueueItem
+		if err := rows.Scan(&qi.MediaID, &qi.Category, &qi.Title, &qi.Status,
+			&qi.NzbURL, &qi.NzbName, &qi.Progress, &qi.SizeBytes,
+			&qi.DownloadedBytes, &qi.ErrorMsg, &qi.Source, &qi.StartedAt,
+			&qi.AddedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, qi)
+	}
+	return items, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// NullStr converts a string to sql.NullString. Empty string → Valid=false.
+// Exported for use by other packages constructing QueueItem literals.
+func NullStr(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
+}
+
+// NullInt converts an int64 to sql.NullInt64. Zero → Valid=false.
+// Exported for use by other packages constructing QueueItem literals.
+func NullInt(v int64) sql.NullInt64 {
+	if v == 0 {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: v, Valid: true}
+}
 
 // nullString converts an empty string to a sql.NullString with Valid=false,
 // and a non-empty string to one with Valid=true.

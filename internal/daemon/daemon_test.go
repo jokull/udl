@@ -87,7 +87,7 @@ func TestAddMovieNoTMDB(t *testing.T) {
 	client := startTestServer(t)
 
 	var reply AddMovieReply
-	err := client.Call("Service.AddMovie", &AddMovieArgs{Query: "Fight Club"}, &reply)
+	err := client.Call("Service.AddMovie", &AddMovieArgs{TMDBID: 550}, &reply)
 	if err == nil {
 		t.Fatal("Service.AddMovie: expected error when TMDB client is nil, got nil")
 	}
@@ -100,8 +100,8 @@ func TestQueueEmpty(t *testing.T) {
 	if err := client.Call("Service.Queue", &Empty{}, &reply); err != nil {
 		t.Fatalf("Service.Queue: %v", err)
 	}
-	if len(reply.Downloads) != 0 {
-		t.Errorf("Queue: got %d downloads, want 0", len(reply.Downloads))
+	if len(reply.Items) != 0 {
+		t.Errorf("Queue: got %d items, want 0", len(reply.Items))
 	}
 }
 

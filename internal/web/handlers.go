@@ -14,7 +14,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		status = &StatusData{Running: true}
 	}
 
-	queue, err := s.db.PendingDownloads()
+	queue, err := s.db.PendingMedia()
 	if err != nil {
 		s.log.Error("web: dashboard queue", "error", err)
 	}
@@ -26,7 +26,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	data := struct {
 		Status  *StatusData
-		Queue   []database.Download
+		Queue   []database.QueueItem
 		History []database.History
 		Page    string
 	}{
@@ -148,16 +148,16 @@ func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
-	downloads, err := s.db.AllDownloads(100)
+	items, err := s.db.QueueItems(100)
 	if err != nil {
 		s.serverError(w, "load queue", err)
 		return
 	}
 
-	var active, queued, failed []database.Download
-	for _, d := range downloads {
+	var active, queued, failed []database.QueueItem
+	for _, d := range items {
 		switch d.Status {
-		case "downloading":
+		case "downloading", "post_processing":
 			active = append(active, d)
 		case "queued":
 			queued = append(queued, d)
@@ -167,9 +167,9 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := struct {
-		Active []database.Download
-		Queued []database.Download
-		Failed []database.Download
+		Active []database.QueueItem
+		Queued []database.QueueItem
+		Failed []database.QueueItem
 		Page   string
 	}{
 		Active: active,
@@ -244,15 +244,20 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRetryDownload(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil {
-		http.Error(w, "invalid download id", http.StatusBadRequest)
+		http.Error(w, "invalid media id", http.StatusBadRequest)
+		return
+	}
+	if category != "movie" && category != "episode" {
+		http.Error(w, "invalid category", http.StatusBadRequest)
 		return
 	}
 
-	if err := s.retry(id); err != nil {
-		s.log.Error("web: retry download", "id", id, "error", err)
+	if err := s.retry(category, id); err != nil {
+		s.log.Error("web: retry download", "category", category, "id", id, "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

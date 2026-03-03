@@ -36,12 +36,47 @@ type Service struct {
 // Empty is used for RPC methods with no meaningful args or reply.
 type Empty struct{}
 
+// --- TMDB search types ---
+
+// TMDBSearchMovieArgs contains arguments for the TMDBSearchMovie RPC method.
+type TMDBSearchMovieArgs struct {
+	Query string
+}
+
+// TMDBMovieResult is a single TMDB movie search result.
+type TMDBMovieResult struct {
+	TMDBID int
+	Title  string
+	Year   int
+}
+
+// TMDBSearchMovieReply contains TMDB movie search results.
+type TMDBSearchMovieReply struct {
+	Results []TMDBMovieResult
+}
+
+// TMDBSearchSeriesArgs contains arguments for the TMDBSearchSeries RPC method.
+type TMDBSearchSeriesArgs struct {
+	Query string
+}
+
+// TMDBSeriesResult is a single TMDB TV series search result.
+type TMDBSeriesResult struct {
+	TMDBID int
+	Title  string
+	Year   int
+}
+
+// TMDBSearchSeriesReply contains TMDB TV series search results.
+type TMDBSearchSeriesReply struct {
+	Results []TMDBSeriesResult
+}
+
 // --- Movie types ---
 
 // AddMovieArgs contains arguments for the AddMovie RPC method.
 type AddMovieArgs struct {
-	Query  string // text search query
-	IMDBID string // direct IMDB ID (optional, overrides Query)
+	TMDBID int // required — use TMDBSearchMovie to find the ID first
 }
 
 // AddMovieReply contains the reply for the AddMovie RPC method.
@@ -52,20 +87,22 @@ type AddMovieReply struct {
 	Grabbed bool // true if a release was immediately enqueued
 }
 
-// SearchMovieArgs contains arguments for the SearchMovie RPC method.
+// SearchMovieArgs contains arguments for the SearchMovie (indexer search) RPC method.
 type SearchMovieArgs struct {
-	Query string
+	MovieID int64  // DB movie ID (required if Title is empty)
+	Title   string // DB movie title lookup (used if MovieID is 0)
 }
 
-// SearchMovieReply contains search results for manual selection.
+// SearchMovieReply contains indexer search results for manual selection.
 type SearchMovieReply struct {
 	Results []ScoredRelease
 }
 
 // GrabMovieReleaseArgs contains arguments for the GrabMovieRelease RPC method.
 type GrabMovieReleaseArgs struct {
-	Query string // movie title to search
-	Index int    // 1-based index into search results
+	MovieID int64  // DB movie ID (required if Title is empty)
+	Title   string // DB movie title lookup (used if MovieID is 0)
+	Index   int    // 1-based index into search results
 }
 
 // GrabMovieReleaseReply contains the reply for the GrabMovieRelease RPC method.
@@ -74,7 +111,6 @@ type GrabMovieReleaseReply struct {
 	Year        int
 	ReleaseName string
 	Quality     string
-	DownloadID  int64
 }
 
 // MovieListReply contains the reply for the ListMovies RPC method.
@@ -86,8 +122,7 @@ type MovieListReply struct {
 
 // AddSeriesArgs contains arguments for the AddSeries RPC method.
 type AddSeriesArgs struct {
-	Query  string
-	TMDBID int
+	TMDBID int // required — use TMDBSearchSeries to find the ID first
 }
 
 // AddSeriesReply contains the reply for the AddSeries RPC method.
@@ -108,7 +143,7 @@ type SeriesListReply struct {
 
 // QueueReply contains the reply for the Queue RPC method.
 type QueueReply struct {
-	Downloads []database.Download
+	Items []database.QueueItem
 }
 
 // HistoryReply contains the reply for the History RPC method.
@@ -165,8 +200,10 @@ type RemoveSeriesReply struct {
 // --- Queue retry types ---
 
 // RetryDownloadArgs contains arguments for the RetryDownload RPC method.
+// Specify Category + MediaID to retry a single item, or leave both empty to retry all failed.
 type RetryDownloadArgs struct {
-	ID int64 // 0 = retry all failed
+	Category string // "movie" or "episode"
+	MediaID  int64  // media item ID
 }
 
 // RetryDownloadReply contains the reply for the RetryDownload RPC method.
@@ -185,39 +222,65 @@ type RefreshSeriesReply struct {
 
 // --- RPC methods ---
 
-// AddMovie searches TMDB, adds a movie to the library, and immediately
-// searches indexers for it (movies use search, not RSS).
+// TMDBSearchMovie searches TMDB for movies and returns results for the user to pick from.
+func (s *Service) TMDBSearchMovie(args *TMDBSearchMovieArgs, reply *TMDBSearchMovieReply) error {
+	if s.tmdb == nil {
+		return fmt.Errorf("TMDBSearchMovie: TMDB client not configured")
+	}
+	if args.Query == "" {
+		return fmt.Errorf("TMDBSearchMovie: query is required")
+	}
+
+	results, err := s.tmdb.SearchMovie(args.Query)
+	if err != nil {
+		return fmt.Errorf("TMDBSearchMovie: %w", err)
+	}
+	for _, r := range results {
+		reply.Results = append(reply.Results, TMDBMovieResult{
+			TMDBID: r.TMDBID,
+			Title:  r.Title,
+			Year:   r.Year,
+		})
+	}
+	return nil
+}
+
+// TMDBSearchSeries searches TMDB for TV series and returns results for the user to pick from.
+func (s *Service) TMDBSearchSeries(args *TMDBSearchSeriesArgs, reply *TMDBSearchSeriesReply) error {
+	if s.tmdb == nil {
+		return fmt.Errorf("TMDBSearchSeries: TMDB client not configured")
+	}
+	if args.Query == "" {
+		return fmt.Errorf("TMDBSearchSeries: query is required")
+	}
+
+	results, err := s.tmdb.SearchTV(args.Query)
+	if err != nil {
+		return fmt.Errorf("TMDBSearchSeries: %w", err)
+	}
+	for _, r := range results {
+		reply.Results = append(reply.Results, TMDBSeriesResult{
+			TMDBID: r.TMDBID,
+			Title:  r.Title,
+			Year:   r.Year,
+		})
+	}
+	return nil
+}
+
+// AddMovie fetches movie details from TMDB by ID, adds it to the library, and
+// immediately searches indexers for it.
 func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 	if s.tmdb == nil {
 		return fmt.Errorf("AddMovie: TMDB client not configured")
 	}
+	if args.TMDBID == 0 {
+		return fmt.Errorf("AddMovie: TMDB ID is required (use 'udl movie search' to find it)")
+	}
 
-	var movie *tmdb.Movie
-
-	if args.IMDBID != "" {
-		m, err := s.tmdb.FindMovieByIMDB(args.IMDBID)
-		if err != nil {
-			return fmt.Errorf("AddMovie: %w", err)
-		}
-		if m == nil {
-			return fmt.Errorf("AddMovie: no movie found for IMDB ID %s", args.IMDBID)
-		}
-		movie = m
-	} else if args.Query != "" {
-		results, err := s.tmdb.SearchMovie(args.Query)
-		if err != nil {
-			return fmt.Errorf("AddMovie: %w", err)
-		}
-		if len(results) == 0 {
-			return fmt.Errorf("AddMovie: no results for query %q", args.Query)
-		}
-		m, err := s.tmdb.GetMovie(results[0].TMDBID)
-		if err != nil {
-			return fmt.Errorf("AddMovie: %w", err)
-		}
-		movie = m
-	} else {
-		return fmt.Errorf("AddMovie: query or IMDB ID is required")
+	movie, err := s.tmdb.GetMovie(args.TMDBID)
+	if err != nil {
+		return fmt.Errorf("AddMovie: %w", err)
 	}
 
 	id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year)
@@ -257,32 +320,26 @@ func (s *Service) ListMovies(args *Empty, reply *MovieListReply) error {
 	return nil
 }
 
-// SearchMovie searches indexers for a movie by IMDB ID (for manual search).
+// SearchMovie searches indexers for a movie already in the database.
 func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) error {
-	if s.tmdb == nil {
-		return fmt.Errorf("SearchMovie: TMDB client not configured")
-	}
 	if len(s.indexers) == 0 {
-		return fmt.Errorf("SearchMovie: searcher not configured")
+		return fmt.Errorf("SearchMovie: no indexers configured")
 	}
 
-	// Look up the movie on TMDB to get its IMDB ID.
-	results, err := s.tmdb.SearchMovie(args.Query)
+	movie, err := s.resolveMovie(args.MovieID, args.Title)
 	if err != nil {
 		return fmt.Errorf("SearchMovie: %w", err)
 	}
-	if len(results) == 0 {
-		return fmt.Errorf("SearchMovie: no TMDB results for %q", args.Query)
+
+	imdbID := ""
+	if movie.ImdbID.Valid {
+		imdbID = movie.ImdbID.String
 	}
-	movie, err := s.tmdb.GetMovie(results[0].TMDBID)
-	if err != nil {
-		return fmt.Errorf("SearchMovie: %w", err)
-	}
-	if movie.IMDBID == "" {
-		return fmt.Errorf("SearchMovie: no IMDB ID for %q", movie.Title)
+	if imdbID == "" {
+		return fmt.Errorf("SearchMovie: %q has no IMDB ID", movie.Title)
 	}
 
-	releases, err := s.SearchMovieReleases(movie.IMDBID, movie.Title, movie.Year)
+	releases, err := s.SearchMovieReleases(imdbID, movie.Title, movie.Year)
 	if err != nil {
 		return fmt.Errorf("SearchMovie: %w", err)
 	}
@@ -290,37 +347,42 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	return nil
 }
 
-// GrabMovieRelease searches indexers for a movie and grabs the release at the
-// given 1-based index. If the movie isn't in the DB yet, it gets added as wanted.
-func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieReleaseReply) error {
-	if s.tmdb == nil {
-		return fmt.Errorf("GrabMovieRelease: TMDB client not configured")
+// resolveMovie looks up a movie in the DB by ID or title.
+func (s *Service) resolveMovie(id int64, title string) (*database.Movie, error) {
+	if id > 0 {
+		return s.db.GetMovie(id)
 	}
+	if title != "" {
+		return s.db.FindMovieByTitle(title)
+	}
+	return nil, fmt.Errorf("movie ID or title is required")
+}
+
+// GrabMovieRelease searches indexers for a movie in the DB and grabs the release
+// at the given 1-based index. The movie must already exist in the database.
+func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieReleaseReply) error {
 	if len(s.indexers) == 0 {
-		return fmt.Errorf("GrabMovieRelease: searcher not configured")
+		return fmt.Errorf("GrabMovieRelease: no indexers configured")
 	}
 	if args.Index < 1 {
 		return fmt.Errorf("GrabMovieRelease: index must be >= 1")
 	}
 
-	// Look up the movie on TMDB.
-	results, err := s.tmdb.SearchMovie(args.Query)
+	movie, err := s.resolveMovie(args.MovieID, args.Title)
 	if err != nil {
 		return fmt.Errorf("GrabMovieRelease: %w", err)
 	}
-	if len(results) == 0 {
-		return fmt.Errorf("GrabMovieRelease: no TMDB results for %q", args.Query)
+
+	imdbID := ""
+	if movie.ImdbID.Valid {
+		imdbID = movie.ImdbID.String
 	}
-	movie, err := s.tmdb.GetMovie(results[0].TMDBID)
-	if err != nil {
-		return fmt.Errorf("GrabMovieRelease: %w", err)
-	}
-	if movie.IMDBID == "" {
-		return fmt.Errorf("GrabMovieRelease: no IMDB ID for %q", movie.Title)
+	if imdbID == "" {
+		return fmt.Errorf("GrabMovieRelease: %q has no IMDB ID", movie.Title)
 	}
 
 	// Search indexers.
-	releases, err := s.SearchMovieReleases(movie.IMDBID, movie.Title, movie.Year)
+	releases, err := s.SearchMovieReleases(imdbID, movie.Title, movie.Year)
 	if err != nil {
 		return fmt.Errorf("GrabMovieRelease: %w", err)
 	}
@@ -333,36 +395,21 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 
 	sr := releases[args.Index-1]
 
-	// Ensure the movie is in the DB.
-	dbMovie, err := s.db.FindMovieByTmdbID(movie.TMDBID)
-	if err != nil {
-		return fmt.Errorf("GrabMovieRelease: %w", err)
-	}
-	if dbMovie == nil {
-		id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year)
-		if err != nil {
-			return fmt.Errorf("GrabMovieRelease: add movie: %w", err)
-		}
-		s.log.Info("auto-added movie for manual grab", "title", movie.Title, "year", movie.Year)
-		dbMovie = &database.Movie{ID: id, Title: movie.Title, Year: movie.Year}
+	// Check for active download — movie must be in wanted/failed state to enqueue.
+	if movie.Status != "wanted" && movie.Status != "failed" {
+		return fmt.Errorf("GrabMovieRelease: %q is %s, not available for download", movie.Title, movie.Status)
 	}
 
-	// Check for active download.
-	active, err := s.db.HasActiveDownload("movie", dbMovie.ID)
+	// Enqueue directly on the media item.
+	enqueued, err := s.db.EnqueueDownload("movie", movie.ID, sr.Release.Link, sr.Release.Title, sr.Release.Size, "usenet")
 	if err != nil {
-		return fmt.Errorf("GrabMovieRelease: %w", err)
+		return fmt.Errorf("GrabMovieRelease: enqueue: %w", err)
 	}
-	if active {
-		return fmt.Errorf("GrabMovieRelease: already downloading %q", movie.Title)
+	if !enqueued {
+		return fmt.Errorf("GrabMovieRelease: could not enqueue %q (may already be active)", movie.Title)
 	}
 
-	// Enqueue the download.
-	dlID, err := s.db.AddDownload(sr.Release.Link, sr.Release.Title, sr.Parsed.Title, "movie", dbMovie.ID, sr.Release.Size)
-	if err != nil {
-		return fmt.Errorf("GrabMovieRelease: add download: %w", err)
-	}
-
-	if err := s.db.AddHistory("movie", dbMovie.ID, sr.Parsed.Title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
+	if err := s.db.AddHistory("movie", movie.ID, sr.Parsed.Title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
 		s.log.Error("failed to record grab history", "error", err)
 	}
 
@@ -370,47 +417,28 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 		"title", movie.Title,
 		"release", sr.Release.Title,
 		"quality", sr.Quality,
-		"download_id", dlID,
 	)
 
 	reply.Title = movie.Title
 	reply.Year = movie.Year
 	reply.ReleaseName = sr.Release.Title
 	reply.Quality = sr.Quality.String()
-	reply.DownloadID = dlID
 	return nil
 }
 
-// AddSeries searches TMDB, adds a TV series to the library, fetches episodes,
-// and searches indexers for already-aired wanted episodes.
+// AddSeries fetches series details from TMDB by ID, adds it to the library,
+// fetches episodes, and searches indexers for already-aired wanted episodes.
 func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 	if s.tmdb == nil {
 		return fmt.Errorf("AddSeries: TMDB client not configured")
 	}
+	if args.TMDBID == 0 {
+		return fmt.Errorf("AddSeries: TMDB ID is required (use 'udl tv search' to find it)")
+	}
 
-	var series *tmdb.Series
-
-	if args.TMDBID != 0 {
-		sr, err := s.tmdb.GetSeries(args.TMDBID)
-		if err != nil {
-			return fmt.Errorf("AddSeries: %w", err)
-		}
-		series = sr
-	} else if args.Query != "" {
-		results, err := s.tmdb.SearchTV(args.Query)
-		if err != nil {
-			return fmt.Errorf("AddSeries: %w", err)
-		}
-		if len(results) == 0 {
-			return fmt.Errorf("AddSeries: no results for query %q", args.Query)
-		}
-		sr, err := s.tmdb.GetSeries(results[0].TMDBID)
-		if err != nil {
-			return fmt.Errorf("AddSeries: %w", err)
-		}
-		series = sr
-	} else {
-		return fmt.Errorf("AddSeries: query or TMDB ID is required")
+	series, err := s.tmdb.GetSeries(args.TMDBID)
+	if err != nil {
+		return fmt.Errorf("AddSeries: %w", err)
 	}
 
 	id, err := s.db.AddSeries(series.TMDBID, series.TVDBID, series.IMDBID, series.Title, series.Year)
@@ -478,11 +506,11 @@ func (s *Service) ListSeries(args *Empty, reply *SeriesListReply) error {
 
 // Queue returns the current download queue.
 func (s *Service) Queue(args *Empty, reply *QueueReply) error {
-	downloads, err := s.db.PendingDownloads()
+	items, err := s.db.QueueItems(100)
 	if err != nil {
 		return err
 	}
-	reply.Downloads = downloads
+	reply.Items = items
 	return nil
 }
 
@@ -493,7 +521,7 @@ type ClearQueueReply struct {
 
 // ClearQueue marks all queued/downloading entries as failed.
 func (s *Service) ClearQueue(args *Empty, reply *ClearQueueReply) error {
-	n, err := s.db.ClearDownloadQueue()
+	n, err := s.db.ClearMediaQueue()
 	if err != nil {
 		return fmt.Errorf("ClearQueue: %w", err)
 	}
@@ -528,7 +556,7 @@ func (s *Service) History(args *Empty, reply *HistoryReply) error {
 func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	reply.Running = true
 
-	queued, downloading, err := s.db.QueueStats()
+	queued, downloading, err := s.db.MediaQueueStats()
 	if err != nil {
 		s.log.Error("status: queue stats", "error", err)
 	}
@@ -546,7 +574,7 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	if s.dl != nil {
 		reply.Checks = s.dl.HealthChecks()
 	}
-	if n, err := s.db.FailedDownloadCount24h(); err == nil {
+	if n, err := s.db.FailedMediaCount24h(); err == nil {
 		reply.FailedCount = n
 	}
 	if n, err := s.db.BlocklistCount(); err == nil {
@@ -598,54 +626,32 @@ func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply)
 	return fmt.Errorf("RemoveSeries: id or title required")
 }
 
-// RetryDownload deletes failed downloads and re-searches for the media.
+// RetryDownload resets failed media items to wanted and re-searches for them.
 // The failed release is already blocklisted, so re-search will pick a different one.
 func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadReply) error {
-	if args.ID > 0 {
-		// Single retry: look up the download, delete it, re-search the media.
-		dl, err := s.db.GetDownload(args.ID)
-		if err != nil || dl == nil || dl.Status != "failed" {
-			return fmt.Errorf("RetryDownload: download %d not found or not failed", args.ID)
+	if args.Category != "" && args.MediaID > 0 {
+		// Single retry: reset this specific failed item and re-search.
+		if err := s.db.ResetMediaForRetry(args.Category, args.MediaID); err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
 		}
-		s.db.Exec(`DELETE FROM downloads WHERE id = ? AND status = 'failed'`, args.ID)
 		if len(s.indexers) > 0 {
-			s.retryMedia(dl.Category, dl.MediaID)
+			s.retryMedia(args.Category, args.MediaID)
 		}
 		reply.Count = 1
 	} else {
-		// Retry all: collect unique media items from failed downloads, delete them, re-search.
-		rows, err := s.db.Query(
-			`SELECT DISTINCT category, media_id FROM downloads WHERE status = 'failed'`)
+		// Retry all: collect failed media items, reset them, re-search.
+		failed, err := s.db.FailedMediaItems()
 		if err != nil {
 			return fmt.Errorf("RetryDownload: %w", err)
 		}
-		type mediaKey struct {
-			category string
-			mediaID  int64
-		}
-		var keys []mediaKey
-		for rows.Next() {
-			var k mediaKey
-			if err := rows.Scan(&k.category, &k.mediaID); err != nil {
-				rows.Close()
-				return fmt.Errorf("RetryDownload: %w", err)
+		for _, item := range failed {
+			if err := s.db.ResetMediaForRetry(item.Category, item.MediaID); err != nil {
+				s.log.Error("retry: reset failed", "category", item.Category, "id", item.MediaID, "error", err)
+				continue
 			}
-			keys = append(keys, k)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("RetryDownload: iterate rows: %w", err)
-		}
-
-		res, err := s.db.Exec(`DELETE FROM downloads WHERE status = 'failed'`)
-		if err != nil {
-			return fmt.Errorf("RetryDownload: %w", err)
-		}
-		reply.Count, _ = res.RowsAffected()
-
-		if len(s.indexers) > 0 {
-			for _, k := range keys {
-				s.retryMedia(k.category, k.mediaID)
+			reply.Count++
+			if len(s.indexers) > 0 {
+				s.retryMedia(item.Category, item.MediaID)
 			}
 		}
 	}
@@ -829,7 +835,7 @@ func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 			if args.Season > 0 {
 				matches, err = s.plex.SearchEpisode(srv, args.Title, args.Season, args.Episode)
 			} else {
-				matches, err = s.plex.SearchMovie(srv, args.Title, args.Year, "")
+				matches, err = s.plex.SearchMovie(srv, args.Title, args.Year, "", 0)
 			}
 			if err != nil {
 				s.log.Debug("plex check: search failed", "server", srv.Name, "error", err)
@@ -1243,11 +1249,10 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 
 	log.Info("daemon listening", "socket", sockPath)
 
-	// Start downloader (queue processing) — created before RPC so status can access it.
-	dl := NewDownloader(cfg, db, log)
-
-	// Start RPC server.
-	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, indexers: indexers, dl: dl, log: log}
+	// Start RPC server — created before downloader so it can be passed to NewDownloader.
+	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, indexers: indexers, log: log}
+	dl := NewDownloader(svc, log)
+	svc.dl = dl
 	server := rpc.NewServer()
 	if err := server.Register(svc); err != nil {
 		ln.Close()
@@ -1276,9 +1281,9 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 				BlockedCount:  reply.BlockedCount,
 			}, nil
 		}
-		retryFn := func(id int64) error {
+		retryFn := func(category string, mediaID int64) error {
 			var reply RetryDownloadReply
-			return svc.RetryDownload(&RetryDownloadArgs{ID: id}, &reply)
+			return svc.RetryDownload(&RetryDownloadArgs{Category: category, MediaID: mediaID}, &reply)
 		}
 		ws, err := web.New(db, cfg, log, statusFn, retryFn)
 		if err != nil {

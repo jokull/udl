@@ -18,7 +18,7 @@
       {{fmtProgress .Progress}}
     </td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
-    <td class="small">{{fmtNullTime .StartedAt}}</td>
+    <td class="small">{{fmtNullTimeStr .StartedAt}}</td>
   </tr>
   {{end}}
 </table>
@@ -33,7 +33,7 @@
   <tr>
     <td>{{.Title}}</td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
-    <td class="small">{{fmtTime .CreatedAt}}</td>
+    <td class="small">{{fmtTime .AddedAt}}</td>
   </tr>
   {{end}}
 </table>
@@ -47,9 +47,9 @@
   <tr>
     <td>{{.Title}}</td>
     <td class="small">{{nullable .ErrorMsg}}</td>
-    <td class="small">{{fmtTime .CreatedAt}}</td>
+    <td class="small">{{fmtTime .AddedAt}}</td>
     <td>
-      <button hx-post="/queue/retry/{{.ID}}" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Retry this download?">retry</button>
+      <button hx-post="/queue/retry/{{.Category}}/{{.MediaID}}" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Retry this download?">retry</button>
     </td>
   </tr>
   {{end}}

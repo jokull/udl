@@ -9,7 +9,7 @@
       {{fmtProgress .Progress}}
     </td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
-    <td class="small">{{fmtNullTime .StartedAt}}</td>
+    <td class="small">{{fmtNullTimeStr .StartedAt}}</td>
   </tr>
   {{end}}
   {{if not .}}

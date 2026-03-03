@@ -191,12 +191,12 @@ func TestGrabBest_SkipsBlocklisted(t *testing.T) {
 	}
 
 	// Verify the non-blocklisted release was grabbed.
-	downloads, _ := db.PendingDownloads()
-	if len(downloads) != 1 {
-		t.Fatalf("expected 1 download, got %d", len(downloads))
+	items, _ := db.PendingMedia()
+	if len(items) != 1 {
+		t.Fatalf("expected 1 download, got %d", len(items))
 	}
-	if downloads[0].NzbName != "Test.Movie.2024.WEBDL-1080p-GROUP2" {
-		t.Errorf("grabbed %q, want the non-blocklisted release", downloads[0].NzbName)
+	if items[0].NzbName.String != "Test.Movie.2024.WEBDL-1080p-GROUP2" {
+		t.Errorf("grabbed %q, want the non-blocklisted release", items[0].NzbName.String)
 	}
 }
 
@@ -264,16 +264,15 @@ func TestFail_AutoBlocklists(t *testing.T) {
 	srv := serveNZB(emptyNZB())
 	defer srv.Close()
 
-	dlID, _ := db.AddDownload(srv.URL, "Bad.Download.2024.WEBDL-1080p", "Bad Download", "movie", movieID, 0)
-	dl := fetchDownload(t, db, dlID)
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "Bad.Download.2024.WEBDL-1080p", 0, "usenet")
 
-	d := NewDownloaderWithEngine(cfg, db, &FakeEngine{}, quietLogger())
-	_ = d.ProcessOne(context.Background(), dl)
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.processItem(context.Background(), item)
 
-	// Verify the download failed.
-	dl = fetchDownload(t, db, dlID)
-	if dl.Status != "failed" {
-		t.Fatalf("download.status = %q, want failed", dl.Status)
+	// Verify the movie failed.
+	movie, _ := db.GetMovie(movieID)
+	if movie.Status != "failed" {
+		t.Fatalf("movie.status = %q, want failed", movie.Status)
 	}
 
 	// Verify the release was auto-blocklisted.
