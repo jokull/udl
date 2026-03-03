@@ -47,7 +47,7 @@ grabbed: Dog (2022) [tmdb=838240]
 ```
 
 Every command uses the same TMDB ID — no internal database IDs exposed.
-Queue shows `movie:<tmdb-id>` matching the retry syntax (`udl queue retry movie:838240`).
+Queue shows `movie:<tmdb-id>` and `episode:<tmdb-id>:S01E02` — matching the retry syntax.
 
 ## Usage
 
@@ -71,9 +71,10 @@ Queue shows `movie:<tmdb-id>` matching the retry syntax (`udl queue retry movie:
 ./udl tv refresh               # refresh episode metadata from TMDB
 
 # Queue & history
-./udl queue                    # show queue (movie:<tmdb-id> format)
-./udl queue retry movie:838240 # retry specific failed download
-./udl history                  # show download history
+./udl queue                              # show queue (movie:<tmdb> / episode:<tmdb>:S01E02)
+./udl queue retry movie:838240           # retry failed movie by TMDB ID
+./udl queue retry episode:94997:S02E01   # retry failed episode by series TMDB + S/E
+./udl history                            # show download history
 ./udl blocklist                # show blocklisted releases
 ./udl blocklist clear          # clear all blocklist entries
 ./udl blocklist remove <id>    # remove specific entry

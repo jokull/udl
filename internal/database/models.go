@@ -70,9 +70,11 @@ type Episode struct {
 // Populated by a UNION query across movies and episodes tables.
 type QueueItem struct {
 	MediaID         int64
-	TmdbID          int            // TMDB ID (movie tmdb_id or 0 for episodes)
+	TmdbID          int            // TMDB ID: movie tmdb_id or series tmdb_id (for episodes)
 	Category        string         // "movie" or "episode"
 	Title           string         // display title (computed in query)
+	Season          int            // episode season (0 for movies)
+	EpisodeNum      int            // episode number (0 for movies)
 	Status          string
 	NzbURL          sql.NullString
 	NzbName         sql.NullString
@@ -104,6 +106,10 @@ type History struct {
 	Source    sql.NullString
 	Quality  sql.NullString
 	CreatedAt time.Time
+	// Populated by joins — not stored in history table.
+	TmdbID     int // movie tmdb_id or series tmdb_id (for episodes)
+	Season     int // episode season (0 for movies)
+	EpisodeNum int // episode number (0 for movies)
 }
 
 // BlocklistEntry represents a release that should not be downloaded again.
@@ -114,4 +120,8 @@ type BlocklistEntry struct {
 	ReleaseTitle string
 	Reason       string
 	CreatedAt    time.Time
+	// Populated by joins — not stored in blocklist table.
+	TmdbID     int // movie tmdb_id or series tmdb_id (for episodes)
+	Season     int // episode season (0 for movies)
+	EpisodeNum int // episode number (0 for movies)
 }

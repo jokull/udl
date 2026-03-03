@@ -201,12 +201,15 @@ type RemoveSeriesReply struct {
 
 // RetryDownloadArgs contains arguments for the RetryDownload RPC method.
 // Specify Category + identifier to retry a single item, or leave both empty to retry all failed.
-// For movies: TmdbID is used to identify the movie.
-// For episodes: MediaID (DB episode ID) is used.
+// For movies: TmdbID identifies the movie.
+// For episodes via CLI: TmdbID (series) + Season + Episode identify the episode.
+// For episodes via web UI: MediaID (DB episode ID) is used directly.
 type RetryDownloadArgs struct {
 	Category string // "movie" or "episode"
-	MediaID  int64  // DB episode ID (for episodes)
-	TmdbID   int    // TMDB ID (for movies)
+	MediaID  int64  // DB episode ID (web UI path)
+	TmdbID   int    // TMDB ID (movie tmdb_id, or series tmdb_id for episodes)
+	Season   int    // episode season (used with TmdbID for episode resolution)
+	Episode  int    // episode number (used with TmdbID for episode resolution)
 }
 
 // RetryDownloadReply contains the reply for the RetryDownload RPC method.
@@ -644,8 +647,31 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 			s.retryMedia("movie", movie.ID)
 		}
 		reply.Count = 1
+	} else if args.Category == "episode" && args.TmdbID != 0 && args.Season > 0 {
+		// Single episode retry by series TMDB ID + season/episode.
+		series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
+		if err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		if series == nil {
+			return fmt.Errorf("RetryDownload: no series with TMDB ID %d", args.TmdbID)
+		}
+		ep, err := s.db.FindEpisode(series.ID, args.Season, args.Episode)
+		if err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		if ep == nil {
+			return fmt.Errorf("RetryDownload: no episode S%02dE%02d for series TMDB %d", args.Season, args.Episode, args.TmdbID)
+		}
+		if err := s.db.ResetMediaForRetry("episode", ep.ID); err != nil {
+			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		if len(s.indexers) > 0 {
+			s.retryMedia("episode", ep.ID)
+		}
+		reply.Count = 1
 	} else if args.Category != "" && args.MediaID > 0 {
-		// Single retry by DB media ID (episodes, or web UI path).
+		// Single retry by DB media ID (web UI path).
 		if err := s.db.ResetMediaForRetry(args.Category, args.MediaID); err != nil {
 			return fmt.Errorf("RetryDownload: %w", err)
 		}

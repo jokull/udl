@@ -132,7 +132,7 @@ var queueClearCmd = &cobra.Command{
 }
 
 var queueRetryCmd = &cobra.Command{
-	Use:   "retry [movie:TMDB_ID|episode:ID]",
+	Use:   "retry [movie:TMDB_ID|episode:TMDB_ID:S01E02]",
 	Short: "Retry failed downloads (all or by category:id)",
 	RunE:  runQueueRetry,
 }
@@ -671,12 +671,7 @@ func runQueue(cmd *cobra.Command, args []string) error {
 		if progress > 100 {
 			progress = 100
 		}
-		var id string
-		if d.Category == "movie" && d.TmdbID != 0 {
-			id = fmt.Sprintf("movie:%d", d.TmdbID)
-		} else {
-			id = fmt.Sprintf("%s:%d", d.Category, d.MediaID)
-		}
+		id := mediaTag(d.Category, d.TmdbID, d.Season, d.EpisodeNum, d.MediaID)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%.0f%%\n", id, d.Title, d.Status, progress)
 	}
 	return w.Flush()
@@ -749,7 +744,7 @@ func runHistory(cmd *cobra.Command, args []string) error {
 		if h.Quality.Valid {
 			q = h.Quality.String
 		}
-		id := fmt.Sprintf("%s:%d", h.MediaType, h.MediaID)
+		id := mediaTag(h.MediaType, h.TmdbID, h.Season, h.EpisodeNum, h.MediaID)
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, h.Title, h.Event, q, h.CreatedAt.Format("2006-01-02 15:04"))
 	}
 	return w.Flush()
@@ -779,7 +774,7 @@ func runBlocklist(cmd *cobra.Command, args []string) error {
 		if len(reason) > 60 {
 			reason = reason[:60] + "..."
 		}
-		media := fmt.Sprintf("%s:%d", e.MediaType, e.MediaID)
+		media := mediaTag(e.MediaType, e.TmdbID, e.Season, e.EpisodeNum, e.MediaID)
 		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", e.ID, media, e.ReleaseTitle, reason, e.CreatedAt.Format("2006-01-02 15:04"))
 	}
 	return w.Flush()
@@ -889,24 +884,39 @@ func runQueueRetry(cmd *cobra.Command, args []string) error {
 
 	rpcArgs := &daemon.RetryDownloadArgs{}
 	if len(args) > 0 {
-		// Parse "movie:<tmdb-id>" or "episode:<db-id>" format.
+		// Parse "movie:<tmdb-id>" or "episode:<series-tmdb>:S01E02" format.
 		parts := strings.SplitN(args[0], ":", 2)
 		if len(parts) != 2 {
-			return fmt.Errorf("invalid format %q — use movie:TMDB_ID or episode:ID", args[0])
+			return fmt.Errorf("invalid format %q — use movie:TMDB_ID or episode:TMDB_ID:S01E02", args[0])
 		}
 		category := parts[0]
 		if category != "movie" && category != "episode" {
 			return fmt.Errorf("invalid category %q — use movie or episode", category)
 		}
-		id, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid ID %q: %w", parts[1], err)
-		}
 		rpcArgs.Category = category
 		if category == "movie" {
-			rpcArgs.TmdbID = int(id)
+			tmdbID, err := strconv.Atoi(parts[1])
+			if err != nil {
+				return fmt.Errorf("invalid TMDB ID %q: %w", parts[1], err)
+			}
+			rpcArgs.TmdbID = tmdbID
 		} else {
-			rpcArgs.MediaID = id
+			// Parse "TMDB_ID:S01E02" for episodes.
+			epParts := strings.SplitN(parts[1], ":", 2)
+			if len(epParts) != 2 {
+				return fmt.Errorf("invalid episode format %q — use episode:TMDB_ID:S01E02", args[0])
+			}
+			tmdbID, err := strconv.Atoi(epParts[0])
+			if err != nil {
+				return fmt.Errorf("invalid series TMDB ID %q: %w", epParts[0], err)
+			}
+			var season, episode int
+			if _, err := fmt.Sscanf(strings.ToUpper(epParts[1]), "S%dE%d", &season, &episode); err != nil {
+				return fmt.Errorf("invalid episode identifier %q — expected S01E02 format", epParts[1])
+			}
+			rpcArgs.TmdbID = tmdbID
+			rpcArgs.Season = season
+			rpcArgs.Episode = episode
 		}
 	}
 
@@ -1043,6 +1053,19 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 			reply.TotalDelete, formatSize(reply.TotalSize), reply.TotalKeep)
 	}
 	return nil
+}
+
+// mediaTag formats a TMDB-based media identifier for CLI output.
+// Movies: "movie:<tmdb_id>", Episodes: "episode:<series_tmdb_id>:S01E02".
+// Falls back to "category:<db_id>" if TMDB ID is unavailable.
+func mediaTag(category string, tmdbID int, season, episodeNum int, mediaID int64) string {
+	if tmdbID != 0 {
+		if category == "movie" {
+			return fmt.Sprintf("movie:%d", tmdbID)
+		}
+		return fmt.Sprintf("episode:%d:S%02dE%02d", tmdbID, season, episodeNum)
+	}
+	return fmt.Sprintf("%s:%d", category, mediaID)
 }
 
 func formatSize(bytes int64) string {
