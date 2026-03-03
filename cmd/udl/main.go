@@ -17,6 +17,8 @@ import (
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/daemon"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/migrate"
+	"github.com/jokull/udl/internal/tmdb"
 )
 
 var rootCmd = &cobra.Command{
@@ -245,6 +247,25 @@ var libraryVerifyCmd = &cobra.Command{
 	RunE:  runLibraryVerify,
 }
 
+var migrateCmd = &cobra.Command{
+	Use:   "migrate",
+	Short: "Import media from Sonarr/Radarr",
+}
+
+var migrateRadarrCmd = &cobra.Command{
+	Use:   "radarr",
+	Short: "Import movies from Radarr",
+	Long:  "Fetches all monitored movies from Radarr and adds them to UDL.\nDry-run by default; use --execute to write to the database.",
+	RunE:  runMigrateRadarr,
+}
+
+var migrateSonarrCmd = &cobra.Command{
+	Use:   "sonarr",
+	Short: "Import series from Sonarr",
+	Long:  "Fetches all monitored series from Sonarr, resolves TVDB→TMDB IDs,\nand adds series + episodes to UDL.\nDry-run by default; use --execute to write to the database.",
+	RunE:  runMigrateSonarr,
+}
+
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Manage configuration",
@@ -273,6 +294,20 @@ func init() {
 	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
 	configCmd.AddCommand(configCheckCmd, configPathCmd)
 
+	migrateRadarrCmd.Flags().String("url", "", "Radarr base URL (e.g. http://localhost:7878)")
+	migrateRadarrCmd.Flags().String("apikey", "", "Radarr API key")
+	migrateRadarrCmd.Flags().Bool("execute", false, "Actually write to database (default is dry-run)")
+	migrateRadarrCmd.MarkFlagRequired("url")
+	migrateRadarrCmd.MarkFlagRequired("apikey")
+
+	migrateSonarrCmd.Flags().String("url", "", "Sonarr base URL (e.g. http://localhost:8989)")
+	migrateSonarrCmd.Flags().String("apikey", "", "Sonarr API key")
+	migrateSonarrCmd.Flags().Bool("execute", false, "Actually write to database (default is dry-run)")
+	migrateSonarrCmd.MarkFlagRequired("url")
+	migrateSonarrCmd.MarkFlagRequired("apikey")
+
+	migrateCmd.AddCommand(migrateRadarrCmd, migrateSonarrCmd)
+
 	libraryImportCmd.Flags().Bool("execute", false, "Actually import files (default is dry-run)")
 	libraryCleanupCmd.Flags().Bool("execute", false, "Actually apply changes (default is dry-run)")
 	libraryCleanupCmd.Flags().Bool("rename", false, "Fix misnamed files (requires --execute to apply)")
@@ -280,7 +315,7 @@ func init() {
 	libraryPruneIncompleteCmd.Flags().Bool("execute", false, "Actually remove directories (default is dry-run)")
 	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd, libraryPruneIncompleteCmd, libraryVerifyCmd)
 
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, configCmd)
+	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd)
 }
 
 func main() {
@@ -1308,6 +1343,103 @@ func runConfigPath(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	fmt.Println(p)
+	return nil
+}
+
+// --- Migrate commands (no daemon required) ---
+
+func openDBDirect() (*database.DB, error) {
+	dataDir, err := config.DataDir()
+	if err != nil {
+		return nil, err
+	}
+	dbPath := filepath.Join(dataDir, "udl.db")
+	return database.Open(dbPath)
+}
+
+func runMigrateRadarr(cmd *cobra.Command, args []string) error {
+	url, _ := cmd.Flags().GetString("url")
+	apiKey, _ := cmd.Flags().GetString("apikey")
+	execute, _ := cmd.Flags().GetBool("execute")
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	db, err := openDBDirect()
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	mode := "dry-run"
+	if execute {
+		mode = "execute"
+	}
+	fmt.Printf("migrating from Radarr (%s) [%s]\n\n", url, mode)
+
+	res, err := migrate.RunRadarr(db, url, apiKey, execute, log)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\nresults: %d added, %d skipped, %d with files, %d wanted\n",
+		res.Added, res.Skipped, res.Files, res.Wanted)
+	if len(res.Errors) > 0 {
+		fmt.Printf("errors (%d):\n", len(res.Errors))
+		for _, e := range res.Errors {
+			fmt.Printf("  %s\n", e)
+		}
+	}
+	if !execute && res.Added > 0 {
+		fmt.Println("\nuse --execute to write to database")
+	}
+	return nil
+}
+
+func runMigrateSonarr(cmd *cobra.Command, args []string) error {
+	url, _ := cmd.Flags().GetString("url")
+	apiKey, _ := cmd.Flags().GetString("apikey")
+	execute, _ := cmd.Flags().GetBool("execute")
+
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config (need TMDB API key): %w", err)
+	}
+
+	tmdbClient, err := tmdb.New(cfg.TMDB.APIKey)
+	if err != nil {
+		return fmt.Errorf("init TMDB client: %w", err)
+	}
+
+	db, err := openDBDirect()
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	mode := "dry-run"
+	if execute {
+		mode = "execute"
+	}
+	fmt.Printf("migrating from Sonarr (%s) [%s]\n\n", url, mode)
+
+	res, err := migrate.RunSonarr(db, tmdbClient, url, apiKey, execute, log)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("\nresults: %d series added, %d skipped, %d episode files, %d episodes wanted\n",
+		res.Added, res.Skipped, res.Files, res.Wanted)
+	if len(res.Errors) > 0 {
+		fmt.Printf("errors (%d):\n", len(res.Errors))
+		for _, e := range res.Errors {
+			fmt.Printf("  %s\n", e)
+		}
+	}
+	if !execute && res.Added > 0 {
+		fmt.Println("\nuse --execute to write to database")
+	}
 	return nil
 }
 

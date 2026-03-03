@@ -70,6 +70,34 @@ func (c *Client) FindMovieByIMDB(imdbID string) (*Movie, error) {
 	}, nil
 }
 
+// FindByTVDB looks up a TV series using its TVDB ID via TMDB's "find by
+// external ID" endpoint. Returns nil if no series is found.
+func (c *Client) FindByTVDB(tvdbID int) (*Series, error) {
+	result, err := c.api.GetFindByID(strconv.Itoa(tvdbID), map[string]string{
+		"external_source": "tvdb_id",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("tmdb: find by tvdb %d: %w", tvdbID, err)
+	}
+	if len(result.TvResults) == 0 {
+		return nil, nil
+	}
+	r := result.TvResults[0]
+	// Fetch external IDs to get IMDB ID.
+	extIDs, err := c.api.GetTVExternalIDs(int(r.ID), nil)
+	if err != nil {
+		return nil, fmt.Errorf("tmdb: get tv external ids %d: %w", r.ID, err)
+	}
+	return &Series{
+		TMDBID: int(r.ID),
+		TVDBID: tvdbID,
+		IMDBID: extIDs.IMDbID,
+		Title:  r.Name,
+		Year:   parseYear(r.FirstAirDate),
+		Status: "", // Not available from find endpoint; caller can fetch full details if needed.
+	}, nil
+}
+
 // SearchMovie searches TMDB for movies matching the query string.
 func (c *Client) SearchMovie(query string) ([]Movie, error) {
 	result, err := c.api.GetSearchMovies(query, nil)

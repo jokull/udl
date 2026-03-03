@@ -135,6 +135,64 @@ would delete 2 items (22.9 GB), keep 2 — use --execute to apply
 
 On `--execute`: files are deleted, database status is reset to "wanted" (so they can be re-grabbed later if needed), and a "cleaned" history event is recorded. Empty directories are cleaned up automatically. Requires `[plex] token` in config.
 
+## Migrating from Sonarr/Radarr
+
+UDL can import your monitored media directly from running Sonarr and Radarr instances. The migrate commands talk to their APIs, resolve all metadata via TMDB, and populate UDL's database with the correct status and file paths. No daemon required.
+
+### 1. Back up
+
+```bash
+cp ~/.config/udl/udl.db ~/.config/udl/udl.db.pre-migrate
+```
+
+### 2. Dry-run
+
+Preview what will be imported without writing anything:
+
+```bash
+udl migrate radarr --url http://localhost:7878 --apikey YOUR_RADARR_API_KEY
+udl migrate sonarr --url http://localhost:8989 --apikey YOUR_SONARR_API_KEY
+```
+
+The Sonarr migration resolves TVDB IDs to TMDB IDs (one API call per series with 250ms rate limiting). For ~100 series this takes about 30 seconds.
+
+### 3. Execute
+
+```bash
+udl migrate radarr --url http://localhost:7878 --apikey YOUR_RADARR_API_KEY --execute
+udl migrate sonarr --url http://localhost:8989 --apikey YOUR_SONARR_API_KEY --execute
+```
+
+For each monitored movie/series:
+- Skips items already in UDL (by TMDB ID)
+- Movies with files are marked `downloaded` with quality and absolute file path
+- Movies without files are left as `wanted`
+- Episodes in season 0 (specials) are skipped
+- Quality names are mapped automatically (WEB-DL, WEBRip, Bluray, Remux, etc.)
+
+### 4. Verify and rename
+
+```bash
+udl library verify                          # should show 0 missing
+udl library cleanup                         # dry-run: preview renames
+udl library cleanup --rename --execute      # rename to UDL conventions
+```
+
+This renames files from Sonarr's `Show - S01E01 - Title Quality.mkv` to UDL's `Show.S01E01.Title.Quality.mkv` and restructures series folders to include the year (e.g., `The Bear` becomes `The Bear (2022)`). Trigger a Plex library scan afterward.
+
+### 5. Decommission old services
+
+Once you've confirmed UDL is working (check `udl status`), stop the old services:
+
+```bash
+# macOS
+launchctl unload ~/Library/LaunchAgents/com.sonarr.agent.plist
+launchctl unload ~/Library/LaunchAgents/com.radarr.agent.plist
+launchctl unload ~/Library/LaunchAgents/homebrew.mxcl.nzbget.plist
+```
+
+Keep Jackett running if Overseerr uses it.
+
 ## Configuration
 
 Single config file at `~/.config/udl/config.toml`:
