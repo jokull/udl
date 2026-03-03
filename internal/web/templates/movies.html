@@ -1,0 +1,32 @@
+{{template "layout" .}}
+
+{{define "title"}} — Movies{{end}}
+
+{{define "content"}}
+<h1>Movies</h1>
+
+<div class="filter-tabs">
+  <a href="/movies" {{if or (eq .Filter "") (eq .Filter "all")}}class="active"{{end}}>All</a>
+  <a href="/movies?status=wanted" {{if eq .Filter "wanted"}}class="active"{{end}}>Wanted</a>
+  <a href="/movies?status=downloaded" {{if eq .Filter "downloaded"}}class="active"{{end}}>Downloaded</a>
+</div>
+
+{{if .Movies}}
+<table>
+  <tr><th>Title</th><th>Year</th><th>Status</th><th>Quality</th><th>Added</th></tr>
+  {{range .Movies}}
+  <tr>
+    <td>
+      {{if .ImdbID.Valid}}<a href="https://www.imdb.com/title/{{.ImdbID.String}}/" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+    </td>
+    <td>{{.Year}}</td>
+    <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
+    <td>{{nullable .Quality}}</td>
+    <td class="small">{{fmtTime .AddedAt}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="muted">No movies found.</p>
+{{end}}
+{{end}}

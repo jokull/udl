@@ -1,0 +1,62 @@
+{{template "layout" .}}
+
+{{define "title"}} — Queue{{end}}
+
+{{define "content"}}
+<h1>Queue</h1>
+
+{{if .Active}}
+<h2>Downloading</h2>
+<div hx-ext="sse" sse-connect="/sse/queue" sse-swap="queue">
+<table>
+  <tr><th>Title</th><th>Progress</th><th>Size</th><th>Started</th></tr>
+  {{range .Active}}
+  <tr>
+    <td>{{.Title}}</td>
+    <td>
+      <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
+      {{fmtProgress .Progress}}
+    </td>
+    <td>{{fmtNullBytes .SizeBytes}}</td>
+    <td class="small">{{fmtNullTime .StartedAt}}</td>
+  </tr>
+  {{end}}
+</table>
+</div>
+{{end}}
+
+{{if .Queued}}
+<h2>Queued</h2>
+<table>
+  <tr><th>Title</th><th>Size</th><th>Added</th></tr>
+  {{range .Queued}}
+  <tr>
+    <td>{{.Title}}</td>
+    <td>{{fmtNullBytes .SizeBytes}}</td>
+    <td class="small">{{fmtTime .CreatedAt}}</td>
+  </tr>
+  {{end}}
+</table>
+{{end}}
+
+{{if .Failed}}
+<h2>Failed</h2>
+<table>
+  <tr><th>Title</th><th>Error</th><th>Added</th><th></th></tr>
+  {{range .Failed}}
+  <tr>
+    <td>{{.Title}}</td>
+    <td class="small">{{nullable .ErrorMsg}}</td>
+    <td class="small">{{fmtTime .CreatedAt}}</td>
+    <td>
+      <button hx-post="/queue/retry/{{.ID}}" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Retry this download?">retry</button>
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{end}}
+
+{{if and (not .Active) (not .Queued) (not .Failed)}}
+<p class="muted">Queue is empty.</p>
+{{end}}
+{{end}}

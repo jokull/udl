@@ -1,0 +1,32 @@
+{{template "layout" .}}
+
+{{define "title"}} — Series{{end}}
+
+{{define "content"}}
+<h1>Series</h1>
+
+{{if .Series}}
+<table>
+  <tr><th>Title</th><th>Year</th><th>Status</th><th>Added</th><th></th></tr>
+  {{range .Series}}
+  <tr>
+    <td>{{.Title}}</td>
+    <td>{{.Year}}</td>
+    <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
+    <td class="small">{{fmtTime .AddedAt}}</td>
+    <td>
+      <button hx-get="/series/{{.ID}}/episodes"
+              hx-target="#episodes-{{.ID}}"
+              hx-swap="innerHTML"
+              hx-trigger="click once">episodes</button>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="5" id="episodes-{{.ID}}"></td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="muted">No series found.</p>
+{{end}}
+{{end}}

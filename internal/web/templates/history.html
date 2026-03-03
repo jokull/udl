@@ -1,0 +1,25 @@
+{{template "layout" .}}
+
+{{define "title"}} — History{{end}}
+
+{{define "content"}}
+<h1>History</h1>
+
+{{if .Events}}
+<table>
+  <tr><th>Time</th><th>Type</th><th>Title</th><th>Event</th><th>Quality</th><th>Source</th></tr>
+  {{range .Events}}
+  <tr>
+    <td class="small">{{fmtTime .CreatedAt}}</td>
+    <td>{{.MediaType}}</td>
+    <td>{{.Title}}</td>
+    <td><span class="status {{statusClass .Event}}">{{.Event}}</span></td>
+    <td>{{nullable .Quality}}</td>
+    <td class="small">{{nullable .Source}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="muted">No history events.</p>
+{{end}}
+{{end}}

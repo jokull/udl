@@ -1,0 +1,150 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1em;
+  line-height: 1.5;
+}
+
+nav {
+  border-bottom: 1px solid #000;
+  padding-bottom: 0.5em;
+  margin-bottom: 1.5em;
+}
+
+nav a {
+  margin-right: 1em;
+}
+
+nav a.active {
+  font-weight: bold;
+}
+
+h1 { font-size: 1.3em; margin-bottom: 0.5em; }
+h2 { font-size: 1.1em; margin: 1em 0 0.5em; }
+h3 { font-size: 1em; margin: 0.8em 0 0.3em; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 1em;
+  font-size: 0.9em;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.3em 0.6em;
+  border-bottom: 1px solid #ccc;
+}
+
+th {
+  border-bottom: 2px solid #000;
+  font-weight: bold;
+}
+
+tr:hover { background: #f5f5f5; }
+
+.status {
+  display: inline-block;
+  padding: 0.1em 0.4em;
+  font-size: 0.85em;
+  border: 1px solid;
+}
+
+.wanted   { border-color: #999; color: #666; }
+.downloading { border-color: #333; color: #000; font-weight: bold; }
+.downloaded  { border-color: #000; color: #000; background: #e8e8e8; }
+.failed      { border-color: #000; color: #fff; background: #000; }
+.monitored   { border-color: #666; color: #333; }
+.ended       { border-color: #ccc; color: #999; }
+
+.stats {
+  display: flex;
+  gap: 2em;
+  margin-bottom: 1.5em;
+  flex-wrap: wrap;
+}
+
+.stat {
+  border: 1px solid #000;
+  padding: 0.5em 1em;
+}
+
+.stat-value {
+  font-size: 1.5em;
+  font-weight: bold;
+}
+
+.stat-label {
+  font-size: 0.8em;
+  color: #666;
+}
+
+.progress-bar {
+  width: 100px;
+  height: 14px;
+  border: 1px solid #000;
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.progress-fill {
+  height: 100%;
+  background: #000;
+}
+
+.filter-tabs {
+  margin-bottom: 1em;
+}
+
+.filter-tabs a {
+  margin-right: 0.8em;
+}
+
+.filter-tabs a.active {
+  font-weight: bold;
+  text-decoration: none;
+}
+
+.episodes-container {
+  padding-left: 1em;
+  margin: 0.5em 0;
+}
+
+button, .btn {
+  font-family: inherit;
+  font-size: 0.85em;
+  padding: 0.2em 0.6em;
+  border: 1px solid #000;
+  background: #fff;
+  cursor: pointer;
+}
+
+button:hover, .btn:hover {
+  background: #000;
+  color: #fff;
+}
+
+.day-group {
+  margin-bottom: 1.5em;
+}
+
+.muted { color: #999; }
+.small { font-size: 0.85em; }
+
+dl {
+  margin-bottom: 1em;
+}
+
+dt {
+  font-weight: bold;
+  float: left;
+  width: 140px;
+}
+
+dd {
+  margin-left: 150px;
+  margin-bottom: 0.3em;
+}

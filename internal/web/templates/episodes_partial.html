@@ -1,0 +1,19 @@
+{{define "episodes_partial.html"}}
+<div class="episodes-container">
+{{range .Seasons}}
+<h3>Season {{.Season}}</h3>
+<table>
+  <tr><th>Episode</th><th>Title</th><th>Air Date</th><th>Status</th><th>Quality</th></tr>
+  {{range .Episodes}}
+  <tr>
+    <td>{{seasonEp .Season .Episode}}</td>
+    <td>{{nullable .Title}}</td>
+    <td class="small">{{nullable .AirDate}}</td>
+    <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
+    <td>{{nullable .Quality}}</td>
+  </tr>
+  {{end}}
+</table>
+{{end}}
+</div>
+{{end}}

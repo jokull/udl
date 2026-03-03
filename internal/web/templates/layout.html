@@ -1,0 +1,23 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UDL{{block "title" .}}{{end}}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/htmx.min.js"></script>
+  <script src="/static/sse.js"></script>
+</head>
+<body>
+  <nav>
+    <strong>UDL</strong> &mdash;
+    <a href="/" {{if eq .Page "dashboard"}}class="active"{{end}}>Dashboard</a>
+    <a href="/movies" {{if eq .Page "movies"}}class="active"{{end}}>Movies</a>
+    <a href="/series" {{if eq .Page "series"}}class="active"{{end}}>Series</a>
+    <a href="/queue" {{if eq .Page "queue"}}class="active"{{end}}>Queue</a>
+    <a href="/schedule" {{if eq .Page "schedule"}}class="active"{{end}}>Schedule</a>
+    <a href="/history" {{if eq .Page "history"}}class="active"{{end}}>History</a>
+  </nav>
+  {{block "content" .}}{{end}}
+</body>
+</html>{{end}}

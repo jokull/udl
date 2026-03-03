@@ -335,6 +335,93 @@ func (db *DB) WantedEpisodes() ([]Episode, error) {
 	return episodes, rows.Err()
 }
 
+// UpcomingEpisodes returns episodes with air_date within the next N days,
+// joined with series title, ordered by air_date ASC.
+func (db *DB) UpcomingEpisodes(days int) ([]Episode, error) {
+	if days <= 0 {
+		days = 30
+	}
+	rows, err := db.Query(`
+		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
+		       e.status, e.quality, e.file_path, s.title
+		FROM episodes e
+		JOIN series s ON s.id = e.series_id
+		WHERE e.air_date IS NOT NULL AND e.air_date != ''
+		  AND e.air_date >= date('now')
+		  AND e.air_date <= date('now', '+' || ? || ' days')
+		ORDER BY e.air_date ASC, s.title, e.season, e.episode`, days)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var episodes []Episode
+	for rows.Next() {
+		var ep Episode
+		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
+			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.SeriesTitle); err != nil {
+			return nil, err
+		}
+		episodes = append(episodes, ep)
+	}
+	return episodes, rows.Err()
+}
+
+// EpisodesForSeries returns all episodes for a given series, ordered by season/episode.
+func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
+	rows, err := db.Query(`
+		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
+		       e.status, e.quality, e.file_path, s.title
+		FROM episodes e
+		JOIN series s ON s.id = e.series_id
+		WHERE e.series_id = ?
+		ORDER BY e.season, e.episode`, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var episodes []Episode
+	for rows.Next() {
+		var ep Episode
+		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
+			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.SeriesTitle); err != nil {
+			return nil, err
+		}
+		episodes = append(episodes, ep)
+	}
+	return episodes, rows.Err()
+}
+
+// AllDownloads returns all downloads including failed/completed, ordered by created_at desc.
+func (db *DB) AllDownloads(limit int) ([]Download, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	rows, err := db.Query(
+		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
+		 FROM downloads ORDER BY created_at DESC LIMIT ?`, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var downloads []Download
+	for rows.Next() {
+		var d Download
+		if err := rows.Scan(&d.ID, &d.NzbURL, &d.NzbName, &d.Title, &d.Category,
+			&d.MediaID, &d.Status, &d.Progress, &d.SizeBytes, &d.DownloadedBytes,
+			&d.ErrorMsg, &d.StartedAt, &d.CompletedAt, &d.CreatedAt, &d.Source); err != nil {
+			return nil, err
+		}
+		downloads = append(downloads, d)
+	}
+	return downloads, rows.Err()
+}
+
 // SearchableEpisodes returns wanted, already-aired episodes that are "due" for
 // search based on their air_date age and last_searched_at timestamp.
 // Search intervals by episode age (since air_date):

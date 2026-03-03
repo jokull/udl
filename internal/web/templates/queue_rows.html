@@ -1,0 +1,19 @@
+{{define "queue_rows.html"}}
+<table>
+  <tr><th>Title</th><th>Progress</th><th>Size</th><th>Started</th></tr>
+  {{range .}}
+  <tr>
+    <td>{{.Title}}</td>
+    <td>
+      <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
+      {{fmtProgress .Progress}}
+    </td>
+    <td>{{fmtNullBytes .SizeBytes}}</td>
+    <td class="small">{{fmtNullTime .StartedAt}}</td>
+  </tr>
+  {{end}}
+  {{if not .}}
+  <tr><td colspan="4" class="muted">No active downloads.</td></tr>
+  {{end}}
+</table>
+{{end}}

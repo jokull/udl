@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
@@ -18,6 +19,7 @@ import (
 	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/postprocess"
 	"github.com/jokull/udl/internal/tmdb"
+	"github.com/jokull/udl/internal/web"
 )
 
 // Service is the RPC service exposed by the daemon.
@@ -724,6 +726,37 @@ type PlexCheckReply struct {
 	Matches []plex.MediaMatch
 }
 
+// --- Plex cleanup types ---
+
+// PlexCleanupArgs contains arguments for the PlexCleanup RPC method.
+type PlexCleanupArgs struct {
+	Days    int  // minimum age in days since added to Plex (default 90)
+	Execute bool // false = dry-run
+}
+
+// PlexCleanupItem describes a single media item considered for cleanup.
+type PlexCleanupItem struct {
+	MediaType string // "movie" or "series"
+	Title     string
+	Year      int
+	Quality   string
+	AddedDays int    // days since added to Plex
+	SizeBytes int64  // total size of files to delete
+	Action    string // "delete" or "keep"
+	Reason    string // why kept: "watched", "too-recent", "not-in-plex"
+	Deleted   bool   // true if actually deleted (when Execute=true)
+}
+
+// PlexCleanupReply contains the reply for the PlexCleanup RPC method.
+type PlexCleanupReply struct {
+	Items        []PlexCleanupItem
+	TotalDelete  int   // count of items to delete
+	TotalKeep    int   // count of items kept
+	TotalSize    int64 // total bytes to reclaim
+	DeletedCount int   // actually deleted (Execute mode)
+	DeletedSize  int64 // bytes actually reclaimed
+}
+
 // Blocklist returns all blocklist entries.
 func (s *Service) Blocklist(args *Empty, reply *BlocklistReply) error {
 	entries, err := s.db.ListBlocklist()
@@ -809,6 +842,328 @@ func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 	}
 	wg.Wait()
 
+	return nil
+}
+
+// PlexCleanup identifies unwatched media older than N days and optionally deletes it.
+// Queries the user's owned Plex server for watch history, cross-references with the
+// UDL database, and removes files that have never been watched.
+func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) error {
+	if s.plex == nil {
+		return fmt.Errorf("PlexCleanup: Plex integration not configured (set plex.token or PLEX_TOKEN)")
+	}
+
+	days := args.Days
+	if days <= 0 {
+		days = 90
+	}
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+
+	// Discover the user's owned Plex server.
+	ownedSrv, err := s.plex.DiscoverOwnedServer()
+	if err != nil {
+		return fmt.Errorf("PlexCleanup: %w", err)
+	}
+	s.log.Info("plex cleanup: discovered owned server", "name", ownedSrv.Name, "uri", ownedSrv.URI)
+
+	// Fetch library sections.
+	sections, err := s.plex.LibrarySections(*ownedSrv)
+	if err != nil {
+		return fmt.Errorf("PlexCleanup: %w", err)
+	}
+
+	// Build file path → Plex item map from all sections.
+	// For TV show sections, we fetch per-show episode data.
+	type plexFileInfo struct {
+		viewCount int
+		addedAt   int64
+	}
+	plexFiles := make(map[string]*plexFileInfo)
+
+	// Also track show-level data for TV series cleanup.
+	type showInfo struct {
+		ratingKey  string
+		title      string
+		year       int
+		viewCount  int // show-level viewCount (>0 if any episode watched)
+		addedAt    int64
+	}
+	var shows []showInfo
+
+	for _, sec := range sections {
+		items, err := s.plex.LibraryAllItems(*ownedSrv, sec.Key)
+		if err != nil {
+			s.log.Warn("plex cleanup: list section failed", "section", sec.Title, "error", err)
+			continue
+		}
+
+		if sec.Type == "movie" {
+			for _, item := range items {
+				for _, fp := range item.FilePaths {
+					plexFiles[fp] = &plexFileInfo{
+						viewCount: item.ViewCount,
+						addedAt:   item.AddedAt,
+					}
+				}
+			}
+		} else if sec.Type == "show" {
+			// For TV, fetch all episodes per show to get per-file watch data.
+			for _, item := range items {
+				shows = append(shows, showInfo{
+					ratingKey: item.RatingKey,
+					title:     item.Title,
+					year:      item.Year,
+					viewCount: item.ViewCount,
+					addedAt:   item.AddedAt,
+				})
+				// Fetch episodes to populate file path map.
+				episodes, err := s.plex.ShowAllLeaves(*ownedSrv, item.RatingKey)
+				if err != nil {
+					s.log.Debug("plex cleanup: fetch episodes failed", "show", item.Title, "error", err)
+					continue
+				}
+				for _, ep := range episodes {
+					for _, fp := range ep.FilePaths {
+						plexFiles[fp] = &plexFileInfo{
+							viewCount: ep.ViewCount,
+							addedAt:   ep.AddedAt,
+						}
+					}
+				}
+			}
+		}
+	}
+
+	s.log.Info("plex cleanup: indexed library", "files", len(plexFiles), "shows", len(shows))
+
+	// --- Process movies ---
+	movies, err := s.db.DownloadedMovies()
+	if err != nil {
+		return fmt.Errorf("PlexCleanup: list movies: %w", err)
+	}
+
+	for _, movie := range movies {
+		if !movie.FilePath.Valid || movie.FilePath.String == "" {
+			continue
+		}
+
+		item := PlexCleanupItem{
+			MediaType: "movie",
+			Title:     movie.Title,
+			Year:      movie.Year,
+		}
+		if movie.Quality.Valid {
+			item.Quality = movie.Quality.String
+		}
+
+		pf, inPlex := plexFiles[movie.FilePath.String]
+		if !inPlex {
+			item.Action = "keep"
+			item.Reason = "not-in-plex"
+			reply.TotalKeep++
+			reply.Items = append(reply.Items, item)
+			continue
+		}
+
+		addedTime := time.Unix(pf.addedAt, 0)
+		item.AddedDays = int(time.Since(addedTime).Hours() / 24)
+
+		if pf.viewCount > 0 {
+			item.Action = "keep"
+			item.Reason = "watched"
+			reply.TotalKeep++
+		} else if addedTime.After(cutoff) {
+			item.Action = "keep"
+			item.Reason = "too-recent"
+			reply.TotalKeep++
+		} else {
+			if fi, err := os.Stat(movie.FilePath.String); err == nil {
+				item.SizeBytes = fi.Size()
+			}
+			item.Action = "delete"
+			reply.TotalDelete++
+			reply.TotalSize += item.SizeBytes
+
+			if args.Execute {
+				if err := os.Remove(movie.FilePath.String); err != nil {
+					s.log.Error("plex cleanup: delete movie file", "path", movie.FilePath.String, "error", err)
+				} else {
+					item.Deleted = true
+					reply.DeletedCount++
+					reply.DeletedSize += item.SizeBytes
+					s.db.UpdateMovieStatus(movie.ID, "wanted", "", "")
+					s.db.AddHistory("movie", movie.ID,
+						fmt.Sprintf("%s (%d)", movie.Title, movie.Year),
+						"cleaned", "plex-cleanup", "")
+					s.log.Info("plex cleanup: deleted movie", "title", movie.Title, "year", movie.Year)
+				}
+			}
+		}
+		reply.Items = append(reply.Items, item)
+	}
+
+	// --- Process TV series ---
+	// Group downloaded episodes by series.
+	downloadedEps, err := s.db.DownloadedEpisodes()
+	if err != nil {
+		return fmt.Errorf("PlexCleanup: list episodes: %w", err)
+	}
+
+	type seriesGroup struct {
+		seriesID   int64
+		title      string
+		year       int
+		episodes   []database.Episode
+		anyWatched bool
+		earliestAdd int64 // earliest Plex addedAt across episodes
+		totalSize  int64
+	}
+	seriesMap := make(map[int64]*seriesGroup)
+
+	for _, ep := range downloadedEps {
+		sg, ok := seriesMap[ep.SeriesID]
+		if !ok {
+			series, err := s.db.GetSeries(ep.SeriesID)
+			if err != nil {
+				continue
+			}
+			sg = &seriesGroup{
+				seriesID: ep.SeriesID,
+				title:    series.Title,
+				year:     series.Year,
+			}
+			seriesMap[ep.SeriesID] = sg
+		}
+		sg.episodes = append(sg.episodes, ep)
+
+		if ep.FilePath.Valid && ep.FilePath.String != "" {
+			if pf, ok := plexFiles[ep.FilePath.String]; ok {
+				if pf.viewCount > 0 {
+					sg.anyWatched = true
+				}
+				if sg.earliestAdd == 0 || pf.addedAt < sg.earliestAdd {
+					sg.earliestAdd = pf.addedAt
+				}
+			}
+			if fi, err := os.Stat(ep.FilePath.String); err == nil {
+				sg.totalSize += fi.Size()
+			}
+		}
+	}
+
+	for _, sg := range seriesMap {
+		item := PlexCleanupItem{
+			MediaType: "series",
+			Title:     sg.title,
+			Year:      sg.year,
+			SizeBytes: sg.totalSize,
+		}
+
+		if sg.earliestAdd == 0 {
+			item.Action = "keep"
+			item.Reason = "not-in-plex"
+			reply.TotalKeep++
+			reply.Items = append(reply.Items, item)
+			continue
+		}
+
+		addedTime := time.Unix(sg.earliestAdd, 0)
+		item.AddedDays = int(time.Since(addedTime).Hours() / 24)
+
+		if sg.anyWatched {
+			item.Action = "keep"
+			item.Reason = "watched"
+			reply.TotalKeep++
+		} else if addedTime.After(cutoff) {
+			item.Action = "keep"
+			item.Reason = "too-recent"
+			reply.TotalKeep++
+		} else {
+			item.Action = "delete"
+			reply.TotalDelete++
+			reply.TotalSize += sg.totalSize
+
+			if args.Execute {
+				// Delete the entire series folder.
+				seriesFolder := filepath.Join(s.cfg.Library.TV, fmt.Sprintf("%s (%d)", sg.title, sg.year))
+				if err := os.RemoveAll(seriesFolder); err != nil {
+					s.log.Error("plex cleanup: delete series folder", "path", seriesFolder, "error", err)
+				} else {
+					item.Deleted = true
+					reply.DeletedCount++
+					reply.DeletedSize += sg.totalSize
+					// Reset all episodes to wanted.
+					for _, ep := range sg.episodes {
+						s.db.UpdateEpisodeStatus(ep.ID, "wanted", "", "")
+					}
+					s.db.AddHistory("series", sg.seriesID,
+						fmt.Sprintf("%s (%d)", sg.title, sg.year),
+						"cleaned", "plex-cleanup", "")
+					s.log.Info("plex cleanup: deleted series", "title", sg.title, "year", sg.year)
+				}
+			}
+		}
+		reply.Items = append(reply.Items, item)
+	}
+
+	// Clean up empty directories after deletions.
+	if args.Execute && reply.DeletedCount > 0 {
+		removeEmptyDirs(s.cfg.Library.Movies)
+		removeEmptyDirs(s.cfg.Library.TV)
+	}
+
+	return nil
+}
+
+// --- Schedule types ---
+
+// ScheduleArgs contains arguments for the Schedule RPC method.
+type ScheduleArgs struct {
+	Days int // number of days to look ahead (default 30)
+}
+
+// ScheduleReply contains the reply for the Schedule RPC method.
+type ScheduleReply struct {
+	Episodes []database.Episode
+}
+
+// SeriesDetailArgs contains arguments for the SeriesDetail RPC method.
+type SeriesDetailArgs struct {
+	ID int64
+}
+
+// SeriesDetailReply contains the reply for the SeriesDetail RPC method.
+type SeriesDetailReply struct {
+	Series   database.Series
+	Episodes []database.Episode
+}
+
+// Schedule returns upcoming episodes within the given number of days.
+func (s *Service) Schedule(args *ScheduleArgs, reply *ScheduleReply) error {
+	days := args.Days
+	if days <= 0 {
+		days = 30
+	}
+	episodes, err := s.db.UpcomingEpisodes(days)
+	if err != nil {
+		return fmt.Errorf("Schedule: %w", err)
+	}
+	reply.Episodes = episodes
+	return nil
+}
+
+// SeriesDetail returns a series and all its episodes.
+func (s *Service) SeriesDetail(args *SeriesDetailArgs, reply *SeriesDetailReply) error {
+	series, err := s.db.GetSeries(args.ID)
+	if err != nil {
+		return fmt.Errorf("SeriesDetail: %w", err)
+	}
+	reply.Series = *series
+	episodes, err := s.db.EpisodesForSeries(args.ID)
+	if err != nil {
+		return fmt.Errorf("SeriesDetail: %w", err)
+	}
+	reply.Episodes = episodes
 	return nil
 }
 
@@ -903,6 +1258,23 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	}
 	go server.Accept(ln)
 
+	// Start web server if configured.
+	var webServer *web.Server
+	if cfg.Web.Port > 0 {
+		adapter := NewWebAdapter(svc)
+		ws, err := web.New(adapter, cfg, db, log)
+		if err != nil {
+			ln.Close()
+			return fmt.Errorf("daemon: create web server: %w", err)
+		}
+		webServer = ws
+		go func() {
+			if err := webServer.ListenAndServe(); err != nil && err.Error() != "http: Server closed" {
+				log.Error("web server error", "error", err)
+			}
+		}()
+	}
+
 	// Start scheduler (episode search + movie search sweep + TMDB refresh).
 	// Share the same searcher instance to prevent duplicate indexer queries.
 	sched := NewScheduler(cfg, db, searcher, tc, plexClient, log)
@@ -930,6 +1302,9 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	<-ctx.Done()
 
 	log.Info("shutting down")
+	if webServer != nil {
+		webServer.Shutdown()
+	}
 	sched.Stop()
 	dl.Stop()
 	ln.Close()

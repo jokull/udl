@@ -1,0 +1,70 @@
+{{template "layout" .}}
+
+{{define "title"}} — Dashboard{{end}}
+
+{{define "content"}}
+<h1>Dashboard</h1>
+
+<div class="stats" hx-get="/" hx-trigger="every 30s" hx-select=".stats" hx-swap="outerHTML">
+  <div class="stat">
+    <div class="stat-value">{{.Status.MovieCount}}</div>
+    <div class="stat-label">Movies</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{.Status.SeriesCount}}</div>
+    <div class="stat-label">Series</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{.Status.QueueSize}}</div>
+    <div class="stat-label">Queue</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{.Status.Downloading}}</div>
+    <div class="stat-label">Downloading</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{.Status.IndexerCount}}</div>
+    <div class="stat-label">Indexers</div>
+  </div>
+  {{if gt .Status.FailedCount 0}}
+  <div class="stat">
+    <div class="stat-value">{{.Status.FailedCount}}</div>
+    <div class="stat-label">Failed (24h)</div>
+  </div>
+  {{end}}
+</div>
+
+{{if .Queue}}
+<h2>Active Downloads</h2>
+<div hx-ext="sse" sse-connect="/sse/queue" sse-swap="queue">
+<table>
+  <tr><th>Title</th><th>Progress</th><th>Size</th></tr>
+  {{range .Queue}}
+  <tr>
+    <td>{{.Title}}</td>
+    <td>
+      <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
+      {{fmtProgress .Progress}}
+    </td>
+    <td>{{fmtNullBytes .SizeBytes}}</td>
+  </tr>
+  {{end}}
+</table>
+</div>
+{{end}}
+
+{{if .History}}
+<h2>Recent Activity</h2>
+<table>
+  <tr><th>Time</th><th>Type</th><th>Title</th><th>Event</th></tr>
+  {{range .History}}
+  <tr>
+    <td class="small">{{fmtTime .CreatedAt}}</td>
+    <td>{{.MediaType}}</td>
+    <td>{{.Title}}</td>
+    <td><span class="status {{statusClass .Event}}">{{.Event}}</span></td>
+  </tr>
+  {{end}}
+</table>
+{{end}}
+{{end}}

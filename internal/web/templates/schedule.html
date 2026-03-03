@@ -1,0 +1,28 @@
+{{template "layout" .}}
+
+{{define "title"}} — Schedule{{end}}
+
+{{define "content"}}
+<h1>Schedule</h1>
+
+{{if .Days}}
+{{range .Days}}
+<div class="day-group">
+  <h2>{{.Date}}</h2>
+  <table>
+    <tr><th>Series</th><th>Episode</th><th>Title</th><th>Status</th></tr>
+    {{range .Episodes}}
+    <tr>
+      <td>{{.SeriesTitle}}</td>
+      <td>{{seasonEp .Season .Episode}}</td>
+      <td>{{nullable .Title}}</td>
+      <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
+    </tr>
+    {{end}}
+  </table>
+</div>
+{{end}}
+{{else}}
+<p class="muted">No upcoming episodes in the next 30 days.</p>
+{{end}}
+{{end}}

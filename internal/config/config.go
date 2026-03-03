@@ -21,6 +21,7 @@ type Config struct {
 	TMDB     TMDBConfig       `toml:"tmdb"`
 	Plex     PlexConfig       `toml:"plex"`
 	Daemon   Daemon           `toml:"daemon"`
+	Web      WebConfig        `toml:"web"`
 	Prefs    quality.Prefs    `toml:"-"` // populated after parsing from Quality strings
 }
 
@@ -89,6 +90,13 @@ type Indexer struct {
 type Daemon struct {
 	RSSIntervalRaw string        `toml:"rss_interval"`
 	RSSInterval    time.Duration `toml:"-"` // parsed from RSSIntervalRaw
+}
+
+// WebConfig holds optional web interface settings.
+// The HTTP server only starts when Port > 0.
+type WebConfig struct {
+	Port int    `toml:"port"` // 0 = disabled (default)
+	Bind string `toml:"bind"` // default "127.0.0.1"
 }
 
 const (
@@ -170,6 +178,11 @@ func LoadFrom(path string) (*Config, error) {
 	// Plex token: fall back to PLEX_TOKEN env var if not in config.
 	if cfg.Plex.Token == "" {
 		cfg.Plex.Token = os.Getenv("PLEX_TOKEN")
+	}
+
+	// Default web bind address.
+	if cfg.Web.Bind == "" {
+		cfg.Web.Bind = "127.0.0.1"
 	}
 
 	// Parse RSS interval with a default.
