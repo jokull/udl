@@ -156,6 +156,13 @@ var plexCheckCmd = &cobra.Command{
 	RunE:  runPlexCheck,
 }
 
+var plexCleanupCmd = &cobra.Command{
+	Use:   "cleanup",
+	Short: "Delete unwatched media older than N days from library",
+	Long:  "Queries Plex watch history on your owned server. Items never watched and added more than --days ago are candidates for deletion. Dry-run by default; use --execute to actually delete files.",
+	RunE:  runPlexCleanup,
+}
+
 var blocklistCmd = &cobra.Command{
 	Use:   "blocklist",
 	Short: "Show blocklisted releases",
@@ -236,7 +243,10 @@ func init() {
 	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieGrabCmd, movieRemoveCmd)
 	tvCmd.AddCommand(tvAddCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd)
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
-	plexCmd.AddCommand(plexServersCmd, plexCheckCmd)
+	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
+	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
+	plexCleanupCmd.Flags().Bool("verbose", false, "Also show items that would be kept")
+	plexCmd.AddCommand(plexServersCmd, plexCheckCmd, plexCleanupCmd)
 	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
 	configCmd.AddCommand(configCheckCmd, configPathCmd)
 
@@ -867,6 +877,80 @@ func runPlexCheck(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", m.ServerName, m.Title, m.Year, m.Resolution, m.Quality)
 	}
 	return w.Flush()
+}
+
+func runPlexCleanup(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	days, _ := cmd.Flags().GetInt("days")
+	execute, _ := cmd.Flags().GetBool("execute")
+	verbose, _ := cmd.Flags().GetBool("verbose")
+
+	rpcArgs := &daemon.PlexCleanupArgs{Days: days, Execute: execute}
+	var reply daemon.PlexCleanupReply
+	if err := client.Call("Service.PlexCleanup", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Items) == 0 {
+		fmt.Println("no downloaded media found in Plex library")
+		return nil
+	}
+
+	// Show items in a table.
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ACTION\tTYPE\tTITLE\tQUALITY\tAGE\tSIZE")
+	for _, item := range reply.Items {
+		if item.Action == "keep" && !verbose {
+			continue
+		}
+		action := item.Action
+		if item.Deleted {
+			action = "deleted"
+		}
+		if item.Action == "keep" {
+			action = fmt.Sprintf("keep (%s)", item.Reason)
+		}
+		age := ""
+		if item.AddedDays > 0 {
+			age = fmt.Sprintf("%dd", item.AddedDays)
+		}
+		size := formatSize(item.SizeBytes)
+		title := item.Title
+		if item.Year > 0 {
+			title = fmt.Sprintf("%s (%d)", item.Title, item.Year)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			action, item.MediaType, title, item.Quality, age, size)
+	}
+	w.Flush()
+	fmt.Println()
+
+	// Summary.
+	if execute {
+		fmt.Printf("deleted %d items (%s), kept %d\n",
+			reply.DeletedCount, formatSize(reply.DeletedSize), reply.TotalKeep)
+	} else {
+		fmt.Printf("would delete %d items (%s), keep %d — use --execute to apply\n",
+			reply.TotalDelete, formatSize(reply.TotalSize), reply.TotalKeep)
+	}
+	return nil
+}
+
+func formatSize(bytes int64) string {
+	if bytes == 0 {
+		return "-"
+	}
+	gb := float64(bytes) / (1024 * 1024 * 1024)
+	if gb >= 1.0 {
+		return fmt.Sprintf("%.1f GB", gb)
+	}
+	mb := float64(bytes) / (1024 * 1024)
+	return fmt.Sprintf("%.0f MB", mb)
 }
 
 func runLibraryImport(cmd *cobra.Command, args []string) error {

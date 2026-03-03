@@ -1,8 +1,10 @@
 // Package plex provides a minimal Plex API client for checking media
-// availability on friends' shared servers.
+// availability on friends' shared servers and querying the owned server's
+// watch history for library cleanup.
 package plex
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +25,9 @@ type Client struct {
 	servers    []Server
 	serversErr error
 	serversOnce sync.Once
+	ownedServer  *Server
+	ownedErr     error
+	ownedOnce    sync.Once
 	mu         sync.Mutex // protects episodeCache only
 
 	// episodeCache stores series episode data keyed by "serverURI|seriesTitle"
@@ -62,6 +67,26 @@ type episodeMeta struct {
 	Episode   int
 	Resolution string
 	RatingKey string
+}
+
+// LibrarySection describes a Plex library section (movie or show).
+type LibrarySection struct {
+	Key   string // section ID, e.g. "1"
+	Title string // e.g. "Movies", "TV Shows"
+	Type  string // "movie" or "show"
+}
+
+// LibraryItem describes a media item with watch status from the owned server.
+type LibraryItem struct {
+	RatingKey    string
+	Title        string
+	Year         int
+	Type         string   // "movie", "show", or "episode"
+	ViewCount    int      // 0 = never watched
+	LastViewedAt int64    // unix timestamp, 0 if never
+	AddedAt      int64    // unix timestamp
+	FilePaths    []string // all file paths for this item's media parts
+	TotalSize    int64    // sum of all part sizes
 }
 
 // New creates a Plex client. The token is a Plex authentication token
@@ -441,6 +466,215 @@ func (c *Client) Servers() []Server {
 	return c.servers
 }
 
+// DiscoverOwnedServer fetches the user's own Plex server from plex.tv.
+// Results are cached for the lifetime of the Client. Safe for concurrent use.
+func (c *Client) DiscoverOwnedServer() (*Server, error) {
+	c.ownedOnce.Do(func() {
+		c.ownedServer, c.ownedErr = c.discoverOwnedInternal()
+	})
+	if c.ownedServer == nil && c.ownedErr == nil {
+		return nil, fmt.Errorf("plex: no owned server found")
+	}
+	return c.ownedServer, c.ownedErr
+}
+
+func (c *Client) discoverOwnedInternal() (*Server, error) {
+	req, err := http.NewRequest("GET", "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1", nil)
+	if err != nil {
+		return nil, fmt.Errorf("plex: build request: %w", err)
+	}
+	c.setHeaders(req)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("plex: discover owned server: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("plex: discover owned server: status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var resources []resourceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&resources); err != nil {
+		return nil, fmt.Errorf("plex: decode resources: %w", err)
+	}
+
+	for _, r := range resources {
+		if !r.Provides("server") || !r.Owned {
+			continue
+		}
+		uri := pickBestLocalConnection(r.Connections)
+		if uri == "" {
+			continue
+		}
+		return &Server{
+			Name:        r.Name,
+			URI:         uri,
+			AccessToken: r.AccessToken,
+			Owned:       true,
+		}, nil
+	}
+	return nil, nil
+}
+
+// LibrarySections returns the library sections on a server.
+func (c *Client) LibrarySections(srv Server) ([]LibrarySection, error) {
+	reqURL := fmt.Sprintf("%s/library/sections", srv.URI)
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setServerHeaders(req, srv.AccessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("plex: library sections: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("plex: library sections: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		MediaContainer struct {
+			Directory []struct {
+				Key   string `json:"key"`
+				Title string `json:"title"`
+				Type  string `json:"type"`
+			} `json:"Directory"`
+		} `json:"MediaContainer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("plex: decode sections: %w", err)
+	}
+
+	var sections []LibrarySection
+	for _, d := range result.MediaContainer.Directory {
+		if d.Type == "movie" || d.Type == "show" {
+			sections = append(sections, LibrarySection{
+				Key:   d.Key,
+				Title: d.Title,
+				Type:  d.Type,
+			})
+		}
+	}
+	return sections, nil
+}
+
+// LibraryAllItems returns all items in a library section with watch metadata.
+// Uses a 60s timeout since large libraries can be slow to enumerate.
+func (c *Client) LibraryAllItems(srv Server, sectionKey string) ([]LibraryItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	reqURL := fmt.Sprintf("%s/library/sections/%s/all", srv.URI, sectionKey)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setServerHeaders(req, srv.AccessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("plex: library items: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("plex: library items: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		MediaContainer struct {
+			Metadata []libraryItemMeta `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("plex: decode library items: %w", err)
+	}
+
+	var items []LibraryItem
+	for _, meta := range result.MediaContainer.Metadata {
+		item := LibraryItem{
+			RatingKey:    meta.RatingKey,
+			Title:        meta.Title,
+			Year:         meta.Year,
+			Type:         meta.Type,
+			ViewCount:    meta.ViewCount,
+			LastViewedAt: meta.LastViewedAt,
+			AddedAt:      meta.AddedAt,
+		}
+		for _, m := range meta.Media {
+			for _, p := range m.Part {
+				if p.File != "" {
+					item.FilePaths = append(item.FilePaths, p.File)
+				}
+				item.TotalSize += p.Size
+			}
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// ShowAllLeaves returns all episodes for a TV show with per-episode watch data.
+func (c *Client) ShowAllLeaves(srv Server, showRatingKey string) ([]LibraryItem, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	reqURL := fmt.Sprintf("%s/library/metadata/%s/allLeaves", srv.URI, showRatingKey)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setServerHeaders(req, srv.AccessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("plex: show leaves: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("plex: show leaves: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		MediaContainer struct {
+			Metadata []libraryItemMeta `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("plex: decode show leaves: %w", err)
+	}
+
+	var items []LibraryItem
+	for _, meta := range result.MediaContainer.Metadata {
+		item := LibraryItem{
+			RatingKey:    meta.RatingKey,
+			Title:        meta.Title,
+			Year:         meta.Year,
+			Type:         "episode",
+			ViewCount:    meta.ViewCount,
+			LastViewedAt: meta.LastViewedAt,
+			AddedAt:      meta.AddedAt,
+		}
+		for _, m := range meta.Media {
+			for _, p := range m.Part {
+				if p.File != "" {
+					item.FilePaths = append(item.FilePaths, p.File)
+				}
+				item.TotalSize += p.Size
+			}
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
 // --- internal helpers ---
 
 func (c *Client) fetchAllEpisodes(srv Server, showKey string) ([]episodeMeta, error) {
@@ -625,6 +859,19 @@ type childrenResponse struct {
 	} `json:"MediaContainer"`
 }
 
+// libraryItemMeta is the JSON shape returned by /library/sections/{key}/all
+// and /library/metadata/{key}/allLeaves — includes watch metadata.
+type libraryItemMeta struct {
+	RatingKey    string      `json:"ratingKey"`
+	Type         string      `json:"type"`
+	Title        string      `json:"title"`
+	Year         int         `json:"year"`
+	ViewCount    int         `json:"viewCount"`
+	LastViewedAt int64       `json:"lastViewedAt"`
+	AddedAt      int64       `json:"addedAt"`
+	Media        []mediaPart `json:"Media"`
+}
+
 // pickBestConnection selects the best URI from a server's connections.
 // Prefers remote HTTPS connections over relay connections.
 func pickBestConnection(conns []resourceConnection) string {
@@ -644,6 +891,31 @@ func pickBestConnection(conns []resourceConnection) string {
 		}
 		if c.Local {
 			score += 0 // skip local connections — can't reach friend's local network
+		}
+		if score > bestScore {
+			bestScore = score
+			best = c.URI
+		}
+	}
+	return best
+}
+
+// pickBestLocalConnection selects the best URI for the owned server.
+// Prefers local connections since the user's own server is on the same network.
+func pickBestLocalConnection(conns []resourceConnection) string {
+	var best string
+	var bestScore int
+
+	for _, c := range conns {
+		score := 0
+		if c.Local {
+			score += 4 // local connection is best for owned server
+		}
+		if c.Protocol == "https" {
+			score += 2
+		}
+		if !c.Local && !c.Relay {
+			score += 1 // remote direct as fallback
 		}
 		if score > bestScore {
 			bestScore = score
