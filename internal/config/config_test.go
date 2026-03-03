@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/jokull/udl/internal/quality"
 )
@@ -50,9 +49,6 @@ apikey = "abc123"
 
 [tmdb]
 apikey = "test-tmdb-key"
-
-[daemon]
-rss_interval = "10m"
 `
 
 func writeTempConfig(t *testing.T, content string) string {
@@ -152,41 +148,6 @@ func TestLoadRoundTrip(t *testing.T) {
 		t.Errorf("Indexer[0].APIKey = %q, want abc123", idx.APIKey)
 	}
 
-	// Daemon
-	if cfg.Daemon.RSSInterval != 10*time.Minute {
-		t.Errorf("Daemon.RSSInterval = %v, want 10m", cfg.Daemon.RSSInterval)
-	}
-}
-
-func TestLoadDefaultRSSInterval(t *testing.T) {
-	// Config without an rss_interval should default to 15m.
-	tomlData := `
-[library]
-tv = "/tmp/tv"
-movies = "/tmp/movies"
-
-[paths]
-incomplete = "/tmp/inc"
-complete = "/tmp/comp"
-
-[[usenet.providers]]
-name = "p"
-host = "h"
-port = 563
-
-[[indexers]]
-name = "i"
-url = "http://x"
-apikey = "k"
-`
-	path := writeTempConfig(t, tomlData)
-	cfg, err := LoadFrom(path)
-	if err != nil {
-		t.Fatalf("LoadFrom: %v", err)
-	}
-	if cfg.Daemon.RSSInterval != 15*time.Minute {
-		t.Errorf("Daemon.RSSInterval = %v, want 15m (default)", cfg.Daemon.RSSInterval)
-	}
 }
 
 func TestValidate(t *testing.T) {
@@ -485,28 +446,3 @@ apikey = "k"
 	}
 }
 
-func TestLoadInvalidRSSInterval(t *testing.T) {
-	tomlData := `
-[library]
-tv = "/t"
-movies = "/m"
-[paths]
-incomplete = "/i"
-complete = "/c"
-[[usenet.providers]]
-name = "p"
-host = "h"
-port = 563
-[[indexers]]
-name = "i"
-url = "http://x"
-apikey = "k"
-[daemon]
-rss_interval = "not-a-duration"
-`
-	path := writeTempConfig(t, tomlData)
-	_, err := LoadFrom(path)
-	if err == nil {
-		t.Fatal("expected error for invalid rss_interval, got nil")
-	}
-}

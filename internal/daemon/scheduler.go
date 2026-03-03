@@ -2,39 +2,27 @@ package daemon
 
 import (
 	"context"
-	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/jokull/udl/internal/config"
-	"github.com/jokull/udl/internal/database"
-	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
 // Scheduler runs periodic tasks for the daemon.
 type Scheduler struct {
-	cfg      *config.Config
-	db       *database.DB
-	log      *slog.Logger
-	searcher *Searcher
+	svc      *Service
 	tmdb     *tmdb.Client
-	plex     *plex.Client // nil if Plex integration is disabled
 	stop     chan struct{}
 	stopOnce sync.Once
 }
 
-// NewScheduler creates a scheduler from config. The searcher is shared with the
-// RPC Service to avoid duplicate indexer queries from concurrent operations.
-func NewScheduler(cfg *config.Config, db *database.DB, searcher *Searcher, tc *tmdb.Client, plexClient *plex.Client, log *slog.Logger) *Scheduler {
+// NewScheduler creates a scheduler that shares the Service's searcher, DB,
+// and plex client.
+func NewScheduler(svc *Service, tc *tmdb.Client) *Scheduler {
 	return &Scheduler{
-		cfg:      cfg,
-		db:       db,
-		log:      log,
-		searcher: searcher,
-		tmdb:     tc,
-		plex:     plexClient,
-		stop:     make(chan struct{}),
+		svc:  svc,
+		tmdb: tc,
+		stop: make(chan struct{}),
 	}
 }
 
@@ -56,7 +44,7 @@ func (s *Scheduler) Stop() {
 // Runs immediately on startup, then ticks every 2 minutes. Each tick searches
 // up to 5 episodes that are "due" based on how recently they aired.
 func (s *Scheduler) episodeSearchLoop(ctx context.Context) {
-	s.log.Info("episode search: starting initial run")
+	s.svc.log.Info("episode search: starting initial run")
 	s.runEpisodeSearch()
 
 	ticker := time.NewTicker(2 * time.Minute)
@@ -77,18 +65,18 @@ func (s *Scheduler) episodeSearchLoop(ctx context.Context) {
 // runEpisodeSearch queries due episodes and searches indexers for each.
 func (s *Scheduler) runEpisodeSearch() {
 	// Clear Plex episode cache so fresh data is fetched each cycle.
-	if s.plex != nil {
-		s.plex.ClearEpisodeCache()
+	if s.svc.plex != nil {
+		s.svc.plex.ClearEpisodeCache()
 	}
 
-	episodes, err := s.db.SearchableEpisodes(5)
+	episodes, err := s.svc.db.SearchableEpisodes(5)
 	if err != nil {
-		s.log.Error("episode search: query failed", "error", err)
+		s.svc.log.Error("episode search: query failed", "error", err)
 		return
 	}
 
 	if len(episodes) == 0 {
-		s.log.Debug("episode search: no episodes due")
+		s.svc.log.Debug("episode search: no episodes due")
 		return
 	}
 
@@ -99,9 +87,9 @@ func (s *Scheduler) runEpisodeSearch() {
 			tvdbID = int(ep.TvdbID.Int64)
 		}
 
-		ok, err := s.searcher.SearchAndGrabEpisode(&ep, tvdbID)
+		ok, err := s.svc.SearchAndGrabEpisode(&ep, tvdbID)
 		if err != nil {
-			s.log.Error("episode search: search failed",
+			s.svc.log.Error("episode search: search failed",
 				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
 		}
 		if ok {
@@ -109,17 +97,17 @@ func (s *Scheduler) runEpisodeSearch() {
 		}
 
 		// Always update searched_at regardless of result.
-		if err := s.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
-			s.log.Error("episode search: update searched_at failed", "episode_id", ep.ID, "error", err)
+		if err := s.svc.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
+			s.svc.log.Error("episode search: update searched_at failed", "episode_id", ep.ID, "error", err)
 		}
 	}
 
-	s.log.Info("episode search: cycle complete", "checked", len(episodes), "grabbed", grabbed)
+	s.svc.log.Info("episode search: cycle complete", "checked", len(episodes), "grabbed", grabbed)
 }
 
 // searchLoop runs periodic search sweeps for wanted movies.
 func (s *Scheduler) searchLoop(ctx context.Context) {
-	s.log.Info("movie search sweep: running initial cycle")
+	s.svc.log.Info("movie search sweep: running initial cycle")
 	s.runMovieSearchSweep()
 
 	// Repeat every 6 hours.
@@ -133,7 +121,7 @@ func (s *Scheduler) searchLoop(ctx context.Context) {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			s.log.Info("movie search sweep: running scheduled cycle")
+			s.svc.log.Info("movie search sweep: running scheduled cycle")
 			s.runMovieSearchSweep()
 		}
 	}
@@ -142,18 +130,18 @@ func (s *Scheduler) searchLoop(ctx context.Context) {
 // runMovieSearchSweep searches indexers for all wanted movies.
 func (s *Scheduler) runMovieSearchSweep() {
 	// Clear Plex episode cache so fresh data is fetched each sweep.
-	if s.plex != nil {
-		s.plex.ClearEpisodeCache()
+	if s.svc.plex != nil {
+		s.svc.plex.ClearEpisodeCache()
 	}
-	if err := s.searcher.SearchWantedMovies(); err != nil {
-		s.log.Error("movie search sweep: failed", "error", err)
+	if err := s.svc.SearchWantedMovies(); err != nil {
+		s.svc.log.Error("movie search sweep: failed", "error", err)
 	}
 }
 
 // refreshLoop periodically re-fetches episode metadata from TMDB for all monitored series.
 func (s *Scheduler) refreshLoop(ctx context.Context) {
 	if s.tmdb == nil {
-		s.log.Warn("tmdb refresh: disabled (no TMDB client)")
+		s.svc.log.Warn("tmdb refresh: disabled (no TMDB client)")
 		return
 	}
 
@@ -166,9 +154,9 @@ func (s *Scheduler) refreshLoop(ctx context.Context) {
 	case <-time.After(5 * time.Minute):
 	}
 
-	s.log.Info("tmdb refresh: running initial cycle")
+	s.svc.log.Info("tmdb refresh: running initial cycle")
 	result := s.RefreshAllSeries()
-	s.log.Info("tmdb refresh: initial cycle complete",
+	s.svc.log.Info("tmdb refresh: initial cycle complete",
 		"checked", result.Checked, "new_episodes", result.NewEpisodes, "ended", result.Ended)
 
 	ticker := time.NewTicker(12 * time.Hour)
@@ -181,9 +169,9 @@ func (s *Scheduler) refreshLoop(ctx context.Context) {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			s.log.Info("tmdb refresh: running scheduled cycle")
+			s.svc.log.Info("tmdb refresh: running scheduled cycle")
 			result := s.RefreshAllSeries()
-			s.log.Info("tmdb refresh: scheduled cycle complete",
+			s.svc.log.Info("tmdb refresh: scheduled cycle complete",
 				"checked", result.Checked, "new_episodes", result.NewEpisodes, "ended", result.Ended)
 		}
 	}
@@ -205,9 +193,9 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 		return result
 	}
 
-	allSeries, err := s.db.ListSeries()
+	allSeries, err := s.svc.db.ListSeries()
 	if err != nil {
-		s.log.Error("tmdb refresh: list series", "error", err)
+		s.svc.log.Error("tmdb refresh: list series", "error", err)
 		return result
 	}
 
@@ -220,16 +208,16 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 		// Fetch all episodes from TMDB and upsert (new ones become "wanted").
 		episodes, err := s.tmdb.GetAllEpisodes(series.TmdbID)
 		if err != nil {
-			s.log.Error("tmdb refresh: fetch episodes", "series", series.Title, "error", err)
+			s.svc.log.Error("tmdb refresh: fetch episodes", "series", series.Title, "error", err)
 			continue
 		}
 
 		newCount := 0
 		for _, ep := range episodes {
 			// UpsertEpisode uses INSERT OR IGNORE, so existing episodes are skipped.
-			err := s.db.UpsertEpisode(series.ID, ep.Season, ep.Episode, ep.Title, ep.AirDate)
+			err := s.svc.db.UpsertEpisode(series.ID, ep.Season, ep.Episode, ep.Title, ep.AirDate)
 			if err != nil {
-				s.log.Error("tmdb refresh: upsert episode", "series", series.Title,
+				s.svc.log.Error("tmdb refresh: upsert episode", "series", series.Title,
 					"season", ep.Season, "episode", ep.Episode, "error", err)
 			}
 		}
@@ -243,24 +231,24 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 		// Check series status on TMDB.
 		tmdbSeries, err := s.tmdb.GetSeries(series.TmdbID)
 		if err != nil {
-			s.log.Error("tmdb refresh: get series status", "series", series.Title, "error", err)
+			s.svc.log.Error("tmdb refresh: get series status", "series", series.Title, "error", err)
 		} else {
 			udlStatus := tmdb.MapStatus(tmdbSeries.Status)
 			if udlStatus == "ended" && series.Status != "ended" {
-				if err := s.db.UpdateSeriesStatus(series.ID, "ended"); err != nil {
-					s.log.Error("tmdb refresh: update status", "series", series.Title, "error", err)
+				if err := s.svc.db.UpdateSeriesStatus(series.ID, "ended"); err != nil {
+					s.svc.log.Error("tmdb refresh: update status", "series", series.Title, "error", err)
 				} else {
-					s.log.Info("tmdb refresh: series ended", "series", series.Title, "tmdb_status", tmdbSeries.Status)
+					s.svc.log.Info("tmdb refresh: series ended", "series", series.Title, "tmdb_status", tmdbSeries.Status)
 					result.Ended++
 				}
 			}
 		}
 
-		if err := s.db.UpdateSeriesRefreshedAt(series.ID); err != nil {
-			s.log.Error("tmdb refresh: update refreshed_at", "series", series.Title, "error", err)
+		if err := s.svc.db.UpdateSeriesRefreshedAt(series.ID); err != nil {
+			s.svc.log.Error("tmdb refresh: update refreshed_at", "series", series.Title, "error", err)
 		}
 
-		s.log.Info("tmdb refresh: checked series", "series", series.Title, "tmdb_episodes", len(episodes))
+		s.svc.log.Info("tmdb refresh: checked series", "series", series.Title, "tmdb_episodes", len(episodes))
 
 		// Rate limit to avoid TMDB API throttling.
 		time.Sleep(250 * time.Millisecond)
@@ -268,4 +256,3 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 
 	return result
 }
-

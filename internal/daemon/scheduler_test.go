@@ -49,12 +49,10 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
+	svc := &Service{cfg: cfg, db: db, log: log}
 	return &Scheduler{
-		cfg:      cfg,
-		db:       db,
-		log:      log,
-		searcher: NewSearcher(cfg, db, nil, nil, log),
-		stop:     make(chan struct{}),
+		svc:  svc,
+		stop: make(chan struct{}),
 	}
 }
 
@@ -63,7 +61,7 @@ func newTestScheduler(t *testing.T) *Scheduler {
 func TestSearchableEpisodes_NeverSearched(t *testing.T) {
 	s := newTestScheduler(t)
 
-	episodes, err := s.db.SearchableEpisodes(10)
+	episodes, err := s.svc.db.SearchableEpisodes(10)
 	if err != nil {
 		t.Fatalf("SearchableEpisodes: %v", err)
 	}
@@ -87,15 +85,15 @@ func TestSearchableEpisodes_RecentlySearched(t *testing.T) {
 	s := newTestScheduler(t)
 
 	// Mark all episodes as recently searched.
-	episodes, _ := s.db.SearchableEpisodes(10)
+	episodes, _ := s.svc.db.SearchableEpisodes(10)
 	for _, ep := range episodes {
-		if err := s.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
+		if err := s.svc.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
 			t.Fatalf("UpdateEpisodeSearchedAt: %v", err)
 		}
 	}
 
 	// Now none should be returned (all aired 31+ days ago → 24h interval, just searched now).
-	episodes, err := s.db.SearchableEpisodes(10)
+	episodes, err := s.svc.db.SearchableEpisodes(10)
 	if err != nil {
 		t.Fatalf("SearchableEpisodes: %v", err)
 	}
@@ -108,7 +106,7 @@ func TestSearchableEpisodes_RecentlySearched(t *testing.T) {
 func TestSearchableEpisodes_Limit(t *testing.T) {
 	s := newTestScheduler(t)
 
-	episodes, err := s.db.SearchableEpisodes(2)
+	episodes, err := s.svc.db.SearchableEpisodes(2)
 	if err != nil {
 		t.Fatalf("SearchableEpisodes: %v", err)
 	}
@@ -154,7 +152,7 @@ func TestSearchableEpisodes_FutureEpisode(t *testing.T) {
 func TestSearchableEpisodes_OrderByAirDateDesc(t *testing.T) {
 	s := newTestScheduler(t)
 
-	episodes, err := s.db.SearchableEpisodes(10)
+	episodes, err := s.svc.db.SearchableEpisodes(10)
 	if err != nil {
 		t.Fatalf("SearchableEpisodes: %v", err)
 	}

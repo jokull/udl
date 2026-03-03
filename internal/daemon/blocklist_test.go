@@ -155,7 +155,7 @@ func TestGrabBest_SkipsBlocklisted(t *testing.T) {
 	defer nzbServer.Close()
 
 	log := quietLogger()
-	searcher := NewSearcher(cfg, db, nil, nil, log)
+	svc := &Service{cfg: cfg, db: db, log: log}
 
 	// Two releases: high-score (blocklisted) and lower-score (not blocklisted).
 	releases := []ScoredRelease{
@@ -176,7 +176,7 @@ func TestGrabBest_SkipsBlocklisted(t *testing.T) {
 	// Blocklist the high-score release.
 	db.AddBlocklist("movie", movieID, "Test.Movie.2024.Bluray-1080p-GROUP1", "PAR2 failed")
 
-	grabbed, err := searcher.GrabBest(releases, GrabContext{
+	grabbed, err := svc.GrabBest(releases, GrabContext{
 		Category: "movie",
 		MediaID:  movieID,
 		Title:    "Test Movie",
@@ -217,7 +217,7 @@ func TestGrabBest_AllBlocklisted(t *testing.T) {
 		},
 	}
 	log := quietLogger()
-	searcher := NewSearcher(cfg, db, nil, nil, log)
+	svc := &Service{cfg: cfg, db: db, log: log}
 
 	releases := []ScoredRelease{
 		{
@@ -231,7 +231,7 @@ func TestGrabBest_AllBlocklisted(t *testing.T) {
 	// Blocklist the only release.
 	db.AddBlocklist("movie", movieID, "Test.Movie.2024.WEBDL-1080p-GROUP1", "corrupt")
 
-	grabbed, err := searcher.GrabBest(releases, GrabContext{
+	grabbed, err := svc.GrabBest(releases, GrabContext{
 		Category: "movie",
 		MediaID:  movieID,
 		Title:    "Test Movie",

@@ -24,21 +24,7 @@ var templateFS embed.FS
 //go:embed static/*
 var staticFS embed.FS
 
-// ServiceInterface defines the methods the web server calls on the daemon Service.
-// This avoids importing the daemon package (which would create a cycle).
-type ServiceInterface interface {
-	StatusData() (*StatusData, error)
-	QueueData() ([]database.Download, error)
-	AllDownloadsData(limit int) ([]database.Download, error)
-	MovieList() ([]database.Movie, error)
-	SeriesList() ([]database.Series, error)
-	EpisodesForSeries(seriesID int64) ([]database.Episode, error)
-	UpcomingEpisodes(days int) ([]database.Episode, error)
-	HistoryList(limit int) ([]database.History, error)
-	RetryDownload(id int64) error
-}
-
-// StatusData mirrors daemon.StatusReply for the web layer.
+// StatusData holds dashboard status information.
 type StatusData struct {
 	Running       bool
 	QueueSize     int
@@ -52,26 +38,35 @@ type StatusData struct {
 	BlockedCount  int
 }
 
+// StatusFunc returns dashboard status data.
+type StatusFunc func() (*StatusData, error)
+
+// RetryFunc retries a failed download by ID.
+type RetryFunc func(id int64) error
+
 // Server is the embedded HTTP server.
 type Server struct {
-	svc      ServiceInterface
-	cfg      *config.Config
 	db       *database.DB
+	cfg      *config.Config
 	log      *slog.Logger
+	status   StatusFunc
+	retry    RetryFunc
 	mux      *http.ServeMux
 	pages    map[string]*template.Template // per-page templates (layout + page)
 	partials *template.Template            // shared partials (no layout)
 	server   *http.Server
 }
 
-// New creates a new web server.
-func New(svc ServiceInterface, cfg *config.Config, db *database.DB, log *slog.Logger) (*Server, error) {
+// New creates a new web server. statusFn and retryFn provide the callbacks
+// that require daemon logic beyond simple DB reads.
+func New(db *database.DB, cfg *config.Config, log *slog.Logger, statusFn StatusFunc, retryFn RetryFunc) (*Server, error) {
 	s := &Server{
-		svc: svc,
-		cfg: cfg,
-		db:  db,
-		log: log,
-		mux: http.NewServeMux(),
+		db:     db,
+		cfg:    cfg,
+		log:    log,
+		status: statusFn,
+		retry:  retryFn,
+		mux:    http.NewServeMux(),
 	}
 
 	if err := s.loadTemplates(); err != nil {

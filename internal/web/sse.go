@@ -35,18 +35,11 @@ func (s *Server) handleSSEQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) sendQueueSSE(w http.ResponseWriter, flusher http.Flusher) {
-	downloads, err := s.svc.QueueData()
+	downloads, err := s.db.PendingDownloads()
 	if err != nil {
 		s.log.Error("web: sse queue", "error", err)
 		return
 	}
-
-	var buf bytes.Buffer
-	data := struct {
-		Downloads []interface{ GetTitle() string }
-		Queue     interface{}
-	}{}
-	_ = data
 
 	// Render the queue rows partial
 	var htmlBuf bytes.Buffer
@@ -57,6 +50,7 @@ func (s *Server) sendQueueSSE(w http.ResponseWriter, flusher http.Flusher) {
 	}
 
 	// Write SSE format: each line of data prefixed with "data: "
+	var buf bytes.Buffer
 	buf.WriteString("event: queue\n")
 	for _, line := range bytes.Split(htmlBuf.Bytes(), []byte("\n")) {
 		fmt.Fprintf(&buf, "data: %s\n", line)

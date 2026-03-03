@@ -8,18 +8,18 @@ import (
 )
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	status, err := s.svc.StatusData()
+	status, err := s.status()
 	if err != nil {
 		s.log.Error("web: dashboard status", "error", err)
 		status = &StatusData{Running: true}
 	}
 
-	queue, err := s.svc.QueueData()
+	queue, err := s.db.PendingDownloads()
 	if err != nil {
 		s.log.Error("web: dashboard queue", "error", err)
 	}
 
-	history, err := s.svc.HistoryList(5)
+	history, err := s.db.ListHistory(5)
 	if err != nil {
 		s.log.Error("web: dashboard history", "error", err)
 	}
@@ -42,7 +42,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleMovies(w http.ResponseWriter, r *http.Request) {
 	filter := r.URL.Query().Get("status")
 
-	movies, err := s.svc.MovieList()
+	movies, err := s.db.ListMovies()
 	if err != nil {
 		s.serverError(w, "load movies", err)
 		return
@@ -73,7 +73,7 @@ func (s *Server) handleMovies(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
-	series, err := s.svc.SeriesList()
+	series, err := s.db.ListSeries()
 	if err != nil {
 		s.serverError(w, "load series", err)
 		return
@@ -98,7 +98,7 @@ func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	episodes, err := s.svc.EpisodesForSeries(id)
+	episodes, err := s.db.EpisodesForSeries(id)
 	if err != nil {
 		s.serverError(w, "load episodes", err)
 		return
@@ -148,7 +148,7 @@ func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
-	downloads, err := s.svc.AllDownloadsData(100)
+	downloads, err := s.db.AllDownloads(100)
 	if err != nil {
 		s.serverError(w, "load queue", err)
 		return
@@ -182,7 +182,7 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
-	episodes, err := s.svc.UpcomingEpisodes(30)
+	episodes, err := s.db.UpcomingEpisodes(30)
 	if err != nil {
 		s.serverError(w, "load schedule", err)
 		return
@@ -226,7 +226,7 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	events, err := s.svc.HistoryList(50)
+	events, err := s.db.ListHistory(50)
 	if err != nil {
 		s.serverError(w, "load history", err)
 		return
@@ -251,7 +251,7 @@ func (s *Server) handleRetryDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.svc.RetryDownload(id); err != nil {
+	if err := s.retry(id); err != nil {
 		s.log.Error("web: retry download", "id", id, "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

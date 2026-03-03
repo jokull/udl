@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/jokull/udl/internal/quality"
@@ -20,7 +19,6 @@ type Config struct {
 	Indexers []Indexer        `toml:"indexers"`
 	TMDB     TMDBConfig       `toml:"tmdb"`
 	Plex     PlexConfig       `toml:"plex"`
-	Daemon   Daemon           `toml:"daemon"`
 	Web      WebConfig        `toml:"web"`
 	Prefs    quality.Prefs    `toml:"-"` // populated after parsing from Quality strings
 }
@@ -86,12 +84,6 @@ type Indexer struct {
 	APIKey string `toml:"apikey"`
 }
 
-// Daemon holds daemon runtime settings.
-type Daemon struct {
-	RSSIntervalRaw string        `toml:"rss_interval"`
-	RSSInterval    time.Duration `toml:"-"` // parsed from RSSIntervalRaw
-}
-
 // WebConfig holds optional web interface settings.
 // The HTTP server only starts when Port > 0.
 type WebConfig struct {
@@ -102,7 +94,6 @@ type WebConfig struct {
 const (
 	defaultConfigDir  = ".config/udl"
 	defaultConfigFile = "config.toml"
-	defaultRSSInterval = 15 * time.Minute
 )
 
 // DataDir returns the directory where UDL stores its database and socket.
@@ -131,7 +122,7 @@ func Path() (string, error) {
 
 // Load reads and parses the TOML configuration file. It resolves the file
 // path using Path(), decodes it, applies defaults, and populates computed
-// fields such as quality.Prefs and Daemon.RSSInterval.
+// fields such as quality.Prefs.
 func Load() (*Config, error) {
 	p, err := Path()
 	if err != nil {
@@ -183,17 +174,6 @@ func LoadFrom(path string) (*Config, error) {
 	// Default web bind address.
 	if cfg.Web.Bind == "" {
 		cfg.Web.Bind = "127.0.0.1"
-	}
-
-	// Parse RSS interval with a default.
-	if cfg.Daemon.RSSIntervalRaw == "" {
-		cfg.Daemon.RSSInterval = defaultRSSInterval
-	} else {
-		d, err := time.ParseDuration(cfg.Daemon.RSSIntervalRaw)
-		if err != nil {
-			return nil, fmt.Errorf("config: invalid rss_interval %q: %w", cfg.Daemon.RSSIntervalRaw, err)
-		}
-		cfg.Daemon.RSSInterval = d
 	}
 
 	return &cfg, nil

@@ -219,13 +219,19 @@ func (db *DB) WantedMovies() ([]Movie, error) {
 	return movies, rows.Err()
 }
 
-// UpdateMovieStatus updates the status, quality, and file_path of a movie.
-func (db *DB) UpdateMovieStatus(id int64, status, quality, filePath string) error {
+// UpdateMediaStatus updates the status, quality, and file_path of a media item.
+// table must be "movies" or "episodes".
+func (db *DB) UpdateMediaStatus(table string, id int64, status, quality, filePath string) error {
 	_, err := db.Exec(
-		`UPDATE movies SET status = ?, quality = ?, file_path = ? WHERE id = ?`,
+		fmt.Sprintf(`UPDATE %s SET status = ?, quality = ?, file_path = ? WHERE id = ?`, table),
 		status, nullString(quality), nullString(filePath), id,
 	)
 	return err
+}
+
+// UpdateMovieStatus updates the status, quality, and file_path of a movie.
+func (db *DB) UpdateMovieStatus(id int64, status, quality, filePath string) error {
+	return db.UpdateMediaStatus("movies", id, status, quality, filePath)
 }
 
 // ---------------------------------------------------------------------------
@@ -485,11 +491,7 @@ func (db *DB) UpdateEpisodeSearchedAt(id int64) error {
 
 // UpdateEpisodeStatus updates the status, quality, and file_path of an episode.
 func (db *DB) UpdateEpisodeStatus(id int64, status, quality, filePath string) error {
-	_, err := db.Exec(
-		`UPDATE episodes SET status = ?, quality = ?, file_path = ? WHERE id = ?`,
-		status, nullString(quality), nullString(filePath), id,
-	)
-	return err
+	return db.UpdateMediaStatus("episodes", id, status, quality, filePath)
 }
 
 // ---------------------------------------------------------------------------
@@ -513,11 +515,13 @@ func (db *DB) AddDownloadWithSource(dlURL, name, title, category string, mediaID
 	return res.LastInsertId()
 }
 
-// PendingDownloads returns downloads that are queued or currently downloading.
+// PendingDownloads returns downloads that need processing: post_processing first
+// (closest to completion), then downloading, then queued.
 func (db *DB) PendingDownloads() ([]Download, error) {
 	rows, err := db.Query(
 		`SELECT id, nzb_url, nzb_name, title, category, media_id, status, progress, size_bytes, downloaded_bytes, error_msg, started_at, completed_at, created_at, source
-		 FROM downloads WHERE status IN ('queued', 'downloading') ORDER BY created_at ASC`,
+		 FROM downloads WHERE status IN ('queued', 'downloading', 'post_processing')
+		 ORDER BY CASE status WHEN 'post_processing' THEN 0 WHEN 'downloading' THEN 1 WHEN 'queued' THEN 2 END, created_at ASC`,
 	)
 	if err != nil {
 		return nil, err
@@ -542,7 +546,7 @@ func (db *DB) PendingDownloads() ([]Download, error) {
 func (db *DB) HasActiveDownload(category string, mediaID int64) (bool, error) {
 	var count int
 	err := db.QueryRow(
-		`SELECT COUNT(*) FROM downloads WHERE category = ? AND media_id = ? AND status IN ('queued', 'downloading')`,
+		`SELECT COUNT(*) FROM downloads WHERE category = ? AND media_id = ? AND status IN ('queued', 'downloading', 'post_processing')`,
 		category, mediaID,
 	).Scan(&count)
 	if err != nil {
@@ -561,7 +565,7 @@ func (db *DB) AddDownloadIfNoActive(dlURL, name, title, category string, mediaID
 	err := db.WithTx(func(tx *sql.Tx) error {
 		var count int
 		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM downloads WHERE category = ? AND media_id = ? AND status IN ('queued', 'downloading')`,
+			`SELECT COUNT(*) FROM downloads WHERE category = ? AND media_id = ? AND status IN ('queued', 'downloading', 'post_processing')`,
 			category, mediaID,
 		).Scan(&count); err != nil {
 			return err
@@ -620,10 +624,10 @@ func (db *DB) UpdateDownloadProgress(id int64, progress float64, downloadedBytes
 	return err
 }
 
-// ClearDownloadQueue marks all queued/downloading entries as failed.
+// ClearDownloadQueue marks all queued/downloading/post_processing entries as failed.
 func (db *DB) ClearDownloadQueue() (int64, error) {
 	res, err := db.Exec(
-		`UPDATE downloads SET status = 'failed', error_msg = 'cleared by user' WHERE status IN ('queued', 'downloading')`,
+		`UPDATE downloads SET status = 'failed', error_msg = 'cleared by user' WHERE status IN ('queued', 'downloading', 'post_processing')`,
 	)
 	if err != nil {
 		return 0, err
@@ -881,12 +885,12 @@ func (db *DB) FindSeriesByTitle(title string) (*Series, error) {
 // Queue statistics
 // ---------------------------------------------------------------------------
 
-// QueueStats returns the number of queued and downloading items.
+// QueueStats returns the number of queued and active (downloading + post_processing) items.
 func (db *DB) QueueStats() (queued, downloading int, err error) {
 	err = db.QueryRow(
 		`SELECT COALESCE(SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END), 0),
-		        COALESCE(SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END), 0)
-		 FROM downloads WHERE status IN ('queued', 'downloading')`,
+		        COALESCE(SUM(CASE WHEN status IN ('downloading', 'post_processing') THEN 1 ELSE 0 END), 0)
+		 FROM downloads WHERE status IN ('queued', 'downloading', 'post_processing')`,
 	).Scan(&queued, &downloading)
 	return
 }

@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"fmt"
-	"log/slog"
 	"net/mail"
 	"regexp"
 	"sort"
@@ -19,20 +18,6 @@ import (
 	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/quality"
 )
-
-// Searcher searches indexers and enqueues the best matching releases.
-type Searcher struct {
-	cfg      *config.Config
-	db       *database.DB
-	indexers []*newznab.Client
-	plex     *plex.Client // nil if Plex integration is disabled
-	log      *slog.Logger
-}
-
-// NewSearcher creates a Searcher.
-func NewSearcher(cfg *config.Config, db *database.DB, indexers []*newznab.Client, plexClient *plex.Client, log *slog.Logger) *Searcher {
-	return &Searcher{cfg: cfg, db: db, indexers: indexers, plex: plexClient, log: log}
-}
 
 // GrabContext provides metadata needed for both quality selection and Plex
 // availability checks.
@@ -62,7 +47,7 @@ type ScoredRelease struct {
 // expectedTitle is used to filter out mismatched results from indexers.
 // expectedYear (if > 0) rejects releases whose parsed year doesn't match.
 // Returns scored results sorted best-first.
-func (s *Searcher) SearchMovieReleases(imdbID, expectedTitle string, expectedYear int) ([]ScoredRelease, error) {
+func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear int) ([]ScoredRelease, error) {
 	var all []ScoredRelease
 	for _, client := range s.indexers {
 		releases, err := client.SearchMovie(imdbID)
@@ -121,7 +106,7 @@ func (s *Searcher) SearchMovieReleases(imdbID, expectedTitle string, expectedYea
 
 // SearchEpisodeReleases queries all indexers for a TV episode by TVDB ID.
 // Returns scored results sorted best-first.
-func (s *Searcher) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredRelease, error) {
+func (s *Service) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredRelease, error) {
 	var all []ScoredRelease
 	for _, client := range s.indexers {
 		releases, err := client.SearchTV(tvdbID, season, episode)
@@ -229,7 +214,7 @@ func releaseAge(pubDate string) int {
 
 // GrabBest picks the best acceptable release and enqueues it for download.
 // Returns true if a release was grabbed.
-func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, error) {
+func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, error) {
 	rejCount := 0
 	grabbed := false
 
@@ -325,7 +310,7 @@ func (s *Searcher) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, er
 // grabFromPlex checks Plex friends for the media and enqueues an HTTP download
 // from their server instead of going through Usenet. Returns true if a Plex
 // download was enqueued.
-func (s *Searcher) grabFromPlex(ctx GrabContext) (bool, error) {
+func (s *Service) grabFromPlex(ctx GrabContext) (bool, error) {
 	var match *plex.MediaMatch
 	var err error
 
@@ -375,7 +360,7 @@ func (s *Searcher) grabFromPlex(ctx GrabContext) (bool, error) {
 }
 
 // SearchAndGrabMovie searches indexers for a movie and grabs the best result.
-func (s *Searcher) SearchAndGrabMovie(movie *database.Movie) (bool, error) {
+func (s *Service) SearchAndGrabMovie(movie *database.Movie) (bool, error) {
 	imdbID := ""
 	if movie.ImdbID.Valid {
 		imdbID = movie.ImdbID.String
@@ -406,7 +391,7 @@ func (s *Searcher) SearchAndGrabMovie(movie *database.Movie) (bool, error) {
 }
 
 // SearchAndGrabEpisode searches indexers for an episode and grabs the best result.
-func (s *Searcher) SearchAndGrabEpisode(ep *database.Episode, tvdbID int) (bool, error) {
+func (s *Service) SearchAndGrabEpisode(ep *database.Episode, tvdbID int) (bool, error) {
 	if tvdbID == 0 {
 		s.log.Warn("series has no TVDB ID, skipping episode search",
 			"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode)
@@ -433,7 +418,7 @@ func (s *Searcher) SearchAndGrabEpisode(ep *database.Episode, tvdbID int) (bool,
 }
 
 // SearchWantedMovies searches indexers for all wanted movies.
-func (s *Searcher) SearchWantedMovies() error {
+func (s *Service) SearchWantedMovies() error {
 	movies, err := s.db.WantedMovies()
 	if err != nil {
 		return fmt.Errorf("wanted movies: %w", err)

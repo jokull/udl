@@ -27,8 +27,8 @@ type Service struct {
 	cfg      *config.Config
 	db       *database.DB
 	tmdb     *tmdb.Client
-	plex     *plex.Client // nil if Plex integration is disabled
-	searcher *Searcher
+	plex     *plex.Client          // nil if Plex integration is disabled
+	indexers []*newznab.Client
 	dl       *Downloader // nil until downloader starts; used for health checks
 	log      *slog.Logger
 }
@@ -231,13 +231,13 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 	s.log.Info("added movie", "title", movie.Title, "year", movie.Year, "tmdb_id", movie.TMDBID)
 
 	// Immediately search indexers for this movie.
-	if s.searcher != nil {
+	if len(s.indexers) > 0 {
 		dbMovie, err := s.db.GetMovie(id)
 		if err != nil {
 			s.log.Error("get movie for search", "id", id, "error", err)
 			return nil
 		}
-		grabbed, err := s.searcher.SearchAndGrabMovie(dbMovie)
+		grabbed, err := s.SearchAndGrabMovie(dbMovie)
 		if err != nil {
 			s.log.Error("search-on-add failed", "title", movie.Title, "error", err)
 		}
@@ -262,7 +262,7 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	if s.tmdb == nil {
 		return fmt.Errorf("SearchMovie: TMDB client not configured")
 	}
-	if s.searcher == nil {
+	if len(s.indexers) == 0 {
 		return fmt.Errorf("SearchMovie: searcher not configured")
 	}
 
@@ -282,7 +282,7 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 		return fmt.Errorf("SearchMovie: no IMDB ID for %q", movie.Title)
 	}
 
-	releases, err := s.searcher.SearchMovieReleases(movie.IMDBID, movie.Title, movie.Year)
+	releases, err := s.SearchMovieReleases(movie.IMDBID, movie.Title, movie.Year)
 	if err != nil {
 		return fmt.Errorf("SearchMovie: %w", err)
 	}
@@ -296,7 +296,7 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 	if s.tmdb == nil {
 		return fmt.Errorf("GrabMovieRelease: TMDB client not configured")
 	}
-	if s.searcher == nil {
+	if len(s.indexers) == 0 {
 		return fmt.Errorf("GrabMovieRelease: searcher not configured")
 	}
 	if args.Index < 1 {
@@ -320,7 +320,7 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 	}
 
 	// Search indexers.
-	releases, err := s.searcher.SearchMovieReleases(movie.IMDBID, movie.Title, movie.Year)
+	releases, err := s.SearchMovieReleases(movie.IMDBID, movie.Title, movie.Year)
 	if err != nil {
 		return fmt.Errorf("GrabMovieRelease: %w", err)
 	}
@@ -440,7 +440,7 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 		"tmdb_id", series.TMDBID, "tvdb_id", series.TVDBID)
 
 	// Search indexers for already-aired wanted episodes.
-	if s.searcher != nil && series.TVDBID != 0 {
+	if len(s.indexers) > 0 && series.TVDBID != 0 {
 		wanted, err := s.db.WantedEpisodes()
 		if err != nil {
 			s.log.Error("get wanted episodes for search-on-add", "error", err)
@@ -451,7 +451,7 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 			if ep.SeriesID != id {
 				continue
 			}
-			grabbed, err := s.searcher.SearchAndGrabEpisode(ep, series.TVDBID)
+			grabbed, err := s.SearchAndGrabEpisode(ep, series.TVDBID)
 			if err != nil {
 				s.log.Error("search episode on add", "series", series.Title,
 					"season", ep.Season, "episode", ep.Episode, "error", err)
@@ -608,7 +608,7 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 			return fmt.Errorf("RetryDownload: download %d not found or not failed", args.ID)
 		}
 		s.db.Exec(`DELETE FROM downloads WHERE id = ? AND status = 'failed'`, args.ID)
-		if s.searcher != nil {
+		if len(s.indexers) > 0 {
 			s.retryMedia(dl.Category, dl.MediaID)
 		}
 		reply.Count = 1
@@ -643,7 +643,7 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 		}
 		reply.Count, _ = res.RowsAffected()
 
-		if s.searcher != nil {
+		if len(s.indexers) > 0 {
 			for _, k := range keys {
 				s.retryMedia(k.category, k.mediaID)
 			}
@@ -659,7 +659,7 @@ func (s *Service) retryMedia(category string, mediaID int64) {
 	case "movie":
 		movie, err := s.db.GetMovie(mediaID)
 		if err == nil && movie != nil && movie.Status == "wanted" {
-			if _, err := s.searcher.SearchAndGrabMovie(movie); err != nil {
+			if _, err := s.SearchAndGrabMovie(movie); err != nil {
 				s.log.Error("retry: search movie failed", "title", movie.Title, "error", err)
 			}
 		}
@@ -672,7 +672,7 @@ func (s *Service) retryMedia(category string, mediaID int64) {
 				if series.TvdbID.Valid {
 					tvdbID = int(series.TvdbID.Int64)
 				}
-				if _, err := s.searcher.SearchAndGrabEpisode(ep, tvdbID); err != nil {
+				if _, err := s.SearchAndGrabEpisode(ep, tvdbID); err != nil {
 					s.log.Error("retry: search episode failed",
 						"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
 				}
@@ -1175,9 +1175,8 @@ func (s *Service) RefreshSeries(args *Empty, reply *RefreshSeriesReply) error {
 
 	// Build a temporary scheduler with the TMDB client to reuse RefreshAllSeries.
 	sched := &Scheduler{
-		db:   s.db,
+		svc:  s,
 		tmdb: s.tmdb,
-		log:  s.log,
 	}
 	result := sched.RefreshAllSeries()
 	reply.Checked = result.Checked
@@ -1242,15 +1241,13 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 		}
 	}
 
-	searcher := NewSearcher(cfg, db, indexers, plexClient, log)
-
 	log.Info("daemon listening", "socket", sockPath)
 
 	// Start downloader (queue processing) — created before RPC so status can access it.
 	dl := NewDownloader(cfg, db, log)
 
 	// Start RPC server.
-	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, searcher: searcher, dl: dl, log: log}
+	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, indexers: indexers, dl: dl, log: log}
 	server := rpc.NewServer()
 	if err := server.Register(svc); err != nil {
 		ln.Close()
@@ -1261,8 +1258,29 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	// Start web server if configured.
 	var webServer *web.Server
 	if cfg.Web.Port > 0 {
-		adapter := NewWebAdapter(svc)
-		ws, err := web.New(adapter, cfg, db, log)
+		statusFn := func() (*web.StatusData, error) {
+			var reply StatusReply
+			if err := svc.Status(&Empty{}, &reply); err != nil {
+				return nil, err
+			}
+			return &web.StatusData{
+				Running:       reply.Running,
+				QueueSize:     reply.QueueSize,
+				Downloading:   reply.Downloading,
+				IndexerCount:  reply.IndexerCount,
+				MovieCount:    reply.MovieCount,
+				SeriesCount:   reply.SeriesCount,
+				LibraryMovies: reply.LibraryMovies,
+				LibraryTV:     reply.LibraryTV,
+				FailedCount:   reply.FailedCount,
+				BlockedCount:  reply.BlockedCount,
+			}, nil
+		}
+		retryFn := func(id int64) error {
+			var reply RetryDownloadReply
+			return svc.RetryDownload(&RetryDownloadArgs{ID: id}, &reply)
+		}
+		ws, err := web.New(db, cfg, log, statusFn, retryFn)
 		if err != nil {
 			ln.Close()
 			return fmt.Errorf("daemon: create web server: %w", err)
@@ -1276,18 +1294,12 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	}
 
 	// Start scheduler (episode search + movie search sweep + TMDB refresh).
-	// Share the same searcher instance to prevent duplicate indexer queries.
-	sched := NewScheduler(cfg, db, searcher, tc, plexClient, log)
+	sched := NewScheduler(svc, tc)
 	sched.Start(ctx)
 
 	// Check for par2cmdline availability.
 	if !postprocess.HasPar2() {
 		log.Warn("par2cmdline not found -- PAR2 repair unavailable. Install: brew install par2cmdline")
-	}
-
-	// Warn if old rss_interval config is present.
-	if cfg.Daemon.RSSIntervalRaw != "" {
-		log.Warn("rss_interval is deprecated and ignored; episodes are now searched based on air dates")
 	}
 
 	dl.Start(ctx)

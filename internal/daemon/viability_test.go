@@ -213,20 +213,20 @@ func TestReleaseAge(t *testing.T) {
 // GrabBest integration tests
 // --------------------------------------------------------------------------
 
-func testSearcher(t *testing.T, cfg *config.Config) (*Searcher, *database.DB) {
+func testSearcherService(t *testing.T, cfg *config.Config) (*Service, *database.DB) {
 	t.Helper()
 	db, err := database.Open(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	s := NewSearcher(cfg, db, nil, nil, log)
-	return s, db
+	svc := &Service{cfg: cfg, db: db, log: log}
+	return svc, db
 }
 
 func TestGrabBest_SizeRejection(t *testing.T) {
 	cfg := viabilityTestConfig()
-	s, db := testSearcher(t, cfg)
+	s, db := testSearcherService(t, cfg)
 	defer db.Close()
 
 	// Add a movie so the download can be created.
@@ -288,7 +288,7 @@ func TestGrabBest_SizeRejection(t *testing.T) {
 func TestGrabBest_RetentionRejection(t *testing.T) {
 	cfg := viabilityTestConfig()
 	cfg.Usenet.RetentionDays = 100
-	s, db := testSearcher(t, cfg)
+	s, db := testSearcherService(t, cfg)
 	defer db.Close()
 
 	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024)
@@ -352,7 +352,7 @@ func TestGrabBest_RetentionRejection(t *testing.T) {
 
 func TestGrabBest_AlreadyImported(t *testing.T) {
 	cfg := viabilityTestConfig()
-	s, db := testSearcher(t, cfg)
+	s, db := testSearcherService(t, cfg)
 	defer db.Close()
 
 	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024)
