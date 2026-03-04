@@ -101,14 +101,50 @@ func TestExtractFilename(t *testing.T) {
 			want:    "some.show.s01e01.720p.mkv",
 		},
 		{
-			subject: `No quoted filename here yEnc (1/10)`,
-			index:   3,
-			want:    "file_3",
-		},
-		{
 			subject: `"movie.2024.1080p.rar" yEnc (01/99)`,
 			index:   0,
 			want:    "movie.2024.1080p.rar",
+		},
+		// PRiVATE bracket format (common obfuscation)
+		{
+			subject: `[PRiVATE]-[WtFnZb]-[The_Baader_Meinhof_Complex_(2008)_Extended_TV_Cut_(1080p_BluRay_x265_afm72).mkv]-[4/12] - "" yEnc  10830217839 (1/21153)`,
+			index:   3,
+			want:    "The_Baader_Meinhof_Complex_(2008)_Extended_TV_Cut_(1080p_BluRay_x265_afm72).mkv",
+		},
+		{
+			subject: `[PRiVATE]-[WtFnZb]-[par.vol015+016.par2]-[10/12] - "" yEnc  17606228 (1/35)`,
+			index:   9,
+			want:    "par.vol015+016.par2",
+		},
+		// PRiVATE with [N3wZ] prefix
+		{
+			subject: `[N3wZ] \lMeRK4358253\::[PRiVATE]-[WtFnZb]-[Movie.Title.1080p.BluRay.x265.mkv]-[1/7] - "" yEnc  1454715270 (1/2030)`,
+			index:   0,
+			want:    "Movie.Title.1080p.BluRay.x265.mkv",
+		},
+		// Unquoted bracket format
+		{
+			subject: `[02/11] - Some.Show.S01E18.1080p.WEBRip.x265.part1.rar yEnc (1/144)`,
+			index:   1,
+			want:    "Some.Show.S01E18.1080p.WEBRip.x265.part1.rar",
+		},
+		// Truly obfuscated (random hex, no filename) — falls back to file_N
+		{
+			subject: `2c0837e5fa42c8cf7de19e6024be3acc [1/1] - "" yEnc (1/518)`,
+			index:   0,
+			want:    "file_0",
+		},
+		// Empty subject
+		{
+			subject: ``,
+			index:   5,
+			want:    "file_5",
+		},
+		// No quoted filename, no brackets
+		{
+			subject: `No quoted filename here yEnc (1/10)`,
+			index:   3,
+			want:    "file_3",
 		},
 	}
 

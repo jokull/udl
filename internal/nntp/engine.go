@@ -83,18 +83,42 @@ type segmentWork struct {
 }
 
 // filenameRegex extracts a quoted filename from a Usenet subject line.
-var filenameRegex = regexp.MustCompile(`"([^"]+)"`)
+// Standard format: `description "filename.ext" yEnc (part/total)`
+var filenameRegex = regexp.MustCompile(`"([^"]+\.[a-zA-Z0-9]{2,5})"`)
+
+// privateRegex extracts filename from [PRiVATE] bracket format.
+// Format: `[PRiVATE]-[WtFnZb]-[filename.ext]-[N/M] - "" yEnc ...`
+// Also handles [N3wZ] prefix: `[N3wZ] ...::[PRiVATE]-[...]-[filename]-[N/M]`
+var privateRegex = regexp.MustCompile(`\[PRiVATE\]-\[[^\]]+\]-\[([^\]]+\.[a-zA-Z0-9]{2,5})\]-\[\d+/\d+\]`)
+
+// bracketFileRegex extracts filename from generic bracket format.
+// Format: `[NN/MM] - "filename.ext" yEnc` or `[NN/MM] - filename.ext yEnc`
+var bracketFileRegex = regexp.MustCompile(`\[\d+/\d+\]\s*-\s*([^\s"]+\.[a-zA-Z0-9]{2,5})\s+yEnc`)
 
 // extractFilename extracts the filename from an NZB subject line.
-// Falls back to "file_<index>" if no quoted filename is found.
+// Tries multiple patterns used by Usenet posters/obfuscators:
+//  1. Standard quoted: `"filename.ext"`
+//  2. PRiVATE bracket: `[PRiVATE]-[tag]-[filename.ext]-[N/M]`
+//  3. Unquoted bracket: `[N/M] - filename.ext yEnc`
+//
+// Falls back to "file_<index>" if no pattern matches.
 // Sanitizes the result to prevent path traversal.
 func extractFilename(subject string, index int) string {
-	matches := filenameRegex.FindStringSubmatch(subject)
-	if len(matches) >= 2 {
-		// Use filepath.Base to prevent path traversal via crafted subjects
-		// like "../../etc/cron.d/evil".
-		return filepath.Base(matches[1])
+	// 1. Standard quoted filename (most common).
+	if m := filenameRegex.FindStringSubmatch(subject); len(m) >= 2 {
+		return filepath.Base(m[1])
 	}
+
+	// 2. [PRiVATE] bracket format (common obfuscation).
+	if m := privateRegex.FindStringSubmatch(subject); len(m) >= 2 {
+		return filepath.Base(m[1])
+	}
+
+	// 3. Unquoted bracket format.
+	if m := bracketFileRegex.FindStringSubmatch(subject); len(m) >= 2 {
+		return filepath.Base(m[1])
+	}
+
 	return fmt.Sprintf("file_%d", index)
 }
 
