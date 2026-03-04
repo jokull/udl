@@ -19,7 +19,8 @@ go test ./... -count=1         # all tests
 
 # Install to ~/bin and restart LaunchAgent:
 go build -o ~/bin/udl ./cmd/udl
-codesign --force --sign - ~/bin/udl   # required — macOS kills unsigned binaries
+# HUMAN STEP: codesign must be run in a real terminal (Keychain prompt)
+# codesign --force --sign "UDL" ~/bin/udl
 launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist
 launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist
 ```
@@ -53,7 +54,8 @@ internal/
   parser/                 Release title parser (regex: title, year, S/E, quality, group)
   quality/                Quality tier enum (SDTV→Remux-2160p), profiles, ShouldGrab()
   organize/               File renaming + import (hardcoded Plex-compatible naming)
-  postprocess/            PAR2 (shells out to par2cmdline), RAR (rardecode), cleanup
+  par2/                   PAR2 binary parser (FileDesc packets, hash16k matching)
+  postprocess/            PAR2 rename + verify (par2cmdline), RAR (rardecode), cleanup
   tmdb/                   TMDB API wrapper (movies, TV, TVDB/IMDB cross-refs)
   plex/                   Plex friend-server availability check
   migrate/                Sonarr/Radarr import commands
@@ -71,10 +73,26 @@ internal/
 
 - **Binary:** `~/bin/udl`, LaunchAgent `com.udl.daemon.plist`
 - **Library:** `/Users/jokull/Plex/media/{tv,movies}`
-- **Downloads:** `/Volumes/Plex/downloads/`
+- **Downloads:** `/Volumes/Plex/downloads/` (external exFAT volume)
 - **Logs:** `~/Library/Logs/udl.log`
 - **Old Sonarr/Radarr/NZBGet:** unloaded, configs preserved at `~/mediaserver/.config/{radarr,sonarr}/`
 - See [CURRENT-SETUP.md](CURRENT-SETUP.md) for API keys and legacy setup details
+
+## Code Signing & Deploy
+
+The binary accesses `/Volumes/Plex` (removable volume) which requires macOS TCC permission.
+A self-signed "UDL" certificate in the login keychain provides a stable signing identity so
+TCC grants persist across rebuilds (ad-hoc `--sign -` pins to CDHash which changes every build).
+
+**Deploy flow — Claude builds, human signs:**
+1. Claude: `go build -o ~/bin/udl ./cmd/udl`
+2. Claude: `launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist`
+3. **Human runs in terminal:** `codesign --force --sign "UDL" ~/bin/udl`
+4. Claude: `launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist`
+
+The codesign step requires Keychain access to the private key which triggers a macOS dialog —
+this cannot be automated from Claude Code's sandbox without storing the login password in
+plaintext (`security set-key-partition-list`), which we don't do.
 
 ## Conventions
 
