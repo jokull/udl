@@ -93,7 +93,8 @@ func SubtitlePath(mediaPath, lang, subExt string) string {
 var ErrDestExists = fmt.Errorf("organize: destination already exists")
 
 // Import moves a file from src to dst, creating directories as needed.
-// Uses hardlink if same filesystem, otherwise copy+delete.
+// Tries rename first (instant on same filesystem, works on exFAT),
+// then hardlink, then copy+delete as last resort.
 // Returns ErrDestExists if the destination file already exists.
 func Import(src, dst string) error {
 	// Prevent overwriting existing files.
@@ -106,14 +107,18 @@ func Import(src, dst string) error {
 		return fmt.Errorf("organize: mkdir %s: %w", filepath.Dir(dst), err)
 	}
 
-	// Try hardlink first (instant, no copy needed).
+	// Try rename first (instant on same filesystem, works on exFAT).
+	if err := os.Rename(src, dst); err == nil {
+		return nil
+	}
+
+	// Try hardlink (instant, keeps original until removed).
 	if err := os.Link(src, dst); err == nil {
-		// Hardlink succeeded; remove the original.
 		os.Remove(src)
 		return nil
 	}
 
-	// Hardlink failed (likely cross-device). Fall back to copy+delete.
+	// Both failed (cross-device). Fall back to copy+delete.
 	return copyAndDelete(src, dst)
 }
 

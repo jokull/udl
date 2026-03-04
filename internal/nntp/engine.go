@@ -124,9 +124,10 @@ func extractFilename(subject string, index int) string {
 
 // Download downloads all files from an NZB to the given output directory.
 // Files are written using DirectWrite (pre-allocated, segments written at offsets).
-// The progressFn callback is called after each segment completes.
+// The progressFn callback is called after each segment completes. It returns true
+// to continue downloading, or false to abort (e.g. health check failure).
 // Returns the list of output file paths, or an error.
-func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, progressFn func(Progress)) ([]string, error) {
+func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, progressFn func(Progress) bool) ([]string, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("nntp: create output dir: %w", err)
 	}
@@ -137,6 +138,10 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 	var failedSegments atomic.Int64
 	var bytesDownloaded atomic.Int64
 
+	// Wrap ctx with cancel so workers can abort on health check failure.
+	ctx, cancelDownload := context.WithCancel(ctx)
+	defer cancelDownload()
+
 	reportProgress := func() {
 		p := Progress{
 			TotalSegments:   totalSegments,
@@ -145,7 +150,9 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 			BytesDownloaded: bytesDownloaded.Load(),
 		}
 		if progressFn != nil {
-			progressFn(p)
+			if !progressFn(p) {
+				cancelDownload()
+			}
 		}
 		// Log progress every 100 segments.
 		done := p.DoneSegments + p.FailedSegments

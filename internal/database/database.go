@@ -982,6 +982,45 @@ func (db *DB) AllEpisodeFilePaths() (map[string]int64, error) {
 	return m, rows.Err()
 }
 
+// ResetEpisodeFile clears the file_path and quality for an episode, sets status
+// to 'wanted' and monitored to false. Used when deleting files from the library.
+func (db *DB) ResetEpisodeFile(id int64) error {
+	_, err := db.Exec(
+		`UPDATE episodes SET status = 'wanted', monitored = 0, file_path = NULL, quality = NULL WHERE id = ?`,
+		id,
+	)
+	return err
+}
+
+// UnmonitoredDownloadedEpisodes returns episodes that are unmonitored but still
+// have downloaded files on disk (monitored=0, status='downloaded', file_path set).
+// Joins with series for title info.
+func (db *DB) UnmonitoredDownloadedEpisodes() ([]Episode, error) {
+	rows, err := db.Query(`
+		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
+		       e.monitored, e.status, e.quality, e.file_path, s.title, s.tmdb_id
+		FROM episodes e
+		JOIN series s ON s.id = e.series_id
+		WHERE e.monitored = 0 AND e.status = 'downloaded' AND e.file_path IS NOT NULL AND e.file_path != ''
+		ORDER BY s.title, e.season, e.episode`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var episodes []Episode
+	for rows.Next() {
+		var ep Episode
+		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
+			&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.SeriesTitle, &ep.SeriesTmdbID); err != nil {
+			return nil, err
+		}
+		episodes = append(episodes, ep)
+	}
+	return episodes, rows.Err()
+}
+
 // BlocklistCount returns the total number of blocklist entries.
 func (db *DB) BlocklistCount() (int, error) {
 	var count int

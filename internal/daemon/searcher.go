@@ -534,6 +534,15 @@ func scoreRelease(rel newznab.Release, cfg *config.Config) ScoredRelease {
 		}
 	}
 
+	// Age decay: prefer newer releases. -1 per day old, capped at -500.
+	if ageDays := releaseAge(rel.PubDate); ageDays > 0 {
+		penalty := ageDays
+		if penalty > 500 {
+			penalty = 500
+		}
+		score -= penalty
+	}
+
 	sr.Score = score
 	return sr
 }

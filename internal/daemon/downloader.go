@@ -28,7 +28,7 @@ import (
 
 // DownloadEngine abstracts the NNTP download engine for testing.
 type DownloadEngine interface {
-	Download(ctx context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress)) ([]string, error)
+	Download(ctx context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress) bool) ([]string, error)
 	Close()
 }
 
@@ -438,16 +438,29 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 	// Save NZB for potential resume.
 	_ = os.WriteFile(filepath.Join(dlDir, "manifest.nzb"), nzbData, 0o644)
 
-	// 6. NNTP Download with progress callback.
-	progressFn := func(p nntp.Progress) {
+	// 6. NNTP Download with progress callback and health abort.
+	var healthAborted bool
+	progressFn := func(p nntp.Progress) bool {
 		if p.TotalSegments == 0 {
-			return
+			return true
 		}
 		progress := float64(p.DoneSegments) / float64(p.TotalSegments) * 100
 		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, p.BytesDownloaded)
+		// Health check: after 100 segments, abort if >50% failed.
+		processed := p.DoneSegments + p.FailedSegments
+		if processed >= 100 && p.FailedSegments > processed/2 {
+			d.svc.log.Warn("health abort: too many segment failures",
+				"title", item.Title, "done", p.DoneSegments, "failed", p.FailedSegments, "total", p.TotalSegments)
+			healthAborted = true
+			return false
+		}
+		return true
 	}
 
 	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
+	if healthAborted {
+		return d.fail(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), "segments failed") {
 			d.svc.log.Warn("some segments failed, proceeding to PAR2 repair", "title", item.Title, "error", err)
@@ -644,16 +657,29 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 	// Save NZB for potential resume (avoids re-fetch from indexer on crash).
 	_ = os.WriteFile(filepath.Join(dlDir, "manifest.nzb"), nzbData, 0o644)
 
-	// 5. NNTP Download with progress callback.
-	progressFn := func(p nntp.Progress) {
+	// 5. NNTP Download with progress callback and health abort.
+	var healthAborted bool
+	progressFn := func(p nntp.Progress) bool {
 		if p.TotalSegments == 0 {
-			return
+			return true
 		}
 		progress := float64(p.DoneSegments) / float64(p.TotalSegments) * 100
 		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, p.BytesDownloaded)
+		// Health check: after 100 segments, abort if >50% failed.
+		processed := p.DoneSegments + p.FailedSegments
+		if processed >= 100 && p.FailedSegments > processed/2 {
+			d.svc.log.Warn("health abort: too many segment failures",
+				"title", item.Title, "done", p.DoneSegments, "failed", p.FailedSegments, "total", p.TotalSegments)
+			healthAborted = true
+			return false
+		}
+		return true
 	}
 
 	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
+	if healthAborted {
+		return d.fail(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
+	}
 	if err != nil {
 		// Segment failures are expected — PAR2 can repair up to ~10-15% missing data.
 		if strings.Contains(err.Error(), "segments failed") {
@@ -858,6 +884,8 @@ func (d *Downloader) expectedLibraryPath(item database.QueueItem) (string, quali
 func failEvent(msg string) string {
 	lower := strings.ToLower(msg)
 	switch {
+	case strings.Contains(lower, "health abort"):
+		return "failed:health"
 	case strings.Contains(lower, "par2"):
 		return "failed:par2"
 	case strings.Contains(lower, "rar"):

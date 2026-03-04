@@ -114,6 +114,60 @@ func TestScoreRelease_PreferredWordsBonus(t *testing.T) {
 	}
 }
 
+func TestScoreRelease_AgeDecay(t *testing.T) {
+	cfg := viabilityTestConfig()
+
+	// Two releases with same quality and size, different ages.
+	newDate := time.Now().AddDate(0, 0, -1).Format(time.RFC1123Z)
+	oldDate := time.Now().AddDate(0, 0, -365).Format(time.RFC1123Z)
+
+	srNew := scoreRelease(newznab.Release{
+		Title:   "Movie.2024.1080p.WEB-DL.DD5.1.H264-GROUP",
+		Size:    3 * gb,
+		PubDate: newDate,
+	}, cfg)
+	srOld := scoreRelease(newznab.Release{
+		Title:   "Movie.2024.1080p.WEB-DL.DD5.1.H264-GROUP",
+		Size:    3 * gb,
+		PubDate: oldDate,
+	}, cfg)
+
+	if srNew.Score <= srOld.Score {
+		t.Errorf("newer release should score higher: new=%d, old=%d", srNew.Score, srOld.Score)
+	}
+	// Verify approximate penalty: ~364 point difference (365-1 = 364 days difference).
+	diff := srNew.Score - srOld.Score
+	if diff < 300 || diff > 400 {
+		t.Errorf("expected ~364 point difference, got %d", diff)
+	}
+
+	// Very old release (2000 days) should cap at -500.
+	veryOldDate := time.Now().AddDate(0, 0, -2000).Format(time.RFC1123Z)
+	srVeryOld := scoreRelease(newznab.Release{
+		Title:   "Movie.2024.1080p.WEB-DL.DD5.1.H264-GROUP",
+		Size:    3 * gb,
+		PubDate: veryOldDate,
+	}, cfg)
+	capDiff := srNew.Score - srVeryOld.Score
+	if capDiff < 490 || capDiff > 510 {
+		t.Errorf("expected ~499 point difference (capped), got %d", capDiff)
+	}
+
+	// No PubDate should not penalize.
+	srNoPub := scoreRelease(newznab.Release{
+		Title: "Movie.2024.1080p.WEB-DL.DD5.1.H264-GROUP",
+		Size:  3 * gb,
+	}, cfg)
+	srFresh := scoreRelease(newznab.Release{
+		Title:   "Movie.2024.1080p.WEB-DL.DD5.1.H264-GROUP",
+		Size:    3 * gb,
+		PubDate: time.Now().Format(time.RFC1123Z),
+	}, cfg)
+	if srNoPub.Score != srFresh.Score {
+		t.Errorf("no pubdate should equal 0-day-old: nopub=%d, fresh=%d", srNoPub.Score, srFresh.Score)
+	}
+}
+
 // --------------------------------------------------------------------------
 // sizeAcceptable tests
 // --------------------------------------------------------------------------

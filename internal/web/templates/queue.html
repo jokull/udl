@@ -35,7 +35,7 @@
       {{fmtProgress .Progress}}
     </td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
-    <td><button hx-post="/queue/evict/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Evict from queue?">evict</button></td>
+    <td>{{if eq .Category "movie"}}<button hx-post="/queue/evict/movie/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Delete movie from library?">delete</button>{{else}}<button hx-post="/queue/evict/episode/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Unmonitor this episode?">unmonitor</button>{{end}}</td>
   </tr>
   {{end}}
 </table>
@@ -55,8 +55,8 @@
     <td class="small">{{nullable .ErrorMsg}}</td>
     <td class="small">{{fmtNullTimeStr .AddedAt}}</td>
     <td>
-      <button hx-post="/queue/retry/{{.Category}}/{{.MediaID}}" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Retry this download?">retry</button>
-      <button hx-post="/queue/evict/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Evict from queue?">evict</button>
+      <button hx-post="/queue/retry/{{.Category}}/{{.MediaID}}" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Re-search indexers for a different release?">re-search</button>
+      {{if eq .Category "movie"}}<button hx-post="/queue/evict/movie/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Delete movie from library?">delete</button>{{else}}<button hx-post="/queue/evict/episode/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Unmonitor this episode?">unmonitor</button>{{end}}
     </td>
   </tr>
   {{end}}

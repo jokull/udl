@@ -34,7 +34,7 @@ var testFilenameRegex = regexp.MustCompile(`"([^"]+)"`)
 // FakeEngine writes a small file per NZB entry with correct magic bytes.
 type FakeEngine struct{}
 
-func (e *FakeEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress)) ([]string, error) {
+func (e *FakeEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress) bool) ([]string, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -68,7 +68,7 @@ type NestedFakeEngine struct {
 	SubDir string
 }
 
-func (e *NestedFakeEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress)) ([]string, error) {
+func (e *NestedFakeEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress) bool) ([]string, error) {
 	nestedDir := filepath.Join(outputDir, e.SubDir)
 	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
 		return nil, err
@@ -96,7 +96,7 @@ func (e *NestedFakeEngine) Close() {}
 // (main media), rest are small (samples/extras).
 type MultiSizeFakeEngine struct{}
 
-func (e *MultiSizeFakeEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress)) ([]string, error) {
+func (e *MultiSizeFakeEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress) bool) ([]string, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -127,7 +127,7 @@ func (e *MultiSizeFakeEngine) Close() {}
 // simulating partial NNTP download that should continue to PAR2 repair.
 type PartialFailEngine struct{}
 
-func (e *PartialFailEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress)) ([]string, error) {
+func (e *PartialFailEngine) Download(_ context.Context, n *nzb.NZB, outputDir string, progressFn func(nntp.Progress) bool) ([]string, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, err
 	}
