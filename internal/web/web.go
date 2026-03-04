@@ -38,32 +38,42 @@ type IsPausedFunc func() bool
 // EvictFunc removes an item from the queue. Movies are deleted; episodes are unmonitored.
 type EvictFunc func(category string, mediaID int64) error
 
+// SearchFunc triggers an immediate indexer search for a wanted item.
+type SearchFunc func(category string, mediaID int64) error
+
+// SearchAllFunc triggers a batch search for all wanted items.
+type SearchAllFunc func()
+
 // Server is the embedded HTTP server.
 type Server struct {
-	db       *database.DB
-	cfg      *config.Config
-	log      *slog.Logger
-	retry    RetryFunc
-	pause    PauseFunc
-	isPaused IsPausedFunc
-	evict    EvictFunc
-	mux      *http.ServeMux
-	pages    map[string]*template.Template // per-page templates (layout + page)
-	partials *template.Template            // shared partials (no layout)
-	server   *http.Server
+	db        *database.DB
+	cfg       *config.Config
+	log       *slog.Logger
+	retry     RetryFunc
+	pause     PauseFunc
+	isPaused  IsPausedFunc
+	evict     EvictFunc
+	search    SearchFunc
+	searchAll SearchAllFunc
+	mux       *http.ServeMux
+	pages     map[string]*template.Template // per-page templates (layout + page)
+	partials  *template.Template            // shared partials (no layout)
+	server    *http.Server
 }
 
 // New creates a new web server.
-func New(db *database.DB, cfg *config.Config, log *slog.Logger, retryFn RetryFunc, pauseFn PauseFunc, isPausedFn IsPausedFunc, evictFn EvictFunc) (*Server, error) {
+func New(db *database.DB, cfg *config.Config, log *slog.Logger, retryFn RetryFunc, pauseFn PauseFunc, isPausedFn IsPausedFunc, evictFn EvictFunc, searchFn SearchFunc, searchAllFn SearchAllFunc) (*Server, error) {
 	s := &Server{
-		db:       db,
-		cfg:      cfg,
-		log:      log,
-		retry:    retryFn,
-		pause:    pauseFn,
-		isPaused: isPausedFn,
-		evict:    evictFn,
-		mux:      http.NewServeMux(),
+		db:        db,
+		cfg:       cfg,
+		log:       log,
+		retry:     retryFn,
+		pause:     pauseFn,
+		isPaused:  isPausedFn,
+		evict:     evictFn,
+		search:    searchFn,
+		searchAll: searchAllFn,
+		mux:       http.NewServeMux(),
 	}
 
 	if err := s.loadTemplates(); err != nil {
@@ -143,7 +153,9 @@ func (s *Server) loadTemplates() error {
 	pageFiles := []string{
 		"movies.html",
 		"series.html",
+		"series_detail.html",
 		"queue.html",
+		"wanted.html",
 		"schedule.html",
 		"history.html",
 	}
@@ -184,12 +196,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /{$}", s.handleQueue)
 	s.mux.HandleFunc("GET /movies", s.handleMovies)
 	s.mux.HandleFunc("GET /series", s.handleSeries)
+	s.mux.HandleFunc("GET /series/{id}", s.handleSeriesDetail)
 	s.mux.HandleFunc("GET /series/{id}/episodes", s.handleSeriesEpisodes)
+	s.mux.HandleFunc("GET /wanted", s.handleWanted)
 	s.mux.HandleFunc("GET /schedule", s.handleSchedule)
 	s.mux.HandleFunc("GET /history", s.handleHistory)
 
 	// SSE
 	s.mux.HandleFunc("GET /sse/queue", s.handleSSEQueue)
+
+	// Wanted actions
+	s.mux.HandleFunc("POST /wanted/search/{category}/{id}", s.handleSearchWanted)
+	s.mux.HandleFunc("POST /wanted/remove/{category}/{id}", s.handleRemoveWanted)
+	s.mux.HandleFunc("POST /wanted/search-all", s.handleSearchAllWanted)
 
 	// Actions
 	s.mux.HandleFunc("POST /queue/retry/{category}/{id}", s.handleRetryDownload)

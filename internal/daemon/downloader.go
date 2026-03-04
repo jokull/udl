@@ -392,7 +392,8 @@ func (d *Downloader) processPostProcessing(ctx context.Context, item database.Qu
 	}
 
 	password := d.readManifestPassword(dlDir)
-	if err := d.postProcessImportComplete(ctx, item, dlDir, password); err != nil {
+	failedSegments := readSegmentHealth(dlDir)
+	if err := d.postProcessImportComplete(ctx, item, dlDir, password, failedSegments); err != nil {
 		d.svc.log.Error("post-processing failed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "error", err)
 	}
 }
@@ -465,10 +466,12 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 
 	// 6. NNTP Download with progress callback and health abort.
 	var healthAborted bool
+	var lastFailedSegments int
 	progressFn := func(p nntp.Progress) bool {
 		if p.TotalSegments == 0 {
 			return true
 		}
+		lastFailedSegments = p.FailedSegments
 		progress := float64(p.DoneSegments) / float64(p.TotalSegments) * 100
 		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, p.BytesDownloaded)
 		// Health check: after 100 segments, abort if >50% failed.
@@ -493,6 +496,9 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 			return d.fail(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
 		}
 	}
+
+	// Save segment health for resume (post-process worker reads this).
+	saveSegmentHealth(dlDir, lastFailedSegments)
 
 	// 7. Update status to "post_processing" and hand off.
 	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "post_processing"); err != nil {
@@ -690,10 +696,12 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 
 	// 5. NNTP Download with progress callback and health abort.
 	var healthAborted bool
+	var lastFailedSegments int
 	progressFn := func(p nntp.Progress) bool {
 		if p.TotalSegments == 0 {
 			return true
 		}
+		lastFailedSegments = p.FailedSegments
 		progress := float64(p.DoneSegments) / float64(p.TotalSegments) * 100
 		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, p.BytesDownloaded)
 		// Health check: after 100 segments, abort if >50% failed.
@@ -720,19 +728,23 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 		}
 	}
 
+	// Save segment health for resume.
+	saveSegmentHealth(dlDir, lastFailedSegments)
+
 	// 6. Update status to "post_processing".
 	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "post_processing"); err != nil {
 		return fmt.Errorf("update status to post_processing: %w", err)
 	}
 
 	// 7-10. Post-process, import, complete, cleanup.
-	return d.postProcessImportComplete(ctx, item, dlDir, nzbPassword)
+	return d.postProcessImportComplete(ctx, item, dlDir, nzbPassword, lastFailedSegments)
 }
 
 // postProcessImportComplete runs post-processing (PAR2/RAR), imports media files
 // to the library, records completion, and cleans up. Used by both the normal
 // download pipeline and the resume path.
-func (d *Downloader) postProcessImportComplete(ctx context.Context, item database.QueueItem, downloadDir string, password string) error {
+// failedSegments: 0 = all OK (skip PAR2), >0 = some failed (skip verify), -1 = unknown (full verify+repair).
+func (d *Downloader) postProcessImportComplete(ctx context.Context, item database.QueueItem, downloadDir string, password string, failedSegments int) error {
 	// Reset progress to 0 and clear any stale error for the post-processing phase.
 	_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, 0, 0)
 	_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID, "")
@@ -742,7 +754,10 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 		_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID, phase)
 	}
 
-	result, err := postprocess.Process(ctx, downloadDir, d.svc.log, progressFn, password)
+	result, err := postprocess.Process(ctx, downloadDir, d.svc.log, progressFn, postprocess.Options{
+		Password:       password,
+		FailedSegments: failedSegments,
+	})
 	if err != nil {
 		return d.fail(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
 	}
@@ -879,7 +894,8 @@ func (d *Downloader) resumePostProcessing(ctx context.Context, item database.Que
 	}
 
 	password := d.readManifestPassword(dlDir)
-	return d.postProcessImportComplete(ctx, item, dlDir, password)
+	failedSegments := readSegmentHealth(dlDir)
+	return d.postProcessImportComplete(ctx, item, dlDir, password, failedSegments)
 }
 
 // expectedLibraryPath computes where the file would be imported based on the
@@ -1152,4 +1168,32 @@ func (d *Downloader) fetchNZB(nzbURL string) ([]byte, error) {
 		return nil, fmt.Errorf("read NZB body: %w", err)
 	}
 	return data, nil
+}
+
+// segmentHealthFile is the filename used to persist segment failure count
+// in the download directory. Used to restore PAR2 skip behavior on resume.
+const segmentHealthFile = ".segment-health"
+
+// saveSegmentHealth writes the failed segment count to the download directory.
+// Best-effort — errors are silently ignored.
+func saveSegmentHealth(dlDir string, failedSegments int) {
+	_ = os.WriteFile(
+		filepath.Join(dlDir, segmentHealthFile),
+		[]byte(fmt.Sprintf("%d", failedSegments)),
+		0o644,
+	)
+}
+
+// readSegmentHealth reads the failed segment count from a download directory.
+// Returns -1 (unknown) if the file doesn't exist or can't be parsed.
+func readSegmentHealth(dlDir string) int {
+	data, err := os.ReadFile(filepath.Join(dlDir, segmentHealthFile))
+	if err != nil {
+		return -1
+	}
+	var n int
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d", &n); err != nil {
+		return -1
+	}
+	return n
 }

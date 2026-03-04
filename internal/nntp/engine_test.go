@@ -199,3 +199,55 @@ func TestEngineClose(t *testing.T) {
 	// Close should not panic even with no active connections.
 	engine.Close()
 }
+
+func TestSegmentTracker(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/segments.done"
+
+	// New tracker on empty file.
+	tr := newSegmentTracker(path)
+	if tr.count() != 0 {
+		t.Fatalf("expected 0 completed, got %d", tr.count())
+	}
+	if tr.isDone("abc@example.com") {
+		t.Fatal("expected isDone=false for unknown segment")
+	}
+
+	// Mark some segments done.
+	tr.markDone("seg1@example.com")
+	tr.markDone("seg2@example.com")
+	tr.markDone("seg3@example.com")
+	if tr.count() != 3 {
+		t.Fatalf("expected 3 completed, got %d", tr.count())
+	}
+	if !tr.isDone("seg1@example.com") {
+		t.Fatal("expected isDone=true for seg1")
+	}
+	tr.close()
+
+	// Re-open tracker — should load previously completed segments.
+	tr2 := newSegmentTracker(path)
+	if tr2.count() != 3 {
+		t.Fatalf("expected 3 resumed, got %d", tr2.count())
+	}
+	if !tr2.isDone("seg2@example.com") {
+		t.Fatal("expected isDone=true for seg2 after resume")
+	}
+	if tr2.isDone("seg4@example.com") {
+		t.Fatal("expected isDone=false for unknown segment after resume")
+	}
+
+	// Add more and verify.
+	tr2.markDone("seg4@example.com")
+	if tr2.count() != 4 {
+		t.Fatalf("expected 4 completed, got %d", tr2.count())
+	}
+	tr2.close()
+
+	// Third open — should have all 4.
+	tr3 := newSegmentTracker(path)
+	if tr3.count() != 4 {
+		t.Fatalf("expected 4 resumed on third open, got %d", tr3.count())
+	}
+	tr3.close()
+}

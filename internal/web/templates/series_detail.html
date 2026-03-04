@@ -1,0 +1,38 @@
+{{template "layout" .}}
+
+{{define "title"}} — {{.Series.Title}}{{end}}
+
+{{define "content"}}
+<h1>
+  {{.Series.Title}} ({{.Series.Year}})
+  {{if .Series.TmdbID}}<a class="ext" href="{{tmdbURL "tv" .Series.TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
+  {{if .Series.ImdbID.Valid}}<a class="ext" href="https://www.imdb.com/title/{{.Series.ImdbID.String}}/" target="_blank" rel="noopener">imdb</a>{{end}}
+</h1>
+
+<p><span class="status {{statusClass .Series.Status}}">{{.Series.Status}}</span> · Added {{fmtNullTimeStr .Series.AddedAt}}</p>
+
+{{range .Seasons}}
+<div class="season-header">
+  <h3>Season {{.Season}}</h3>
+  <button class="btn btn-sm {{if .Monitored}}btn-active{{end}}"
+    hx-post="/series/{{.SeriesID}}/season/{{.Season}}/toggle"
+    hx-target="body"
+    hx-swap="outerHTML"
+    title="{{if .Monitored}}Unmonitor season{{else}}Monitor season{{end}}">
+    {{if .Monitored}}Monitored{{else}}Unmonitored{{end}}
+  </button>
+</div>
+<table>
+  <tr><th>Episode</th><th>Title</th><th>Air Date</th><th>Status</th><th>Quality</th></tr>
+  {{range .Episodes}}
+  <tr{{if not .Monitored}} class="unmonitored"{{end}}>
+    <td>{{seasonEp .Season .Episode}}</td>
+    <td>{{nullable .Title}}</td>
+    <td class="small">{{nullable .AirDate}}</td>
+    <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
+    <td>{{nullable .Quality}}</td>
+  </tr>
+  {{end}}
+</table>
+{{end}}
+{{end}}

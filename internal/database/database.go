@@ -185,7 +185,7 @@ func (db *DB) AddMovie(tmdbID int, imdbID, title string, year int) (int64, error
 // ListMovies returns all movies ordered by added_at descending.
 func (db *DB) ListMovies() ([]Movie, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at
+		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at, download_error
 		 FROM movies ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -197,7 +197,7 @@ func (db *DB) ListMovies() ([]Movie, error) {
 	for rows.Next() {
 		var m Movie
 		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
-			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt); err != nil {
+			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt, &m.DownloadError); err != nil {
 			return nil, err
 		}
 		movies = append(movies, m)
@@ -1305,6 +1305,51 @@ func (db *DB) EvictFromQueue(category string, mediaID int64) error {
 	default:
 		return fmt.Errorf("unknown category: %s", category)
 	}
+}
+
+// WantedItems returns a unified list of wanted movies and wanted episodes,
+// sorted by air date descending (most recent first).
+func (db *DB) WantedItems() ([]WantedItem, error) {
+	rows, err := db.Query(`
+		SELECT 'movie', id, tmdb_id, 0,
+		       title || ' (' || year || ')',
+		       year || '-01-01',
+		       NULL
+		FROM movies WHERE status = 'wanted'
+		UNION ALL
+		SELECT 'episode', e.id, s.tmdb_id, e.series_id,
+		       s.title || ' · S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode) || ' ' || COALESCE(e.title, ''),
+		       e.air_date,
+		       e.last_searched_at
+		FROM episodes e
+		JOIN series s ON s.id = e.series_id
+		WHERE e.status = 'wanted'
+		  AND e.monitored = 1
+		  AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
+		ORDER BY 6 DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var items []WantedItem
+	for rows.Next() {
+		var wi WantedItem
+		if err := rows.Scan(&wi.Category, &wi.MediaID, &wi.TmdbID, &wi.SeriesID,
+			&wi.Title, &wi.AirDate, &wi.LastSearchedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, wi)
+	}
+	return items, rows.Err()
+}
+
+// ClearWantedEpisodeSearchTimers resets last_searched_at on all wanted episodes
+// so the episode search loop will pick them up on the next tick.
+func (db *DB) ClearWantedEpisodeSearchTimers() error {
+	_, err := db.Exec(`UPDATE episodes SET last_searched_at = NULL
+		WHERE status = 'wanted' AND monitored = 1`)
+	return err
 }
 
 // QueueTotalSize returns the sum of download_size for all active queue items.

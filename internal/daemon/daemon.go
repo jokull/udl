@@ -1244,7 +1244,7 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 		addedTime := time.Unix(pf.addedAt, 0)
 		item.AddedDays = int(time.Since(addedTime).Hours() / 24)
 
-		if pf.viewCount > 0 {
+		if pf.viewCount > 0 || len(item.WatchedBy) > 0 {
 			item.Action = "keep"
 			item.Reason = "watched"
 			reply.TotalKeep++
@@ -1324,7 +1324,7 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 
 		if ep.FilePath.Valid && ep.FilePath.String != "" {
 			if pf, ok := plexFiles[ep.FilePath.String]; ok {
-				if pf.viewCount > 0 {
+				if pf.viewCount > 0 || lastWatchedMap[pf.ratingKey] > 0 {
 					sg.anyWatched = true
 				}
 				// Enrich from watch history.
@@ -1696,7 +1696,17 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 		evictFn := func(category string, mediaID int64) error {
 			return db.EvictFromQueue(category, mediaID)
 		}
-		ws, err := web.New(db, cfg, log, retryFn, pauseFn, isPausedFn, evictFn)
+		searchFn := func(category string, mediaID int64) error {
+			go svc.retryMedia(category, mediaID)
+			return nil
+		}
+		searchAllFn := func() {
+			go func() {
+				_ = svc.SearchWantedMovies()
+				_ = db.ClearWantedEpisodeSearchTimers()
+			}()
+		}
+		ws, err := web.New(db, cfg, log, retryFn, pauseFn, isPausedFn, evictFn, searchFn, searchAllFn)
 		if err != nil {
 			ln.Close()
 			return fmt.Errorf("daemon: create web server: %w", err)

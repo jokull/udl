@@ -1,0 +1,38 @@
+{{template "layout" .}}
+
+{{define "title"}} — Wanted{{end}}
+
+{{define "content"}}
+<h1>Wanted ({{.Total}})</h1>
+
+<div class="filter-tabs">
+  <a href="/wanted" {{if or (eq .Filter "") (eq .Filter "all")}}class="active"{{end}}>All ({{.Total}})</a>
+  <a href="/wanted?filter=movies" {{if eq .Filter "movies"}}class="active"{{end}}>Movies ({{.MovieCount}})</a>
+  <a href="/wanted?filter=episodes" {{if eq .Filter "episodes"}}class="active"{{end}}>Episodes ({{.EpisodeCount}})</a>
+  <button hx-post="/wanted/search-all" hx-confirm="Search all {{.Total}} wanted items?" hx-swap="none" class="btn-sm">Search All</button>
+</div>
+
+{{if .Items}}
+<table>
+  <tr><th>Title</th><th>Aired</th><th>Searched</th><th></th></tr>
+  {{range .Items}}
+  <tr>
+    <td>
+      {{if eq .Category "movie"}}<a href="/movies#movie-{{.MediaID}}">{{.Title}}</a>{{else}}<a href="/series/{{.SeriesID}}">{{.Title}}</a>{{end}}
+      {{if (tmdbURL .Category .TmdbID)}}<a class="ext" href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
+    </td>
+    <td class="small">{{nullable .AirDate}}</td>
+    <td class="small">{{fmtNullTimeStr .LastSearchedAt}}</td>
+    <td>
+      <button class="btn-sm" hx-post="/wanted/search/{{.Category}}/{{.MediaID}}" hx-target="closest td" hx-swap="innerHTML">search</button>
+      {{if eq .Category "movie"}}<button class="btn-sm" hx-post="/wanted/remove/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete"
+        hx-confirm="Delete movie?">remove</button>{{else}}<button class="btn-sm" hx-post="/wanted/remove/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete"
+        hx-confirm="Unmonitor episode?">unmonitor</button>{{end}}
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="muted">Nothing wanted.</p>
+{{end}}
+{{end}}

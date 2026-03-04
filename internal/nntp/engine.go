@@ -126,6 +126,11 @@ func extractFilename(subject string, index int) string {
 // Files are written using DirectWrite (pre-allocated, segments written at offsets).
 // The progressFn callback is called after each segment completes. It returns true
 // to continue downloading, or false to abort (e.g. health check failure).
+//
+// Supports segment-level resume: if outputDir contains a segments.done file from a
+// previous partial download, completed segments are skipped. Each successful segment
+// is appended to segments.done atomically so progress survives crashes.
+//
 // Returns the list of output file paths, or an error.
 func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, progressFn func(Progress) bool) ([]string, error) {
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
@@ -134,9 +139,19 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 
 	totalSegments := n.TotalSegments()
 
+	// Load previously completed segments for resume.
+	tracker := newSegmentTracker(filepath.Join(outputDir, "segments.done"))
+	resumedCount := tracker.count()
+	if resumedCount > 0 {
+		e.log.Info("resuming download with completed segments", "completed", resumedCount, "total", totalSegments)
+	}
+
 	var doneSegments atomic.Int64
 	var failedSegments atomic.Int64
 	var bytesDownloaded atomic.Int64
+
+	// Pre-count resumed segments as done.
+	doneSegments.Store(int64(resumedCount))
 
 	// Wrap ctx with cancel so workers can abort on health check failure.
 	ctx, cancelDownload := context.WithCancel(ctx)
@@ -166,7 +181,7 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 		}
 	}
 
-	// Prepare work items and output file paths.
+	// Prepare work items and output file paths, skipping completed segments.
 	var work []segmentWork
 	outputFiles := make([]string, len(n.Files))
 
@@ -176,6 +191,9 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 		outputFiles[fi] = outPath
 
 		for si, seg := range file.Segments {
+			if tracker.isDone(seg.MessageID) {
+				continue // already downloaded in previous run
+			}
 			work = append(work, segmentWork{
 				fileIndex:    fi,
 				segmentIndex: si,
@@ -184,10 +202,16 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 		}
 	}
 
-	// Create output files (no pre-allocation — final size is determined after
-	// yEnc decoding and tracked via fileMaxEnd below).
+	if len(work) == 0 && resumedCount > 0 {
+		e.log.Info("all segments already completed from previous run")
+		tracker.close()
+		return outputFiles, nil
+	}
+
+	// Create or open output files. Use O_CREATE without O_TRUNC so resumed
+	// downloads preserve existing partial data.
 	for fi := range n.Files {
-		f, err := os.Create(outputFiles[fi])
+		f, err := os.OpenFile(outputFiles[fi], os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, fmt.Errorf("nntp: create file %s: %w", outputFiles[fi], err)
 		}
@@ -210,6 +234,12 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 			return nil, fmt.Errorf("nntp: open file %s: %w", outputFiles[fi], err)
 		}
 		openFiles[fi] = f
+
+		// Seed fileMaxEnd from existing file size so truncation doesn't destroy
+		// data from segments completed in a previous run (Codex review P1 fix).
+		if info, err := f.Stat(); err == nil && info.Size() > 0 {
+			fileMaxEnd[fi].Store(info.Size())
+		}
 	}
 	defer func() {
 		for _, f := range openFiles {
@@ -237,12 +267,13 @@ func (e *Engine) Download(ctx context.Context, n *nzb.NZB, outputDir string, pro
 			wg.Add(1)
 			go func(p *Pool) {
 				defer wg.Done()
-				e.worker(ctx, p, workCh, openFiles, fileMaxEnd, &doneSegments, &failedSegments, &bytesDownloaded, reportProgress)
+				e.worker(ctx, p, workCh, openFiles, fileMaxEnd, &doneSegments, &failedSegments, &bytesDownloaded, reportProgress, tracker)
 			}(pool)
 		}
 	}
 
 	wg.Wait()
+	tracker.close()
 
 	// Truncate each file to its actual decoded size (yEnc decoded data is
 	// smaller than the raw segment byte counts used for pre-allocation).
@@ -289,6 +320,7 @@ func (e *Engine) worker(
 	doneSegments, failedSegments *atomic.Int64,
 	bytesDownloaded *atomic.Int64,
 	reportProgress func(),
+	tracker *segmentTracker,
 ) {
 	for w := range workCh {
 		select {
@@ -351,6 +383,7 @@ func (e *Engine) worker(
 
 		bytesDownloaded.Add(int64(len(result.Data)))
 		doneSegments.Add(1)
+		tracker.markDone(w.messageID)
 		reportProgress()
 	}
 }
@@ -437,5 +470,71 @@ func (e *Engine) fetchFromPool(ctx context.Context, pool *Pool, messageID string
 func (e *Engine) Close() {
 	for _, p := range e.pools {
 		p.Close()
+	}
+}
+
+// segmentTracker tracks completed segment message IDs to a file for crash-resume.
+// Thread-safe — multiple workers can call markDone concurrently.
+type segmentTracker struct {
+	path string
+	done map[string]bool
+	mu   sync.Mutex
+	file *os.File
+}
+
+// newSegmentTracker creates a tracker, loading any existing completion data from path.
+func newSegmentTracker(path string) *segmentTracker {
+	t := &segmentTracker{
+		path: path,
+		done: make(map[string]bool),
+	}
+
+	// Load existing completed segments.
+	data, err := os.ReadFile(path)
+	if err == nil && len(data) > 0 {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				t.done[line] = true
+			}
+		}
+	}
+
+	// Open for append (new completions).
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err == nil {
+		t.file = f
+	}
+
+	return t
+}
+
+// isDone returns true if the given message ID was already downloaded.
+func (t *segmentTracker) isDone(messageID string) bool {
+	return t.done[messageID]
+}
+
+// count returns the number of completed segments.
+func (t *segmentTracker) count() int {
+	return len(t.done)
+}
+
+// markDone records a segment as completed. Appends to the file atomically.
+func (t *segmentTracker) markDone(messageID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.done[messageID] = true
+	if t.file != nil {
+		fmt.Fprintln(t.file, messageID)
+	}
+}
+
+// close flushes and closes the tracker file.
+func (t *segmentTracker) close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.file != nil {
+		t.file.Close()
+		t.file = nil
 	}
 }

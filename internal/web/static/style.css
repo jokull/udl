@@ -176,3 +176,8 @@ dd {
 }
 
 tr.unmonitored { opacity: 0.5; }
+
+.status-flip { position: relative; display: inline-block; }
+.status-flip .flip-action { display: none; }
+.status-flip:hover .flip-label { display: none; }
+.status-flip:hover .flip-action { display: inline-block; }

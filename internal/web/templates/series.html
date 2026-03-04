@@ -11,7 +11,7 @@
   {{range .Series}}
   <tr>
     <td>
-      {{.Title}}
+      <a href="/series/{{.ID}}">{{.Title}}</a>
       {{if .TmdbID}}<a class="ext" href="{{tmdbURL "tv" .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
       {{if .ImdbID.Valid}}<a class="ext" href="https://www.imdb.com/title/{{.ImdbID.String}}/" target="_blank" rel="noopener">imdb</a>{{end}}
     </td>

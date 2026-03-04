@@ -122,6 +122,18 @@ type History struct {
 	EpisodeNum int // episode number (0 for movies)
 }
 
+// WantedItem is a unified view of a wanted movie or episode.
+// Populated by a UNION query across movies and episodes tables.
+type WantedItem struct {
+	Category       string         // "movie" or "episode"
+	MediaID        int64
+	TmdbID         int
+	SeriesID       int64          // series_id for episodes, 0 for movies
+	Title          string         // pre-formatted: "Movie (Year)" or "Series · S01E02 Title"
+	AirDate        sql.NullString // episode air_date or movie year as "YYYY-01-01"
+	LastSearchedAt sql.NullString // episodes only, NULL for movies
+}
+
 // BlocklistEntry represents a release that should not be downloaded again.
 type BlocklistEntry struct {
 	ID           int64

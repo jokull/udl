@@ -298,12 +298,22 @@ func renameByPAR2(dir string, log *slog.Logger) int {
 // (e.g. "par2 verify", "rar extract"), pct is 0–100.
 type ProgressFn func(phase string, pct float64)
 
+// Options configures post-processing behavior.
+type Options struct {
+	Password string // archive password for encrypted RARs
+
+	// FailedSegments controls PAR2 behavior based on download health:
+	//   -1 = unknown (resume from crash) → full verify + repair (default behavior)
+	//    0 = all segments OK → skip PAR2 entirely (huge time saver)
+	//   >0 = N segments failed → skip verify, go straight to repair
+	FailedSegments int
+}
+
 // Process runs the full post-processing pipeline on a download directory.
 // Stages: PAR2 rename -> magic rename -> AppleDouble cleanup -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
 // The context is checked between stages for prompt cancellation on shutdown.
 // If progressFn is non-nil, it is called at phase boundaries with a label and overall percentage.
-// The password parameter is used for encrypted RAR archives (from NZB <meta type="password"> tag).
-func Process(ctx context.Context, dir string, log *slog.Logger, progressFn ProgressFn, password string) (*Result, error) {
+func Process(ctx context.Context, dir string, log *slog.Logger, progressFn ProgressFn, opts Options) (*Result, error) {
 	result := &Result{}
 
 	report := func(phase string, pct float64) {
@@ -331,7 +341,7 @@ func Process(ctx context.Context, dir string, log *slog.Logger, progressFn Progr
 	// contain no valid PAR2 packets and cause "Main packet not found" errors.
 	removeAppleDoubleFiles(dir, log)
 
-	// Stage 2: PAR2 verify + repair
+	// Stage 2: PAR2 verify + repair (behavior depends on segment health)
 	report("par2 verify", 0)
 	par2File, err := findPAR2File(dir)
 	if err != nil {
@@ -339,29 +349,54 @@ func Process(ctx context.Context, dir string, log *slog.Logger, progressFn Progr
 	} else if par2File != "" {
 		log.Info("found PAR2 index file", "file", par2File)
 
-		needsRepair, err := par2Verify(ctx, par2File, log)
-		if err != nil {
-			// PAR2 failure is non-fatal if RAR files exist (common with obfuscated
-			// releases where filenames don't match the PAR2 manifest).
-			hasRAR, _ := findRARFiles(dir)
-			if len(hasRAR) > 0 {
-				log.Warn("PAR2 verify failed but RAR files exist, continuing to extraction", "error", err)
-			} else {
-				result.Success = false
-				result.Error = fmt.Sprintf("PAR2 verify failed: %v", err)
-				return result, fmt.Errorf("par2 verify failed: %w", err)
-			}
-		} else if needsRepair {
-			report("par2 repair", 15)
-			log.Info("PAR2 indicates repair needed, running repair")
+		if opts.FailedSegments == 0 {
+			// All segments downloaded successfully — skip PAR2 entirely.
+			// This is the NZBGet "quick verification" optimization: since we know
+			// every segment was received and decoded correctly, the files are intact.
+			log.Info("all segments OK, skipping PAR2 verify/repair")
+		} else if opts.FailedSegments > 0 {
+			// Some segments failed — skip verify, go straight to repair.
+			// par2 repair includes its own verification internally, so running
+			// par2 verify first would just read all files twice.
+			report("par2 repair", 5)
+			log.Info("segments failed, skipping verify — going straight to PAR2 repair",
+				"failed_segments", opts.FailedSegments)
 			if err := par2Repair(ctx, par2File, log); err != nil {
-				result.Success = false
-				result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
-				return result, fmt.Errorf("par2 repair failed: %w", err)
+				hasRAR, _ := findRARFiles(dir)
+				if len(hasRAR) > 0 {
+					log.Warn("PAR2 repair failed but RAR files exist, continuing to extraction", "error", err)
+				} else {
+					result.Success = false
+					result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
+					return result, fmt.Errorf("par2 repair failed: %w", err)
+				}
+			} else {
+				log.Info("PAR2 repair completed successfully")
 			}
-			log.Info("PAR2 repair completed successfully")
 		} else {
-			log.Info("PAR2 verify passed, no repair needed")
+			// Unknown segment health (resume from crash) — full verify + repair.
+			needsRepair, err := par2Verify(ctx, par2File, log)
+			if err != nil {
+				hasRAR, _ := findRARFiles(dir)
+				if len(hasRAR) > 0 {
+					log.Warn("PAR2 verify failed but RAR files exist, continuing to extraction", "error", err)
+				} else {
+					result.Success = false
+					result.Error = fmt.Sprintf("PAR2 verify failed: %v", err)
+					return result, fmt.Errorf("par2 verify failed: %w", err)
+				}
+			} else if needsRepair {
+				report("par2 repair", 15)
+				log.Info("PAR2 indicates repair needed, running repair")
+				if err := par2Repair(ctx, par2File, log); err != nil {
+					result.Success = false
+					result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
+					return result, fmt.Errorf("par2 repair failed: %w", err)
+				}
+				log.Info("PAR2 repair completed successfully")
+			} else {
+				log.Info("PAR2 verify passed, no repair needed")
+			}
 		}
 	} else {
 		log.Info("no PAR2 files found, skipping verify/repair")
@@ -380,7 +415,7 @@ func Process(ctx context.Context, dir string, log *slog.Logger, progressFn Progr
 	} else if len(rarFiles) > 0 {
 		for _, rarFile := range rarFiles {
 			log.Info("extracting RAR archive", "file", rarFile)
-			extracted, err := extractRAR(rarFile, dir, password, log)
+			extracted, err := extractRAR(rarFile, dir, opts.Password, log)
 			if err != nil {
 				result.Success = false
 				result.Error = fmt.Sprintf("RAR extraction failed: %v", err)

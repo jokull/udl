@@ -69,6 +69,41 @@ type SeasonGroup struct {
 	Episodes  []database.Episode
 }
 
+func (s *Server) handleSeriesDetail(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid series id", http.StatusBadRequest)
+		return
+	}
+
+	series, err := s.db.GetSeries(id)
+	if err != nil {
+		s.serverError(w, "load series", err)
+		return
+	}
+
+	episodes, err := s.db.EpisodesForSeries(id)
+	if err != nil {
+		s.serverError(w, "load episodes", err)
+		return
+	}
+
+	seasons := s.groupEpisodesBySeason(id, episodes)
+
+	data := struct {
+		Series  *database.Series
+		Seasons []SeasonGroup
+		Page    string
+	}{
+		Series:  series,
+		Seasons: seasons,
+		Page:    "series",
+	}
+
+	s.render(w, "series_detail.html", data)
+}
+
 func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -87,7 +122,16 @@ func (s *Server) renderEpisodesPartial(w http.ResponseWriter, seriesID int64) {
 		return
 	}
 
-	// Group by season
+	data := struct {
+		Seasons []SeasonGroup
+	}{
+		Seasons: s.groupEpisodesBySeason(seriesID, episodes),
+	}
+
+	s.renderPartial(w, "episodes_partial.html", data)
+}
+
+func (s *Server) groupEpisodesBySeason(seriesID int64, episodes []database.Episode) []SeasonGroup {
 	seasonMap := make(map[int]*SeasonGroup)
 	for _, ep := range episodes {
 		sg, ok := seasonMap[ep.Season]
@@ -100,7 +144,6 @@ func (s *Server) renderEpisodesPartial(w http.ResponseWriter, seriesID int64) {
 		}
 		sg.Episodes = append(sg.Episodes, ep)
 	}
-	// Sort keys
 	keys := make([]int, 0, len(seasonMap))
 	for k := range seasonMap {
 		keys = append(keys, k)
@@ -116,14 +159,7 @@ func (s *Server) renderEpisodesPartial(w http.ResponseWriter, seriesID int64) {
 	for _, k := range keys {
 		seasons = append(seasons, *seasonMap[k])
 	}
-
-	data := struct {
-		Seasons []SeasonGroup
-	}{
-		Seasons: seasons,
-	}
-
-	s.renderPartial(w, "episodes_partial.html", data)
+	return seasons
 }
 
 func (s *Server) handleToggleSeasonMonitor(w http.ResponseWriter, r *http.Request) {
@@ -273,6 +309,115 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.render(w, "history.html", data)
+}
+
+func (s *Server) handleWanted(w http.ResponseWriter, r *http.Request) {
+	filter := r.URL.Query().Get("filter")
+
+	items, err := s.db.WantedItems()
+	if err != nil {
+		s.serverError(w, "load wanted items", err)
+		return
+	}
+
+	// Count by category before filtering.
+	var movieCount, episodeCount int
+	for _, wi := range items {
+		switch wi.Category {
+		case "movie":
+			movieCount++
+		case "episode":
+			episodeCount++
+		}
+	}
+
+	// Filter if requested.
+	if filter == "movies" {
+		var filtered []database.WantedItem
+		for _, wi := range items {
+			if wi.Category == "movie" {
+				filtered = append(filtered, wi)
+			}
+		}
+		items = filtered
+	} else if filter == "episodes" {
+		var filtered []database.WantedItem
+		for _, wi := range items {
+			if wi.Category == "episode" {
+				filtered = append(filtered, wi)
+			}
+		}
+		items = filtered
+	}
+
+	data := struct {
+		Items        []database.WantedItem
+		Filter       string
+		Total        int
+		MovieCount   int
+		EpisodeCount int
+		Page         string
+	}{
+		Items:        items,
+		Filter:       filter,
+		Total:        movieCount + episodeCount,
+		MovieCount:   movieCount,
+		EpisodeCount: episodeCount,
+		Page:         "wanted",
+	}
+
+	s.render(w, "wanted.html", data)
+}
+
+func (s *Server) handleSearchWanted(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid media id", http.StatusBadRequest)
+		return
+	}
+	if category != "movie" && category != "episode" {
+		http.Error(w, "invalid category", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.search(category, id); err != nil {
+		s.log.Error("web: search wanted", "category", category, "id", id, "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span class="status downloading">searching…</span>`))
+}
+
+func (s *Server) handleRemoveWanted(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid media id", http.StatusBadRequest)
+		return
+	}
+	if category != "movie" && category != "episode" {
+		http.Error(w, "invalid category", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.evict(category, id); err != nil {
+		s.log.Error("web: remove wanted", "category", category, "id", id, "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleSearchAllWanted(w http.ResponseWriter, r *http.Request) {
+	s.searchAll()
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span class="status downloading">batch search started…</span>`))
 }
 
 func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
