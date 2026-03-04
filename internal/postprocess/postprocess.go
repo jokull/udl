@@ -302,7 +302,8 @@ type ProgressFn func(phase string, pct float64)
 // Stages: PAR2 rename -> magic rename -> AppleDouble cleanup -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
 // The context is checked between stages for prompt cancellation on shutdown.
 // If progressFn is non-nil, it is called at phase boundaries with a label and overall percentage.
-func Process(ctx context.Context, dir string, log *slog.Logger, progressFn ProgressFn) (*Result, error) {
+// The password parameter is used for encrypted RAR archives (from NZB <meta type="password"> tag).
+func Process(ctx context.Context, dir string, log *slog.Logger, progressFn ProgressFn, password string) (*Result, error) {
 	result := &Result{}
 
 	report := func(phase string, pct float64) {
@@ -379,7 +380,7 @@ func Process(ctx context.Context, dir string, log *slog.Logger, progressFn Progr
 	} else if len(rarFiles) > 0 {
 		for _, rarFile := range rarFiles {
 			log.Info("extracting RAR archive", "file", rarFile)
-			extracted, err := extractRAR(rarFile, dir, log)
+			extracted, err := extractRAR(rarFile, dir, password, log)
 			if err != nil {
 				result.Success = false
 				result.Error = fmt.Sprintf("RAR extraction failed: %v", err)
@@ -561,9 +562,15 @@ func isFirstPart(filename string) bool {
 }
 
 // extractRAR extracts a RAR archive to the output directory.
+// If password is non-empty, it is used to decrypt the archive.
 // Returns the list of extracted file paths.
-func extractRAR(rarFile, outputDir string, log *slog.Logger) ([]string, error) {
-	rc, err := rardecode.OpenReader(rarFile)
+func extractRAR(rarFile, outputDir, password string, log *slog.Logger) ([]string, error) {
+	var opts []rardecode.Option
+	if password != "" {
+		opts = append(opts, rardecode.Password(password))
+		log.Info("using NZB password for RAR extraction")
+	}
+	rc, err := rardecode.OpenReader(rarFile, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("open rar: %w", err)
 	}

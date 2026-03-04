@@ -391,9 +391,28 @@ func (d *Downloader) processPostProcessing(ctx context.Context, item database.Qu
 		}
 	}
 
-	if err := d.postProcessImportComplete(ctx, item, dlDir); err != nil {
+	password := d.readManifestPassword(dlDir)
+	if err := d.postProcessImportComplete(ctx, item, dlDir, password); err != nil {
 		d.svc.log.Error("post-processing failed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "error", err)
 	}
+}
+
+// readManifestPassword reads the saved manifest.nzb in a download directory
+// and extracts the archive password from NZB metadata, if present.
+func (d *Downloader) readManifestPassword(dlDir string) string {
+	data, err := os.ReadFile(filepath.Join(dlDir, "manifest.nzb"))
+	if err != nil {
+		return ""
+	}
+	parsed, err := nzb.Parse(bytes.NewReader(data))
+	if err != nil {
+		return ""
+	}
+	pw := parsed.Password()
+	if pw != "" {
+		d.svc.log.Info("recovered NZB password from manifest", "dir", filepath.Base(dlDir))
+	}
+	return pw
 }
 
 // processUsenetDownloadOnly handles the NNTP download phase only.
@@ -435,7 +454,13 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
 	}
 
-	// Save NZB for potential resume.
+	// Extract password from NZB metadata (if present).
+	nzbPassword := parsed.Password()
+	if nzbPassword != "" {
+		d.svc.log.Info("NZB contains archive password", "title", item.Title)
+	}
+
+	// Save NZB for potential resume (includes password metadata).
 	_ = os.WriteFile(filepath.Join(dlDir, "manifest.nzb"), nzbData, 0o644)
 
 	// 6. NNTP Download with progress callback and health abort.
@@ -654,7 +679,13 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
 	}
 
-	// Save NZB for potential resume (avoids re-fetch from indexer on crash).
+	// Extract password from NZB metadata (if present).
+	nzbPassword := parsed.Password()
+	if nzbPassword != "" {
+		d.svc.log.Info("NZB contains archive password", "title", item.Title)
+	}
+
+	// Save NZB for potential resume (includes password metadata).
 	_ = os.WriteFile(filepath.Join(dlDir, "manifest.nzb"), nzbData, 0o644)
 
 	// 5. NNTP Download with progress callback and health abort.
@@ -695,13 +726,13 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 	}
 
 	// 7-10. Post-process, import, complete, cleanup.
-	return d.postProcessImportComplete(ctx, item, dlDir)
+	return d.postProcessImportComplete(ctx, item, dlDir, nzbPassword)
 }
 
 // postProcessImportComplete runs post-processing (PAR2/RAR), imports media files
 // to the library, records completion, and cleans up. Used by both the normal
 // download pipeline and the resume path.
-func (d *Downloader) postProcessImportComplete(ctx context.Context, item database.QueueItem, downloadDir string) error {
+func (d *Downloader) postProcessImportComplete(ctx context.Context, item database.QueueItem, downloadDir string, password string) error {
 	// Reset progress to 0 and clear any stale error for the post-processing phase.
 	_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, 0, 0)
 	_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID, "")
@@ -711,7 +742,7 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 		_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID, phase)
 	}
 
-	result, err := postprocess.Process(ctx, downloadDir, d.svc.log, progressFn)
+	result, err := postprocess.Process(ctx, downloadDir, d.svc.log, progressFn, password)
 	if err != nil {
 		return d.fail(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
 	}
@@ -847,7 +878,8 @@ func (d *Downloader) resumePostProcessing(ctx context.Context, item database.Que
 		}
 	}
 
-	return d.postProcessImportComplete(ctx, item, dlDir)
+	password := d.readManifestPassword(dlDir)
+	return d.postProcessImportComplete(ctx, item, dlDir, password)
 }
 
 // expectedLibraryPath computes where the file would be imported based on the

@@ -58,6 +58,17 @@ func Parse(r io.Reader) (*NZB, error) {
 	return &n, nil
 }
 
+// Password returns the archive password from the NZB metadata, if present.
+// NZB files embed passwords as <meta type="password">value</meta> in the head section.
+func (n *NZB) Password() string {
+	for _, m := range n.Meta {
+		if m.Type == "password" {
+			return m.Value
+		}
+	}
+	return ""
+}
+
 // TotalSize returns the total size in bytes across all files and segments.
 func (n *NZB) TotalSize() int64 {
 	var total int64
