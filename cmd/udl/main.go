@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -263,6 +265,21 @@ var libraryVerifyCmd = &cobra.Command{
 	RunE:  runLibraryVerify,
 }
 
+var libraryPruneCmd = &cobra.Command{
+	Use:   "prune",
+	Short: "Delete files for unmonitored episodes",
+	Long:  "Dry-run by default. Use --execute to actually delete files.",
+	RunE:  runLibraryPrune,
+}
+
+var tvDeleteCmd = &cobra.Command{
+	Use:   "delete [tmdb-id]",
+	Short: "Delete files for a series (or specific season)",
+	Long:  "Delete files and unmonitor episodes. Dry-run by default. Use --execute to actually delete.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runTVDelete,
+}
+
 var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Import media from Sonarr/Radarr",
@@ -306,7 +323,9 @@ func init() {
 	tvMonitorCmd.Flags().Bool("latest", false, "Monitor only the latest season")
 	tvMonitorCmd.Flags().Bool("all", false, "Monitor all seasons")
 	tvMonitorCmd.Flags().Bool("none", false, "Unmonitor all seasons")
-	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd, tvMonitorCmd)
+	tvDeleteCmd.Flags().IntP("season", "s", -1, "Season number to delete (-1 means all)")
+	tvDeleteCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
+	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd, tvMonitorCmd, tvDeleteCmd)
 	queueClearCmd.Flags().Bool("unmonitored", false, "Only clear unmonitored episodes")
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
@@ -335,7 +354,9 @@ func init() {
 	libraryCleanupCmd.Flags().Bool("rename", false, "Fix misnamed files (requires --execute to apply)")
 	libraryCleanupCmd.Flags().Bool("delete", false, "Delete orphan files (requires --execute to apply)")
 	libraryPruneIncompleteCmd.Flags().Bool("execute", false, "Actually remove directories (default is dry-run)")
-	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd, libraryPruneIncompleteCmd, libraryVerifyCmd)
+	libraryPruneCmd.Flags().Bool("unmonitored", false, "Prune files for unmonitored episodes")
+	libraryPruneCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
+	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd, libraryPruneIncompleteCmd, libraryVerifyCmd, libraryPruneCmd)
 
 	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd)
 }
@@ -946,6 +967,103 @@ func runTVRemove(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func runTVDelete(cmd *cobra.Command, args []string) error {
+	tmdbID, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("TMDB ID must be a number (use 'udl tv list' to find it)")
+	}
+
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	season, _ := cmd.Flags().GetInt("season")
+	execute, _ := cmd.Flags().GetBool("execute")
+
+	rpcArgs := &daemon.TVDeleteArgs{TmdbID: tmdbID, Season: season, Execute: execute}
+	var reply daemon.TVDeleteReply
+	if err := client.Call("Service.TVDelete", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Items) == 0 {
+		fmt.Println("no downloaded files found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ACTION\tEPISODE\tSIZE\tPATH")
+	for _, item := range reply.Items {
+		action := "delete"
+		if item.Deleted {
+			action = "deleted"
+		}
+		ep := fmt.Sprintf("%s S%02dE%02d", item.SeriesTitle, item.Season, item.Episode)
+		if item.EpTitle != "" {
+			ep += " " + item.EpTitle
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", action, ep, formatSize(item.SizeBytes), item.FilePath)
+	}
+	w.Flush()
+
+	if execute {
+		fmt.Printf("\n%d files deleted, %s reclaimed\n", len(reply.Items), formatSize(reply.TotalBytes))
+	} else {
+		fmt.Printf("\n%d files, %s total (dry-run: use --execute to delete)\n", len(reply.Items), formatSize(reply.TotalBytes))
+	}
+	return nil
+}
+
+func runLibraryPrune(cmd *cobra.Command, args []string) error {
+	unmonitored, _ := cmd.Flags().GetBool("unmonitored")
+	if !unmonitored {
+		return fmt.Errorf("--unmonitored flag is required")
+	}
+
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	execute, _ := cmd.Flags().GetBool("execute")
+
+	rpcArgs := &daemon.LibraryPruneArgs{Unmonitored: true, Execute: execute}
+	var reply daemon.LibraryPruneReply
+	if err := client.Call("Service.LibraryPrune", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Items) == 0 {
+		fmt.Println("no unmonitored downloaded files found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ACTION\tSERIES\tEPISODE\tSIZE\tPATH")
+	for _, item := range reply.Items {
+		action := "delete"
+		if item.Deleted {
+			action = "deleted"
+		}
+		ep := fmt.Sprintf("S%02dE%02d", item.Season, item.Episode)
+		if item.EpTitle != "" {
+			ep += " " + item.EpTitle
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", action, item.SeriesTitle, ep, formatSize(item.SizeBytes), item.FilePath)
+	}
+	w.Flush()
+
+	if execute {
+		fmt.Printf("\n%d files deleted, %s reclaimed\n", len(reply.Items), formatSize(reply.TotalBytes))
+	} else {
+		fmt.Printf("\n%d files, %s total (dry-run: use --execute to delete)\n", len(reply.Items), formatSize(reply.TotalBytes))
+	}
+	return nil
+}
+
 func runTVRefresh(cmd *cobra.Command, args []string) error {
 	client, err := daemon.Dial()
 	if err != nil {
@@ -1163,9 +1281,18 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Sort by (Title, Season) for stable ordering.
+	sort.Slice(reply.Items, func(i, j int) bool {
+		a, b := reply.Items[i], reply.Items[j]
+		if a.Title != b.Title {
+			return a.Title < b.Title
+		}
+		return a.Season < b.Season
+	})
+
 	// Show items in a table.
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ACTION\tTYPE\tTITLE\tQUALITY\tAGE\tSIZE")
+	fmt.Fprintln(w, "ACTION\tTYPE\tTITLE\tQUALITY\tAGE\tSIZE\tLAST WATCHED\tWATCHED BY")
 	for _, item := range reply.Items {
 		if item.Action == "keep" && !verbose {
 			continue
@@ -1177,7 +1304,7 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 		if item.Action == "keep" {
 			action = fmt.Sprintf("keep (%s)", item.Reason)
 		}
-		age := ""
+		age := "-"
 		if item.AddedDays > 0 {
 			age = fmt.Sprintf("%dd", item.AddedDays)
 		}
@@ -1186,8 +1313,28 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 		if item.Year > 0 {
 			title = fmt.Sprintf("%s (%d)", item.Title, item.Year)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			action, item.MediaType, title, item.Quality, age, size)
+		if item.MediaType == "season" {
+			title = fmt.Sprintf("%s S%02d (%dep)", title, item.Season, item.EpisodeCount)
+		}
+
+		lastWatched := "-"
+		if item.LastWatchedAt > 0 {
+			daysAgo := int(time.Since(time.Unix(item.LastWatchedAt, 0)).Hours() / 24)
+			if daysAgo == 0 {
+				lastWatched = "today"
+			} else {
+				lastWatched = fmt.Sprintf("%dd ago", daysAgo)
+			}
+		}
+
+		watchedBy := "-"
+		if len(item.WatchedBy) > 0 {
+			sort.Strings(item.WatchedBy)
+			watchedBy = strings.Join(item.WatchedBy, ", ")
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			action, item.MediaType, title, item.Quality, age, size, lastWatched, watchedBy)
 	}
 	if err := w.Flush(); err != nil {
 		return err

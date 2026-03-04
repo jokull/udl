@@ -82,11 +82,19 @@ type LibraryItem struct {
 	Title        string
 	Year         int
 	Type         string   // "movie", "show", or "episode"
+	ParentIndex  int      // season number (for episodes)
 	ViewCount    int      // 0 = never watched
 	LastViewedAt int64    // unix timestamp, 0 if never
 	AddedAt      int64    // unix timestamp
 	FilePaths    []string // all file paths for this item's media parts
 	TotalSize    int64    // sum of all part sizes
+}
+
+// WatchHistoryEntry represents a single watch event from Plex's history.
+type WatchHistoryEntry struct {
+	AccountID int
+	RatingKey string
+	ViewedAt  int64 // unix timestamp
 }
 
 // New creates a Plex client. The token is a Plex authentication token
@@ -662,6 +670,7 @@ func (c *Client) ShowAllLeaves(srv Server, showRatingKey string) ([]LibraryItem,
 			Title:        meta.Title,
 			Year:         meta.Year,
 			Type:         "episode",
+			ParentIndex:  meta.ParentIndex,
 			ViewCount:    meta.ViewCount,
 			LastViewedAt: meta.LastViewedAt,
 			AddedAt:      meta.AddedAt,
@@ -677,6 +686,106 @@ func (c *Client) ShowAllLeaves(srv Server, showRatingKey string) ([]LibraryItem,
 		items = append(items, item)
 	}
 	return items, nil
+}
+
+// Accounts returns a map of accountID → display name for all accounts
+// that have access to the given server.
+func (c *Client) Accounts(srv Server) (map[int]string, error) {
+	reqURL := fmt.Sprintf("%s/accounts", srv.URI)
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setServerHeaders(req, srv.AccessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("plex: accounts: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("plex: accounts: status %d", resp.StatusCode)
+	}
+
+	var result struct {
+		MediaContainer struct {
+			Account []struct {
+				ID   int    `json:"id"`
+				Name string `json:"name"`
+			} `json:"Account"`
+		} `json:"MediaContainer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("plex: decode accounts: %w", err)
+	}
+
+	accounts := make(map[int]string)
+	for _, a := range result.MediaContainer.Account {
+		accounts[a.ID] = a.Name
+	}
+	return accounts, nil
+}
+
+// WatchHistory fetches the complete watch history for a library section,
+// paginated up to 5000 entries. Returns a map of ratingKey → watch entries.
+func (c *Client) WatchHistory(srv Server, sectionID string) (map[string][]WatchHistoryEntry, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	result := make(map[string][]WatchHistoryEntry)
+	start := 0
+	pageSize := 500
+
+	for {
+		reqURL := fmt.Sprintf("%s/status/sessions/history/all?sort=viewedAt:desc&librarySectionID=%s&X-Plex-Container-Start=%d&X-Plex-Container-Size=%d",
+			srv.URI, sectionID, start, pageSize)
+		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.setServerHeaders(req, srv.AccessToken)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("plex: watch history: %w", err)
+		}
+
+		var page struct {
+			MediaContainer struct {
+				Size     int `json:"size"`
+				Metadata []struct {
+					RatingKey string `json:"ratingKey"`
+					AccountID int    `json:"accountID"`
+					ViewedAt  int64  `json:"viewedAt"`
+				} `json:"Metadata"`
+			} `json:"MediaContainer"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("plex: decode watch history: %w", err)
+		}
+		resp.Body.Close()
+
+		for _, m := range page.MediaContainer.Metadata {
+			entry := WatchHistoryEntry{
+				AccountID: m.AccountID,
+				RatingKey: m.RatingKey,
+				ViewedAt:  m.ViewedAt,
+			}
+			result[m.RatingKey] = append(result[m.RatingKey], entry)
+		}
+
+		if len(page.MediaContainer.Metadata) < pageSize {
+			break
+		}
+		start += pageSize
+		if start >= 5000 {
+			break
+		}
+	}
+
+	return result, nil
 }
 
 // --- internal helpers ---
@@ -870,6 +979,7 @@ type libraryItemMeta struct {
 	Type         string      `json:"type"`
 	Title        string      `json:"title"`
 	Year         int         `json:"year"`
+	ParentIndex  int         `json:"parentIndex"` // season number (for episodes)
 	ViewCount    int         `json:"viewCount"`
 	LastViewedAt int64       `json:"lastViewedAt"`
 	AddedAt      int64       `json:"addedAt"`

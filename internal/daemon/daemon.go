@@ -916,15 +916,19 @@ type PlexCleanupArgs struct {
 
 // PlexCleanupItem describes a single media item considered for cleanup.
 type PlexCleanupItem struct {
-	MediaType string // "movie" or "series"
-	Title     string
-	Year      int
-	Quality   string
-	AddedDays int    // days since added to Plex
-	SizeBytes int64  // total size of files to delete
-	Action    string // "delete" or "keep"
-	Reason    string // why kept: "watched", "too-recent", "not-in-plex"
-	Deleted   bool   // true if actually deleted (when Execute=true)
+	MediaType     string   // "movie" or "season"
+	Title         string
+	Year          int
+	Season        int      // season number (0 for movies)
+	EpisodeCount  int      // number of episodes in this season group
+	Quality       string
+	AddedDays     int      // days since added to Plex
+	SizeBytes     int64    // total size of files to delete
+	Action        string   // "delete" or "keep"
+	Reason        string   // why kept: "watched", "too-recent", "not-in-plex"
+	Deleted       bool     // true if actually deleted (when Execute=true)
+	LastWatchedAt int64    // unix timestamp of most recent watch (0 if never)
+	WatchedBy     []string // Plex usernames who watched
 }
 
 // PlexCleanupReply contains the reply for the PlexCleanup RPC method.
@@ -935,6 +939,44 @@ type PlexCleanupReply struct {
 	TotalSize    int64 // total bytes to reclaim
 	DeletedCount int   // actually deleted (Execute mode)
 	DeletedSize  int64 // bytes actually reclaimed
+}
+
+// --- TV delete / library prune types ---
+
+// DeleteItem describes a single file considered for deletion.
+type DeleteItem struct {
+	SeriesTitle string
+	Season      int
+	Episode     int
+	EpTitle     string
+	FilePath    string
+	SizeBytes   int64
+	Deleted     bool
+}
+
+// TVDeleteArgs contains arguments for the TVDelete RPC method.
+type TVDeleteArgs struct {
+	TmdbID  int
+	Season  int  // -1 means all seasons
+	Execute bool // false = dry-run
+}
+
+// TVDeleteReply contains the reply for the TVDelete RPC method.
+type TVDeleteReply struct {
+	Items      []DeleteItem
+	TotalBytes int64
+}
+
+// LibraryPruneArgs contains arguments for the LibraryPrune RPC method.
+type LibraryPruneArgs struct {
+	Unmonitored bool
+	Execute     bool // false = dry-run
+}
+
+// LibraryPruneReply contains the reply for the LibraryPrune RPC method.
+type LibraryPruneReply struct {
+	Items      []DeleteItem
+	TotalBytes int64
 }
 
 // Blocklist returns all blocklist entries.
@@ -1041,6 +1083,7 @@ func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 // PlexCleanup identifies unwatched media older than N days and optionally deletes it.
 // Queries the user's owned Plex server for watch history, cross-references with the
 // UDL database, and removes files that have never been watched.
+// TV series are grouped at the season level for granular cleanup.
 func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) error {
 	if s.plex == nil {
 		return fmt.Errorf("PlexCleanup: Plex integration not configured (set plex.token or PLEX_TOKEN)")
@@ -1065,25 +1108,49 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 		return fmt.Errorf("PlexCleanup: %w", err)
 	}
 
+	// Fetch accounts for watch attribution.
+	accountNames, err := s.plex.Accounts(*ownedSrv)
+	if err != nil {
+		s.log.Warn("plex cleanup: fetch accounts failed, watch attribution unavailable", "error", err)
+		accountNames = make(map[int]string)
+	}
+
 	// Build file path → Plex item map from all sections.
 	// For TV show sections, we fetch per-show episode data.
 	type plexFileInfo struct {
-		viewCount int
-		addedAt   int64
+		ratingKey    string
+		viewCount    int
+		lastViewedAt int64
+		addedAt      int64
+		season       int // from Plex parentIndex
 	}
 	plexFiles := make(map[string]*plexFileInfo)
 
-	// Also track show-level data for TV series cleanup.
-	type showInfo struct {
-		ratingKey  string
-		title      string
-		year       int
-		viewCount  int // show-level viewCount (>0 if any episode watched)
-		addedAt    int64
-	}
-	var shows []showInfo
+	// Watch history maps: ratingKey → latest viewedAt, ratingKey → set of watcher names.
+	watchedByMap := make(map[string]map[string]bool)   // ratingKey → set of names
+	lastWatchedMap := make(map[string]int64)            // ratingKey → latest viewedAt
 
 	for _, sec := range sections {
+		// Fetch watch history for this section.
+		history, err := s.plex.WatchHistory(*ownedSrv, sec.Key)
+		if err != nil {
+			s.log.Warn("plex cleanup: fetch watch history failed", "section", sec.Title, "error", err)
+		} else {
+			for rk, entries := range history {
+				for _, e := range entries {
+					if e.ViewedAt > lastWatchedMap[rk] {
+						lastWatchedMap[rk] = e.ViewedAt
+					}
+					if watchedByMap[rk] == nil {
+						watchedByMap[rk] = make(map[string]bool)
+					}
+					if name, ok := accountNames[e.AccountID]; ok {
+						watchedByMap[rk][name] = true
+					}
+				}
+			}
+		}
+
 		items, err := s.plex.LibraryAllItems(*ownedSrv, sec.Key)
 		if err != nil {
 			s.log.Warn("plex cleanup: list section failed", "section", sec.Title, "error", err)
@@ -1094,22 +1161,16 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 			for _, item := range items {
 				for _, fp := range item.FilePaths {
 					plexFiles[fp] = &plexFileInfo{
-						viewCount: item.ViewCount,
-						addedAt:   item.AddedAt,
+						ratingKey:    item.RatingKey,
+						viewCount:    item.ViewCount,
+						lastViewedAt: item.LastViewedAt,
+						addedAt:      item.AddedAt,
 					}
 				}
 			}
 		} else if sec.Type == "show" {
 			// For TV, fetch all episodes per show to get per-file watch data.
 			for _, item := range items {
-				shows = append(shows, showInfo{
-					ratingKey: item.RatingKey,
-					title:     item.Title,
-					year:      item.Year,
-					viewCount: item.ViewCount,
-					addedAt:   item.AddedAt,
-				})
-				// Fetch episodes to populate file path map.
 				episodes, err := s.plex.ShowAllLeaves(*ownedSrv, item.RatingKey)
 				if err != nil {
 					s.log.Debug("plex cleanup: fetch episodes failed", "show", item.Title, "error", err)
@@ -1118,8 +1179,11 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 				for _, ep := range episodes {
 					for _, fp := range ep.FilePaths {
 						plexFiles[fp] = &plexFileInfo{
-							viewCount: ep.ViewCount,
-							addedAt:   ep.AddedAt,
+							ratingKey:    ep.RatingKey,
+							viewCount:    ep.ViewCount,
+							lastViewedAt: ep.LastViewedAt,
+							addedAt:      ep.AddedAt,
+							season:       ep.ParentIndex,
 						}
 					}
 				}
@@ -1127,7 +1191,20 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 		}
 	}
 
-	s.log.Info("plex cleanup: indexed library", "files", len(plexFiles), "shows", len(shows))
+	s.log.Info("plex cleanup: indexed library", "files", len(plexFiles), "watch_history_keys", len(lastWatchedMap))
+
+	// Helper to collect watcher names for a ratingKey.
+	watcherNames := func(rk string) []string {
+		names := watchedByMap[rk]
+		if len(names) == 0 {
+			return nil
+		}
+		var result []string
+		for n := range names {
+			result = append(result, n)
+		}
+		return result
+	}
 
 	// --- Process movies ---
 	movies, err := s.db.DownloadedMovies()
@@ -1157,6 +1234,12 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 			reply.Items = append(reply.Items, item)
 			continue
 		}
+
+		// Enrich with watch history data.
+		if lw, ok := lastWatchedMap[pf.ratingKey]; ok {
+			item.LastWatchedAt = lw
+		}
+		item.WatchedBy = watcherNames(pf.ratingKey)
 
 		addedTime := time.Unix(pf.addedAt, 0)
 		item.AddedDays = int(time.Since(addedTime).Hours() / 24)
@@ -1195,37 +1278,47 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 		reply.Items = append(reply.Items, item)
 	}
 
-	// --- Process TV series ---
-	// Group downloaded episodes by series.
+	// --- Process TV seasons ---
+	// Group downloaded episodes by series+season for granular cleanup.
 	downloadedEps, err := s.db.DownloadedEpisodes()
 	if err != nil {
 		return fmt.Errorf("PlexCleanup: list episodes: %w", err)
 	}
 
-	type seriesGroup struct {
-		seriesID   int64
-		title      string
-		year       int
-		episodes   []database.Episode
-		anyWatched bool
-		earliestAdd int64 // earliest Plex addedAt across episodes
-		totalSize  int64
+	type seasonKey struct {
+		seriesID int64
+		season   int
 	}
-	seriesMap := make(map[int64]*seriesGroup)
+	type seasonGroup struct {
+		seriesID    int64
+		title       string
+		year        int
+		season      int
+		episodes    []database.Episode
+		anyWatched  bool
+		latestWatch int64
+		watchedBy   map[string]bool
+		earliestAdd int64
+		totalSize   int64
+	}
+	seasonMap := make(map[seasonKey]*seasonGroup)
 
 	for _, ep := range downloadedEps {
-		sg, ok := seriesMap[ep.SeriesID]
+		key := seasonKey{seriesID: ep.SeriesID, season: ep.Season}
+		sg, ok := seasonMap[key]
 		if !ok {
 			series, err := s.db.GetSeries(ep.SeriesID)
 			if err != nil {
 				continue
 			}
-			sg = &seriesGroup{
-				seriesID: ep.SeriesID,
-				title:    series.Title,
-				year:     series.Year,
+			sg = &seasonGroup{
+				seriesID:  ep.SeriesID,
+				title:     series.Title,
+				year:      series.Year,
+				season:    ep.Season,
+				watchedBy: make(map[string]bool),
 			}
-			seriesMap[ep.SeriesID] = sg
+			seasonMap[key] = sg
 		}
 		sg.episodes = append(sg.episodes, ep)
 
@@ -1233,6 +1326,13 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 			if pf, ok := plexFiles[ep.FilePath.String]; ok {
 				if pf.viewCount > 0 {
 					sg.anyWatched = true
+				}
+				// Enrich from watch history.
+				if lw, ok := lastWatchedMap[pf.ratingKey]; ok && lw > sg.latestWatch {
+					sg.latestWatch = lw
+				}
+				for _, name := range watcherNames(pf.ratingKey) {
+					sg.watchedBy[name] = true
 				}
 				if sg.earliestAdd == 0 || pf.addedAt < sg.earliestAdd {
 					sg.earliestAdd = pf.addedAt
@@ -1244,12 +1344,21 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 		}
 	}
 
-	for _, sg := range seriesMap {
+	for _, sg := range seasonMap {
+		var watchedBySlice []string
+		for name := range sg.watchedBy {
+			watchedBySlice = append(watchedBySlice, name)
+		}
+
 		item := PlexCleanupItem{
-			MediaType: "series",
-			Title:     sg.title,
-			Year:      sg.year,
-			SizeBytes: sg.totalSize,
+			MediaType:     "season",
+			Title:         sg.title,
+			Year:          sg.year,
+			Season:        sg.season,
+			EpisodeCount:  len(sg.episodes),
+			SizeBytes:     sg.totalSize,
+			LastWatchedAt: sg.latestWatch,
+			WatchedBy:     watchedBySlice,
 		}
 
 		if sg.earliestAdd == 0 {
@@ -1277,22 +1386,26 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 			reply.TotalSize += sg.totalSize
 
 			if args.Execute {
-				// Delete the entire series folder.
-				seriesFolder := filepath.Join(s.cfg.Library.TV, fmt.Sprintf("%s (%d)", sg.title, sg.year))
-				if err := os.RemoveAll(seriesFolder); err != nil {
-					s.log.Error("plex cleanup: delete series folder", "path", seriesFolder, "error", err)
+				// Delete the season folder (not the entire series).
+				seasonFolder := filepath.Join(
+					s.cfg.Library.TV,
+					fmt.Sprintf("%s (%d)", sg.title, sg.year),
+					fmt.Sprintf("Season %02d", sg.season),
+				)
+				if err := os.RemoveAll(seasonFolder); err != nil {
+					s.log.Error("plex cleanup: delete season folder", "path", seasonFolder, "error", err)
 				} else {
 					item.Deleted = true
 					reply.DeletedCount++
 					reply.DeletedSize += sg.totalSize
-					// Reset all episodes to wanted.
+					// Reset only this season's episodes to wanted.
 					for _, ep := range sg.episodes {
 						s.db.UpdateEpisodeStatus(ep.ID, "wanted", "", "")
 					}
 					s.db.AddHistory("series", sg.seriesID,
-						fmt.Sprintf("%s (%d)", sg.title, sg.year),
+						fmt.Sprintf("%s (%d) S%02d", sg.title, sg.year, sg.season),
 						"cleaned", "plex-cleanup", "")
-					s.log.Info("plex cleanup: deleted series", "title", sg.title, "year", sg.year)
+					s.log.Info("plex cleanup: deleted season", "title", sg.title, "year", sg.year, "season", sg.season)
 				}
 			}
 		}
@@ -1302,6 +1415,121 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 	// Clean up empty directories after deletions.
 	if args.Execute && reply.DeletedCount > 0 {
 		removeEmptyDirs(s.cfg.Library.Movies)
+		removeEmptyDirs(s.cfg.Library.TV)
+	}
+
+	return nil
+}
+
+// TVDelete deletes files for a series (optionally filtered to a single season),
+// resets episodes to wanted+unmonitored, and cleans up empty directories.
+// Dry-run by default; set Execute=true to actually delete.
+func (s *Service) TVDelete(args *TVDeleteArgs, reply *TVDeleteReply) error {
+	if args.TmdbID == 0 {
+		return fmt.Errorf("TVDelete: TMDB ID is required")
+	}
+	series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
+	if err != nil {
+		return fmt.Errorf("TVDelete: %w", err)
+	}
+	if series == nil {
+		return fmt.Errorf("TVDelete: no series with TMDB ID %d", args.TmdbID)
+	}
+
+	episodes, err := s.db.EpisodesForSeries(series.ID)
+	if err != nil {
+		return fmt.Errorf("TVDelete: %w", err)
+	}
+
+	for _, ep := range episodes {
+		if args.Season >= 0 && ep.Season != args.Season {
+			continue
+		}
+		if ep.Status != "downloaded" || !ep.FilePath.Valid || ep.FilePath.String == "" {
+			continue
+		}
+
+		item := DeleteItem{
+			SeriesTitle: series.Title,
+			Season:      ep.Season,
+			Episode:     ep.Episode,
+			FilePath:    ep.FilePath.String,
+		}
+		if ep.Title.Valid {
+			item.EpTitle = ep.Title.String
+		}
+
+		info, err := os.Stat(ep.FilePath.String)
+		if err == nil {
+			item.SizeBytes = info.Size()
+		}
+		reply.TotalBytes += item.SizeBytes
+
+		if args.Execute {
+			if err := os.Remove(ep.FilePath.String); err != nil && !os.IsNotExist(err) {
+				s.log.Warn("TVDelete: failed to remove file", "path", ep.FilePath.String, "err", err)
+			} else {
+				item.Deleted = true
+			}
+			if err := s.db.ResetEpisodeFile(ep.ID); err != nil {
+				s.log.Warn("TVDelete: failed to reset episode", "id", ep.ID, "err", err)
+			}
+		}
+
+		reply.Items = append(reply.Items, item)
+	}
+
+	if args.Execute && len(reply.Items) > 0 {
+		removeEmptyDirs(s.cfg.Library.TV)
+	}
+
+	return nil
+}
+
+// LibraryPrune deletes files for unmonitored episodes and resets them to wanted.
+// Dry-run by default; set Execute=true to actually delete.
+func (s *Service) LibraryPrune(args *LibraryPruneArgs, reply *LibraryPruneReply) error {
+	if !args.Unmonitored {
+		return fmt.Errorf("LibraryPrune: --unmonitored flag is required")
+	}
+
+	episodes, err := s.db.UnmonitoredDownloadedEpisodes()
+	if err != nil {
+		return fmt.Errorf("LibraryPrune: %w", err)
+	}
+
+	for _, ep := range episodes {
+		item := DeleteItem{
+			SeriesTitle: ep.SeriesTitle,
+			Season:      ep.Season,
+			Episode:     ep.Episode,
+			FilePath:    ep.FilePath.String,
+		}
+		if ep.Title.Valid {
+			item.EpTitle = ep.Title.String
+		}
+
+		info, err := os.Stat(ep.FilePath.String)
+		if err == nil {
+			item.SizeBytes = info.Size()
+		}
+		reply.TotalBytes += item.SizeBytes
+
+		if args.Execute {
+			if err := os.Remove(ep.FilePath.String); err != nil && !os.IsNotExist(err) {
+				s.log.Warn("LibraryPrune: failed to remove file", "path", ep.FilePath.String, "err", err)
+			} else {
+				item.Deleted = true
+			}
+			if err := s.db.ResetEpisodeFile(ep.ID); err != nil {
+				s.log.Warn("LibraryPrune: failed to reset episode", "id", ep.ID, "err", err)
+			}
+		}
+
+		reply.Items = append(reply.Items, item)
+	}
+
+	if args.Execute && len(reply.Items) > 0 {
 		removeEmptyDirs(s.cfg.Library.TV)
 	}
 
