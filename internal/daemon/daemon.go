@@ -81,10 +81,12 @@ type AddMovieArgs struct {
 
 // AddMovieReply contains the reply for the AddMovie RPC method.
 type AddMovieReply struct {
-	Title   string
-	Year    int
-	TmdbID  int
-	Grabbed bool // true if a release was immediately enqueued
+	Title         string
+	Year          int
+	TmdbID        int
+	Grabbed       bool   // true if a release was immediately enqueued
+	AlreadyExists bool   // true if the movie was already in the database
+	Status        string // current status when AlreadyExists is true
 }
 
 // SearchMovieArgs contains arguments for the SearchMovie (indexer search) RPC method.
@@ -125,11 +127,13 @@ type AddSeriesArgs struct {
 
 // AddSeriesReply contains the reply for the AddSeries RPC method.
 type AddSeriesReply struct {
-	Title        string
-	Year         int
-	TmdbID       int
-	EpisodeCount int
-	Grabbed      int // number of episodes immediately enqueued
+	Title         string
+	Year          int
+	TmdbID        int
+	EpisodeCount  int
+	Grabbed       int    // number of episodes immediately enqueued
+	AlreadyExists bool
+	Status        string
 }
 
 // SeriesListReply contains the reply for the ListSeries RPC method.
@@ -308,7 +312,29 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 
 	id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year)
 	if err != nil {
-		return fmt.Errorf("AddMovie: %w", err)
+		// Check if it already exists.
+		existing, findErr := s.db.FindMovieByTmdbID(movie.TMDBID)
+		if findErr != nil || existing == nil {
+			return fmt.Errorf("AddMovie: %w", err)
+		}
+		reply.Title = existing.Title
+		reply.Year = existing.Year
+		reply.TmdbID = existing.TmdbID
+		reply.AlreadyExists = true
+		reply.Status = existing.Status
+
+		// Re-search if wanted or failed.
+		if (existing.Status == "wanted" || existing.Status == "failed") && len(s.indexers) > 0 {
+			if existing.Status == "failed" {
+				s.db.ResetMediaForRetry("movie", existing.ID)
+			}
+			grabbed, searchErr := s.SearchAndGrabMovie(existing)
+			if searchErr != nil {
+				s.log.Error("re-search existing movie", "title", existing.Title, "error", searchErr)
+			}
+			reply.Grabbed = grabbed
+		}
+		return nil
 	}
 
 	reply.Title = movie.Title
@@ -468,7 +494,16 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 
 	id, err := s.db.AddSeries(series.TMDBID, series.TVDBID, series.IMDBID, series.Title, series.Year)
 	if err != nil {
-		return fmt.Errorf("AddSeries: %w", err)
+		existing, findErr := s.db.FindSeriesByTmdbID(series.TMDBID)
+		if findErr != nil || existing == nil {
+			return fmt.Errorf("AddSeries: %w", err)
+		}
+		reply.Title = existing.Title
+		reply.Year = existing.Year
+		reply.TmdbID = existing.TmdbID
+		reply.AlreadyExists = true
+		reply.Status = existing.Status
+		return nil
 	}
 
 	// Fetch and store all episodes.

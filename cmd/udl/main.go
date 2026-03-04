@@ -489,11 +489,18 @@ func runMovieAdd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("added: %s (%d) [tmdb=%d]\n", reply.Title, reply.Year, reply.TmdbID)
-	if reply.Grabbed {
-		fmt.Println("  -> release found and enqueued for download")
+	if reply.AlreadyExists {
+		fmt.Printf("already exists: %s (%d) [tmdb=%d] — %s\n", reply.Title, reply.Year, reply.TmdbID, reply.Status)
+		if reply.Grabbed {
+			fmt.Println("  -> re-searched and enqueued for download")
+		}
 	} else {
-		fmt.Println("  -> no matching release found on indexers")
+		fmt.Printf("added: %s (%d) [tmdb=%d]\n", reply.Title, reply.Year, reply.TmdbID)
+		if reply.Grabbed {
+			fmt.Println("  -> release found and enqueued for download")
+		} else {
+			fmt.Println("  -> no matching release found on indexers")
+		}
 	}
 	return nil
 }
@@ -643,9 +650,13 @@ func runTVAdd(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("added: %s (%d) [tmdb=%d] — %d episodes\n", reply.Title, reply.Year, reply.TmdbID, reply.EpisodeCount)
-	if reply.Grabbed > 0 {
-		fmt.Printf("  -> %d episodes enqueued for download\n", reply.Grabbed)
+	if reply.AlreadyExists {
+		fmt.Printf("already exists: %s (%d) [tmdb=%d] — %s\n", reply.Title, reply.Year, reply.TmdbID, reply.Status)
+	} else {
+		fmt.Printf("added: %s (%d) [tmdb=%d] — %d episodes\n", reply.Title, reply.Year, reply.TmdbID, reply.EpisodeCount)
+		if reply.Grabbed > 0 {
+			fmt.Printf("  -> %d episodes enqueued for download\n", reply.Grabbed)
+		}
 	}
 	return nil
 }
