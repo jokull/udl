@@ -762,7 +762,11 @@ func runQueue(cmd *cobra.Command, args []string) error {
 			progress = 100
 		}
 		id := mediaTag(d.Category, d.TmdbID, d.Season, d.EpisodeNum, d.MediaID)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%.0f%%\n", id, d.Title, d.Status, progress)
+		progressStr := fmt.Sprintf("%.0f%%", progress)
+		if d.Status == "post_processing" && d.ErrorMsg.Valid && d.ErrorMsg.String != "" {
+			progressStr = fmt.Sprintf("%.0f%% %s", progress, d.ErrorMsg.String)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", id, d.Title, d.Status, progressStr)
 	}
 	return w.Flush()
 }

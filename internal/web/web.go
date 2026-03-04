@@ -300,6 +300,8 @@ func tplStatusClass(status string) string {
 		return "wanted"
 	case "downloading":
 		return "downloading"
+	case "post_processing":
+		return "post-processing"
 	case "downloaded", "completed":
 		return "downloaded"
 	case "failed":

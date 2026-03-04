@@ -294,11 +294,22 @@ func renameByPAR2(dir string, log *slog.Logger) int {
 	return renamed
 }
 
+// ProgressFn reports post-processing progress. Phase is a human-readable label
+// (e.g. "par2 verify", "rar extract"), pct is 0–100.
+type ProgressFn func(phase string, pct float64)
+
 // Process runs the full post-processing pipeline on a download directory.
 // Stages: PAR2 rename -> magic rename -> AppleDouble cleanup -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
 // The context is checked between stages for prompt cancellation on shutdown.
-func Process(ctx context.Context, dir string, log *slog.Logger) (*Result, error) {
+// If progressFn is non-nil, it is called at phase boundaries with a label and overall percentage.
+func Process(ctx context.Context, dir string, log *slog.Logger, progressFn ProgressFn) (*Result, error) {
 	result := &Result{}
+
+	report := func(phase string, pct float64) {
+		if progressFn != nil {
+			progressFn(phase, pct)
+		}
+	}
 
 	// Stage 0: Rename obfuscated files using PAR2 manifest hash matching.
 	if n := renameByPAR2(dir, log); n > 0 {
@@ -320,6 +331,7 @@ func Process(ctx context.Context, dir string, log *slog.Logger) (*Result, error)
 	removeAppleDoubleFiles(dir, log)
 
 	// Stage 2: PAR2 verify + repair
+	report("par2 verify", 0)
 	par2File, err := findPAR2File(dir)
 	if err != nil {
 		log.Warn("error searching for PAR2 files", "error", err)
@@ -339,6 +351,7 @@ func Process(ctx context.Context, dir string, log *slog.Logger) (*Result, error)
 				return result, fmt.Errorf("par2 verify failed: %w", err)
 			}
 		} else if needsRepair {
+			report("par2 repair", 15)
 			log.Info("PAR2 indicates repair needed, running repair")
 			if err := par2Repair(ctx, par2File, log); err != nil {
 				result.Success = false
@@ -352,12 +365,14 @@ func Process(ctx context.Context, dir string, log *slog.Logger) (*Result, error)
 	} else {
 		log.Info("no PAR2 files found, skipping verify/repair")
 	}
+	report("par2 verify", 15)
 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("post-processing canceled: %w", err)
 	}
 
 	// Stage 3: RAR extraction
+	report("rar extract", 40)
 	rarFiles, err := findRARFiles(dir)
 	if err != nil {
 		log.Warn("error searching for RAR files", "error", err)
@@ -375,12 +390,14 @@ func Process(ctx context.Context, dir string, log *slog.Logger) (*Result, error)
 	} else {
 		log.Info("no RAR archives found, skipping extraction")
 	}
+	report("rar extract", 90)
 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("post-processing canceled: %w", err)
 	}
 
 	// Stage 4: Cleanup
+	report("importing", 90)
 	if err := cleanup(dir, log); err != nil {
 		log.Warn("cleanup encountered errors", "error", err)
 		// Non-fatal: continue to identification

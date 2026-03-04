@@ -702,7 +702,16 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 // to the library, records completion, and cleans up. Used by both the normal
 // download pipeline and the resume path.
 func (d *Downloader) postProcessImportComplete(ctx context.Context, item database.QueueItem, downloadDir string) error {
-	result, err := postprocess.Process(ctx, downloadDir, d.svc.log)
+	// Reset progress to 0 and clear any stale error for the post-processing phase.
+	_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, 0, 0)
+	_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID, "")
+
+	progressFn := func(phase string, pct float64) {
+		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, pct, 0)
+		_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID, phase)
+	}
+
+	result, err := postprocess.Process(ctx, downloadDir, d.svc.log, progressFn)
 	if err != nil {
 		return d.fail(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
 	}

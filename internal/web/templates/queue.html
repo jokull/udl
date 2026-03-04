@@ -31,8 +31,8 @@
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td class="small">{{fmtSource .Source .NzbName .NzbURL}}</td>
     <td>
-      <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
-      {{fmtProgress .Progress}}
+      <div class="progress-bar"><div class="progress-fill{{if eq .Status "post_processing"}} post-processing{{end}}" style="width:{{fmtProgress .Progress}}"></div></div>
+      {{fmtProgress .Progress}}{{if and (eq .Status "post_processing") .ErrorMsg.Valid}} {{.ErrorMsg.String}}{{end}}
     </td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
     <td>{{if eq .Category "movie"}}<button hx-post="/queue/evict/movie/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Delete movie from library?">delete</button>{{else}}<button hx-post="/queue/evict/episode/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Unmonitor this episode?">unmonitor</button>{{end}}</td>

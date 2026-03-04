@@ -1199,6 +1199,17 @@ func (db *DB) UpdateMediaProgress(category string, id int64, progress float64, d
 	return err
 }
 
+// UpdateMediaPhaseLabel stores a post-processing phase label in download_error.
+// This reuses the column to avoid schema changes — the label is cleared on completion/failure.
+func (db *DB) UpdateMediaPhaseLabel(category string, id int64, phase string) error {
+	table := tableFor(category)
+	_, err := db.Exec(
+		fmt.Sprintf(`UPDATE %s SET download_error = ? WHERE id = ?`, table),
+		phase, id,
+	)
+	return err
+}
+
 // SetMediaDownloadError marks a media item as failed with an error message.
 func (db *DB) SetMediaDownloadError(category string, id int64, errMsg string) error {
 	table := tableFor(category)
