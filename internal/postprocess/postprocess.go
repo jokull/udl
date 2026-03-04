@@ -54,6 +54,31 @@ var cleanupExtensions = map[string]bool{
 	".rar":  true,
 }
 
+// isAppleDouble returns true if the filename is a macOS AppleDouble resource fork file.
+// These ._* files are created on non-HFS+ volumes (exFAT, NTFS) and contain no useful data.
+func isAppleDouble(name string) bool {
+	return strings.HasPrefix(name, "._")
+}
+
+// removeAppleDoubleFiles deletes all ._* files from a directory.
+// Must run before par2cmdline which scans the dir and loads ._*.par2 ghosts.
+func removeAppleDoubleFiles(dir string, log *slog.Logger) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() && isAppleDouble(entry.Name()) {
+			path := filepath.Join(dir, entry.Name())
+			if err := os.Remove(path); err != nil {
+				log.Warn("failed to remove AppleDouble file", "file", path, "error", err)
+			} else {
+				log.Debug("removed AppleDouble file", "file", entry.Name())
+			}
+		}
+	}
+}
+
 // Pattern matching .r00, .r01, ... .r99, etc.
 var rNumberedPattern = regexp.MustCompile(`(?i)^\.r\d+$`)
 
@@ -76,7 +101,7 @@ func renameByMagic(dir string, log *slog.Logger) error {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if entry.IsDir() || isAppleDouble(entry.Name()) {
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(entry.Name()))
@@ -151,6 +176,11 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 		log.Warn("rename by magic failed", "error", err)
 	}
 
+	// Stage 0.5: Delete macOS AppleDouble resource fork files before PAR2.
+	// par2cmdline scans the directory itself and picks up ._* files which
+	// contain no valid PAR2 packets and cause "Main packet not found" errors.
+	removeAppleDoubleFiles(dir, log)
+
 	// Stage 1: PAR2 verify + repair
 	par2File, err := findPAR2File(dir)
 	if err != nil {
@@ -160,12 +190,17 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 
 		needsRepair, err := par2Verify(par2File, log)
 		if err != nil {
-			result.Success = false
-			result.Error = fmt.Sprintf("PAR2 verify failed: %v", err)
-			return result, fmt.Errorf("par2 verify failed: %w", err)
-		}
-
-		if needsRepair {
+			// PAR2 failure is non-fatal if RAR files exist (common with obfuscated
+			// releases where filenames don't match the PAR2 manifest).
+			hasRAR, _ := findRARFiles(dir)
+			if len(hasRAR) > 0 {
+				log.Warn("PAR2 verify failed but RAR files exist, continuing to extraction", "error", err)
+			} else {
+				result.Success = false
+				result.Error = fmt.Sprintf("PAR2 verify failed: %v", err)
+				return result, fmt.Errorf("par2 verify failed: %w", err)
+			}
+		} else if needsRepair {
 			log.Info("PAR2 indicates repair needed, running repair")
 			if err := par2Repair(par2File, log); err != nil {
 				result.Success = false
@@ -239,10 +274,11 @@ func findPAR2File(dir string) (string, error) {
 	}
 
 	// Deduplicate (on case-insensitive filesystems these may overlap)
+	// and skip macOS AppleDouble resource fork files (._* prefix)
 	seen := make(map[string]bool)
 	var allMatches []string
 	for _, m := range append(matches, matchesUpper...) {
-		if !seen[m] {
+		if !seen[m] && !isAppleDouble(filepath.Base(m)) {
 			seen[m] = true
 			allMatches = append(allMatches, m)
 		}
@@ -311,11 +347,11 @@ func findRARFiles(dir string) ([]string, error) {
 		return nil, fmt.Errorf("glob for RAR files: %w", err)
 	}
 
-	// Deduplicate
+	// Deduplicate and skip macOS AppleDouble resource fork files
 	seen := make(map[string]bool)
 	var allMatches []string
 	for _, m := range append(matches, matchesUpper...) {
-		if !seen[m] {
+		if !seen[m] && !isAppleDouble(filepath.Base(m)) {
 			seen[m] = true
 			allMatches = append(allMatches, m)
 		}
@@ -445,7 +481,7 @@ func cleanup(dir string, log *slog.Logger) error {
 		if entry.IsDir() {
 			continue
 		}
-		if shouldCleanup(entry.Name()) {
+		if shouldCleanup(entry.Name()) || isAppleDouble(entry.Name()) {
 			path := filepath.Join(dir, entry.Name())
 			log.Debug("removing", "file", path)
 			if err := os.Remove(path); err != nil {
@@ -477,7 +513,7 @@ func identifyFiles(dir string) (mediaFiles, subtitleFiles []string, err error) {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
+		if info.IsDir() || isAppleDouble(info.Name()) {
 			return nil
 		}
 
