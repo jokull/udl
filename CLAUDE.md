@@ -4,8 +4,6 @@
 
 UDL (Usenet Download Layer) — a single Go binary replacing Sonarr + Radarr + NZBGet for Usenet-based media automation. CLI-first, daemon-mode, opinionated defaults.
 
-**Genesis:** "Combine sonarr, radarr and nzbget into a single Go CLI and daemon. Start super simple with a single NZB indexer and only usenet download, as few config parameters as possible, single config file. Only interface is the CLI — TUI to be added later."
-
 ## Quick Reference
 
 ```bash
@@ -18,13 +16,20 @@ go test ./... -count=1         # all tests
 ./udl movie list               # list movies
 ./udl tv add "Title"           # add TV series
 ./udl queue                    # show download queue
+
+# Install to ~/bin and restart LaunchAgent:
+go build -o ~/bin/udl ./cmd/udl
+codesign --force --sign - ~/bin/udl   # required — macOS kills unsigned binaries
+launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist
+launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist
 ```
 
 ## Architecture
 
 - **Single binary**, single config (`~/.config/udl/config.toml`), single db (`~/.config/udl/udl.db`)
 - **CLI ↔ Daemon** via `net/rpc` over Unix socket (`~/.config/udl/udl.sock`)
-- **Daemon** runs: scheduler (RSS sync every 15m, search sweep every 6h), downloader (polls queue every 5s)
+- **Web UI** at `udl.plex.uno` (Caddy reverse proxy → localhost:9876), htmx + SSE
+- **Daemon** runs: episode search (air-date-driven, 2m tick), movie search sweep (6h), downloader (polls queue every 5s)
 - **Download pipeline:** fetch NZB → parse → NNTP segment download → yEnc decode → PAR2 verify/repair → RAR extract → cleanup → import to library
 
 ## Package Map
@@ -37,9 +42,9 @@ internal/
   daemon/
     daemon.go             RPC service (AddMovie, ListSeries, SearchMovie, etc.)
     downloader.go         Download queue processor
-    scheduler.go          RSS sync + search sweep loops, normalize() for TV matching
+    scheduler.go          Air-date-driven episode search + movie search sweep
     searcher.go           Release scoring, cleanTitle() for movie matching, year validation
-  newznab/                Newznab API client (search, RSS, NZB fetch)
+  newznab/                Newznab API client (search, NZB fetch)
   nntp/
     conn.go               NNTP protocol (connect, auth, body fetch)
     pool.go               Connection pooling per provider
@@ -50,6 +55,9 @@ internal/
   organize/               File renaming + import (hardcoded Plex-compatible naming)
   postprocess/            PAR2 (shells out to par2cmdline), RAR (rardecode), cleanup
   tmdb/                   TMDB API wrapper (movies, TV, TVDB/IMDB cross-refs)
+  plex/                   Plex friend-server availability check
+  migrate/                Sonarr/Radarr import commands
+  web/                    Embedded HTTP server (htmx templates, SSE queue updates)
   yenc/                   yEnc binary-to-text decoder with CRC32 verification
 ```
 
@@ -59,22 +67,21 @@ internal/
 - `nwaples/rardecode` v2 for RAR, `golang.org/x/text` for unicode normalization
 - External: `par2cmdline` (brew install) for PAR2 verify/repair
 
-## Test Environment
+## Production Environment
 
-Existing Sonarr/Radarr/NZBGet runs natively via Homebrew on this Mac:
-- Radarr: localhost:7878, config at `~/mediaserver/.config/radarr/`
-- Sonarr: localhost:8989, config at `~/mediaserver/.config/sonarr/`
-- NZBGet: localhost:6789, config at `/opt/homebrew/etc/nzbget.conf`
-- Library: `/Users/jokull/Plex/media/{tv,movies}`
-- Downloads: `/Volumes/Plex/downloads/`
-- See [CURRENT-SETUP.md](CURRENT-SETUP.md) for full details and API keys
+- **Binary:** `~/bin/udl`, LaunchAgent `com.udl.daemon.plist`
+- **Library:** `/Users/jokull/Plex/media/{tv,movies}`
+- **Downloads:** `/Volumes/Plex/downloads/`
+- **Logs:** `~/Library/Logs/udl.log`
+- **Old Sonarr/Radarr/NZBGet:** unloaded, configs preserved at `~/mediaserver/.config/{radarr,sonarr}/`
+- See [CURRENT-SETUP.md](CURRENT-SETUP.md) for API keys and legacy setup details
 
 ## Conventions
 
 - **Quality profiles:** 720p, 1080p (default), 4k, remux — each sets min/preferred/upgrade_until
 - **File naming is hardcoded** — folders use spaces, filenames use dots: `Movie.Year.Quality.ext`, `Show.S01E01.Title.Quality.ext`
-- **No torrents, no web UI, no custom naming templates** — these are permanent scope exclusions
-- **Title matching:** `cleanTitle()` in searcher.go strips to pure alphanumeric lowercase (Radarr's approach), exact equality. `normalize()` in scheduler.go is looser for RSS TV matching.
+- **No torrents, no custom naming templates** — permanent scope exclusions
+- **Title matching:** `cleanTitle()` in searcher.go strips to pure alphanumeric lowercase, exact equality
 - **Year validation:** movie searches reject releases with wrong parsed year
 
 ## Planning Documents
@@ -83,10 +90,8 @@ Existing Sonarr/Radarr/NZBGet runs natively via Homebrew on this Mac:
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design, components, database schema, RPC methods
 - [PIPELINE.md](PIPELINE.md) — download + post-processing pipeline design
 - [RESEARCH.md](RESEARCH.md) — Go library ecosystem analysis, dependency decisions
-- [CURRENT-SETUP.md](CURRENT-SETUP.md) — existing local Sonarr/Radarr/NZBGet setup
+- [CURRENT-SETUP.md](CURRENT-SETUP.md) — legacy Sonarr/Radarr/NZBGet setup
 
-## Indexers Configured
+## Indexers
 
-UDL config (`~/.config/udl/config.toml`): DOGnzb, omgwtf (omgwtf hitting daily limits)
-
-Radarr has additional indexers that could be added: Nzb.su, NZBgeek, NZBFinder.ws (marked as expired keys in UDL config — verify if still active in Radarr)
+Config: `~/.config/udl/config.toml` — DOGnzb, omgwtf, Nzb.su (3 active). omgwtf frequently hits daily API limits.
