@@ -1,4 +1,21 @@
-# UDL — Usenet Download Layer
+<p align="center">
+  <img src="docs/logo.png" alt="UDL" width="300">
+</p>
+
+<h1 align="center">UDL</h1>
+
+<p align="center"><em>
+Usenet Download Layer<br>
+Usenet Data Liberator<br>
+Unpacks Decrypts Loads<br>
+Unattended Download Loop<br>
+Unified Download Logic<br>
+Usenet Decode Line<br>
+Usenet Download Launcher<br>
+Ultimate Data Leecher<br>
+Unrar Deobfuscate Librarify<br>
+Usenet Daemon Lite<br>
+</em></p>
 
 A single Go binary that replaces Sonarr + Radarr + NZBGet for Usenet-based media
 automation. CLI-first, daemon mode, opinionated defaults.
@@ -52,47 +69,54 @@ Queue shows `movie:<tmdb-id>` and `episode:<tmdb-id>:S01E02` — matching the re
 ## Usage
 
 ```bash
-./udl daemon                   # start daemon (foreground)
-./udl status                   # check daemon status
+udl daemon                   # start daemon (foreground)
+udl status                   # check daemon status
 
 # Movies — TMDB ID is the only identifier you need
-./udl movie search "Title"     # search TMDB, shows TMDB IDs
-./udl movie add <tmdb-id>      # add by TMDB ID
-./udl movie list               # list movies (shows TMDB IDs)
-./udl movie releases <tmdb-id> # search indexers for releases
-./udl movie grab <tmdb-id> <#> # grab release # for a movie
-./udl movie remove <tmdb-id>   # remove from monitoring
+udl movie search "Title"     # search TMDB, shows TMDB IDs
+udl movie add <tmdb-id>      # add by TMDB ID
+udl movie list               # list movies (shows TMDB IDs)
+udl movie releases <tmdb-id> # search indexers for releases
+udl movie grab <tmdb-id> <#> # grab release # for a movie
+udl movie remove <tmdb-id>   # remove from monitoring
 
 # TV — same pattern, all by TMDB ID
-./udl tv search "Title"        # search TMDB for series
-./udl tv add <tmdb-id>         # add by TMDB ID
-./udl tv list                  # list series (shows TMDB IDs)
-./udl tv remove <tmdb-id>      # remove from monitoring
-./udl tv refresh               # refresh episode metadata from TMDB
+udl tv search "Title"        # search TMDB for series
+udl tv add <tmdb-id>         # add by TMDB ID
+udl tv list                  # list series (shows TMDB IDs)
+udl tv remove <tmdb-id>      # remove from monitoring
+udl tv delete <tmdb-id>      # delete files for a series
+udl tv monitor <tmdb-id>     # show/change season monitoring
+udl tv refresh               # refresh episode metadata from TMDB
 
 # Queue & history
-./udl queue                              # show queue (movie:<tmdb> / episode:<tmdb>:S01E02)
-./udl queue retry movie:838240           # retry failed movie by TMDB ID
-./udl queue retry episode:94997:S02E01   # retry failed episode by series TMDB + S/E
-./udl history                            # show download history
-./udl blocklist                # show blocklisted releases
-./udl blocklist clear          # clear all blocklist entries
-./udl blocklist remove <id>    # remove specific entry
+udl queue                                    # show queue
+udl queue retry                              # retry all failed
+udl queue retry movie:838240                 # retry failed movie by TMDB ID
+udl queue retry episode:94997:S02E01         # retry failed episode
+udl queue pause                              # pause all downloads
+udl queue resume                             # resume all downloads
+udl queue clear                              # clear all queued entries
+udl history                                  # show download history
+udl blocklist                                # show blocklisted releases
+udl blocklist clear                          # clear all blocklist entries
+udl blocklist remove <id>                    # remove specific entry
 
 # Library management
-./udl library import <dir>              # identify and import media (dry-run)
-./udl library import <dir> --execute    # actually perform the import
-./udl library cleanup                   # find orphan/misnamed files (dry-run)
-./udl library cleanup --execute         # rename misnamed, delete orphans
-./udl library verify                    # read-only DB/disk consistency check
-./udl library prune-incomplete          # find stale download dirs (dry-run)
+udl library import <dir>              # identify and import media (dry-run)
+udl library import <dir> --execute    # actually perform the import
+udl library cleanup                   # find orphan/misnamed files (dry-run)
+udl library cleanup --execute         # rename misnamed, delete orphans
+udl library verify                    # read-only DB/disk consistency check
+udl library prune                     # delete files for unmonitored episodes
+udl library prune-incomplete          # find stale download dirs (dry-run)
 
 # Plex integration
-./udl plex servers             # list Plex friend servers
-./udl plex check <tmdb-id>     # check if friends have it (by TMDB ID)
-./udl plex cleanup             # show unwatched old media (dry-run)
-./udl plex cleanup --execute   # delete unwatched media older than 90 days
-./udl plex cleanup --days 30   # shorter age threshold
+udl plex servers             # list Plex friend servers
+udl plex check <tmdb-id>     # check if friends have it (by TMDB ID)
+udl plex cleanup             # show unwatched old media (dry-run)
+udl plex cleanup --execute   # delete unwatched media older than 90 days
+udl plex cleanup --days 30   # shorter age threshold
 ```
 
 ## Web UI
@@ -105,7 +129,7 @@ port = 9876
 bind = "127.0.0.1"
 ```
 
-The dashboard shows library stats, active downloads with live progress (via SSE), queue status, series schedule, and download history. Navigation: Dashboard, Movies, Series, Queue, Schedule, History.
+The dashboard shows library stats, active downloads with live progress (via SSE), queue status, wanted items, series schedule, and download history. Navigation: Queue, Movies, Series, Wanted, Schedule, History.
 
 ![UDL Dashboard](docs/dashboard.png)
 
@@ -116,10 +140,10 @@ Pages use htmx for dynamic updates — the queue refreshes automatically via ser
 Reclaim disk space by deleting media that was never watched on your Plex server. Queries your owned Plex server's watch history and identifies items added more than N days ago with zero plays.
 
 ```bash
-./udl plex cleanup                 # dry-run — shows what would be deleted
-./udl plex cleanup --days 30       # items older than 30 days (default: 90)
-./udl plex cleanup --execute       # actually delete files and reset to "wanted"
-./udl plex cleanup --verbose       # also show kept items with reasons
+udl plex cleanup                 # dry-run — shows what would be deleted
+udl plex cleanup --days 30       # items older than 30 days (default: 90)
+udl plex cleanup --execute       # actually delete files and reset to "wanted"
+udl plex cleanup --verbose       # also show kept items with reasons
 ```
 
 Output:
@@ -303,7 +327,7 @@ go test ./internal/daemon/ -run TestLibrary -v    # library management tests
 
 - **Single binary**, single config (`~/.config/udl/config.toml`), single SQLite database (`~/.config/udl/udl.db`)
 - **CLI ↔ Daemon** via `net/rpc` over Unix socket
-- **Scheduler** runs RSS sync (every 15m) and search sweeps (every 6h)
+- **Scheduler** runs air-date-driven episode search (every 2m) and movie search sweeps (every 6h)
 - **Plex integration** checks friend libraries before downloading (optional)
 - **Quality profiles:** 720p, 1080p (default), 4k, remux — each with min/preferred/upgrade tiers
 
