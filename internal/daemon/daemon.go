@@ -553,18 +553,29 @@ func (s *Service) Queue(args *Empty, reply *QueueReply) error {
 }
 
 // ClearQueueReply contains the reply for the ClearQueue RPC method.
+// ClearQueueArgs contains arguments for the ClearQueue RPC method.
+type ClearQueueArgs struct {
+	Unmonitored bool // only clear unmonitored episodes
+}
+
 type ClearQueueReply struct {
 	Cleared int64
 }
 
-// ClearQueue marks all queued/downloading entries as failed.
-func (s *Service) ClearQueue(args *Empty, reply *ClearQueueReply) error {
-	n, err := s.db.ClearMediaQueue()
+// ClearQueue marks queued/downloading entries as failed (or wanted if unmonitored).
+func (s *Service) ClearQueue(args *ClearQueueArgs, reply *ClearQueueReply) error {
+	var n int64
+	var err error
+	if args.Unmonitored {
+		n, err = s.db.ClearUnmonitoredQueue()
+	} else {
+		n, err = s.db.ClearMediaQueue()
+	}
 	if err != nil {
 		return fmt.Errorf("ClearQueue: %w", err)
 	}
 	reply.Cleared = n
-	s.log.Info("cleared download queue", "count", n)
+	s.log.Info("cleared download queue", "count", n, "unmonitored_only", args.Unmonitored)
 	return nil
 }
 

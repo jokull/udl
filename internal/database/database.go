@@ -1195,6 +1195,23 @@ func (db *DB) ClearMediaQueue() (int64, error) {
 	return total, nil
 }
 
+// ClearUnmonitoredQueue resets unmonitored episodes that are queued/downloading/post_processing
+// back to wanted status, clearing their download fields.
+func (db *DB) ClearUnmonitoredQueue() (int64, error) {
+	res, err := db.Exec(`
+		UPDATE episodes SET
+			status = 'wanted',
+			nzb_url = NULL, nzb_name = NULL,
+			download_progress = 0, download_size = NULL, download_bytes = 0,
+			download_error = NULL, download_source = NULL, download_started_at = NULL
+		WHERE status IN ('queued', 'downloading', 'post_processing')
+		  AND monitored = 0`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // MediaQueueStats returns the number of queued and active (downloading + post_processing) items.
 func (db *DB) MediaQueueStats() (queued, downloading int, err error) {
 	err = db.QueryRow(`

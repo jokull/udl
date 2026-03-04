@@ -307,6 +307,7 @@ func init() {
 	tvMonitorCmd.Flags().Bool("all", false, "Monitor all seasons")
 	tvMonitorCmd.Flags().Bool("none", false, "Unmonitor all seasons")
 	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd, tvMonitorCmd)
+	queueClearCmd.Flags().Bool("unmonitored", false, "Only clear unmonitored episodes")
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
 	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
@@ -755,11 +756,17 @@ func runQueueClear(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
+	unmonitored, _ := cmd.Flags().GetBool("unmonitored")
+	rpcArgs := &daemon.ClearQueueArgs{Unmonitored: unmonitored}
 	var reply daemon.ClearQueueReply
-	if err := client.Call("Service.ClearQueue", &daemon.Empty{}, &reply); err != nil {
+	if err := client.Call("Service.ClearQueue", rpcArgs, &reply); err != nil {
 		return err
 	}
-	fmt.Printf("cleared %d downloads\n", reply.Cleared)
+	if unmonitored {
+		fmt.Printf("cleared %d unmonitored downloads\n", reply.Cleared)
+	} else {
+		fmt.Printf("cleared %d downloads\n", reply.Cleared)
+	}
 	return nil
 }
 
