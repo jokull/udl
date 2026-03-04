@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/jokull/udl/internal/par2"
 	"github.com/nwaples/rardecode/v2"
 )
 
@@ -166,22 +167,152 @@ func detectExtension(path string) string {
 	return ""
 }
 
+// renameByPAR2 parses PAR2 files in dir to recover original filenames for
+// obfuscated downloads. It computes the MD5 of the first 16KB of each file
+// and matches against the PAR2 FileDesc hash_16k entries.
+// Returns the number of files renamed. Non-fatal — returns 0 on any error.
+func renameByPAR2(dir string, log *slog.Logger) int {
+	// Find PAR2 files: first try by extension, then scan for magic bytes
+	var par2Files []string
+
+	for _, pattern := range []string{"*.par2", "*.PAR2"} {
+		matches, _ := filepath.Glob(filepath.Join(dir, pattern))
+		par2Files = append(par2Files, matches...)
+	}
+
+	// Deduplicate (case-insensitive FS may return overlapping results)
+	seen := make(map[string]bool)
+	var deduped []string
+	for _, p := range par2Files {
+		if !seen[p] && !isAppleDouble(filepath.Base(p)) {
+			seen[p] = true
+			deduped = append(deduped, p)
+		}
+	}
+	par2Files = deduped
+
+	// If no .par2 files found by extension, scan all files for PAR2 magic
+	if len(par2Files) == 0 {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return 0
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || isAppleDouble(entry.Name()) {
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			f, err := os.Open(path)
+			if err != nil {
+				continue
+			}
+			isPAR2 := par2.IsPAR2(f)
+			f.Close()
+			if isPAR2 {
+				par2Files = append(par2Files, path)
+			}
+		}
+		if len(par2Files) > 0 {
+			log.Info("found obfuscated PAR2 files via magic scan", "count", len(par2Files))
+		}
+	}
+
+	if len(par2Files) == 0 {
+		return 0
+	}
+
+	// Parse all PAR2 files, merge FileEntry results
+	hashMap := make(map[string]string) // hex(hash16k) -> original filename
+	for _, p := range par2Files {
+		entries, err := par2.ParseFile(p)
+		if err != nil {
+			log.Debug("par2 parse failed", "file", p, "error", err)
+			continue
+		}
+		for _, e := range entries {
+			hashMap[e.Hash16kHex()] = e.Name
+		}
+	}
+
+	if len(hashMap) == 0 {
+		return 0
+	}
+
+	log.Info("parsed PAR2 manifest", "files_in_manifest", len(hashMap))
+
+	// Build set of existing filenames for collision detection
+	dirEntries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	existingNames := make(map[string]bool)
+	for _, entry := range dirEntries {
+		existingNames[entry.Name()] = true
+	}
+
+	// Match files by hash16k
+	renamed := 0
+	for _, entry := range dirEntries {
+		if entry.IsDir() || isAppleDouble(entry.Name()) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+
+		hash, err := par2.Hash16k(path)
+		if err != nil {
+			continue
+		}
+
+		hexHash := fmt.Sprintf("%x", hash)
+		originalName, ok := hashMap[hexHash]
+		if !ok {
+			continue
+		}
+		if entry.Name() == originalName {
+			continue // already correct
+		}
+
+		newPath := filepath.Join(dir, originalName)
+		if existingNames[originalName] {
+			log.Warn("PAR2 rename collision, skipping", "from", entry.Name(), "to", originalName)
+			continue
+		}
+
+		if err := os.Rename(path, newPath); err != nil {
+			log.Warn("PAR2 rename failed", "from", entry.Name(), "to", originalName, "error", err)
+			continue
+		}
+
+		log.Info("renamed by PAR2 manifest", "from", entry.Name(), "to", originalName)
+		existingNames[originalName] = true
+		delete(existingNames, entry.Name())
+		renamed++
+	}
+
+	return renamed
+}
+
 // Process runs the full post-processing pipeline on a download directory.
-// Stages: rename obfuscated -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
+// Stages: PAR2 rename -> magic rename -> AppleDouble cleanup -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
 func Process(dir string, log *slog.Logger) (*Result, error) {
 	result := &Result{}
 
-	// Stage 0: Rename obfuscated files by magic bytes.
+	// Stage 0: Rename obfuscated files using PAR2 manifest hash matching.
+	if n := renameByPAR2(dir, log); n > 0 {
+		log.Info("PAR2-based rename complete", "renamed", n)
+	}
+
+	// Stage 0.5: Rename remaining obfuscated files by magic bytes (fallback).
 	if err := renameByMagic(dir, log); err != nil {
 		log.Warn("rename by magic failed", "error", err)
 	}
 
-	// Stage 0.5: Delete macOS AppleDouble resource fork files before PAR2.
+	// Stage 1: Delete macOS AppleDouble resource fork files before PAR2.
 	// par2cmdline scans the directory itself and picks up ._* files which
 	// contain no valid PAR2 packets and cause "Main packet not found" errors.
 	removeAppleDoubleFiles(dir, log)
 
-	// Stage 1: PAR2 verify + repair
+	// Stage 2: PAR2 verify + repair
 	par2File, err := findPAR2File(dir)
 	if err != nil {
 		log.Warn("error searching for PAR2 files", "error", err)
@@ -215,7 +346,7 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 		log.Info("no PAR2 files found, skipping verify/repair")
 	}
 
-	// Stage 2: RAR extraction
+	// Stage 3: RAR extraction
 	rarFiles, err := findRARFiles(dir)
 	if err != nil {
 		log.Warn("error searching for RAR files", "error", err)
@@ -234,13 +365,13 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 		log.Info("no RAR archives found, skipping extraction")
 	}
 
-	// Stage 3: Cleanup
+	// Stage 4: Cleanup
 	if err := cleanup(dir, log); err != nil {
 		log.Warn("cleanup encountered errors", "error", err)
 		// Non-fatal: continue to identification
 	}
 
-	// Stage 4: Identify files
+	// Stage 5: Identify files
 	mediaFiles, subtitleFiles, err := identifyFiles(dir)
 	if err != nil {
 		result.Success = false

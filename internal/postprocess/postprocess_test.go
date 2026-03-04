@@ -1,6 +1,9 @@
 package postprocess
 
 import (
+	"crypto/md5"
+	"encoding/binary"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -314,4 +317,201 @@ func TestShouldCleanup(t *testing.T) {
 // testLogger returns a slog.Logger suitable for tests.
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// PAR2 packet builder helpers for postprocess tests.
+
+var (
+	par2Magic       = []byte("PAR2\x00PKT")
+	par2FileDescSig = []byte("PAR 2.0\x00FileDesc")
+)
+
+func buildTestPAR2FileDescPacket(fileID, hashFull, hash16k [16]byte, length int64, name string) []byte {
+	nameBytes := []byte(name)
+	for len(nameBytes)%4 != 0 {
+		nameBytes = append(nameBytes, 0)
+	}
+	bodyLen := 16 + 16 + 16 + 8 + len(nameBytes)
+	pktLen := 64 + bodyLen
+	pkt := make([]byte, pktLen)
+	copy(pkt[0:8], par2Magic)
+	binary.LittleEndian.PutUint64(pkt[8:16], uint64(pktLen))
+	copy(pkt[48:64], par2FileDescSig)
+	body := pkt[64:]
+	copy(body[0:16], fileID[:])
+	copy(body[16:32], hashFull[:])
+	copy(body[32:48], hash16k[:])
+	binary.LittleEndian.PutUint64(body[48:56], uint64(length))
+	copy(body[56:], nameBytes)
+	return pkt
+}
+
+func computeHash16k(data []byte) [16]byte {
+	h := md5.New()
+	n := 16384
+	if len(data) < n {
+		n = len(data)
+	}
+	io.CopyN(h, io.NewSectionReader(newByteReaderAt(data), 0, int64(n)), int64(n))
+	var sum [16]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
+type byteReaderAt struct{ data []byte }
+
+func newByteReaderAt(data []byte) *byteReaderAt { return &byteReaderAt{data: data} }
+func (b *byteReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(b.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func TestRenameByPAR2_Basic(t *testing.T) {
+	dir := t.TempDir()
+	log := testLogger()
+
+	// Create a "data" file with known content, named as obfuscated
+	data := make([]byte, 20000)
+	for i := range data {
+		data[i] = byte(i*13 + 7)
+	}
+	dataPath := filepath.Join(dir, "file_0")
+	if err := os.WriteFile(dataPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Build PAR2 file referencing this data with correct hash16k
+	hash16k := computeHash16k(data)
+	hashFull := md5.Sum(data)
+	fileID := md5.Sum([]byte("id"))
+	pkt := buildTestPAR2FileDescPacket(fileID, hashFull, hash16k, int64(len(data)), "movie.part01.rar")
+
+	par2Path := filepath.Join(dir, "test.par2")
+	if err := os.WriteFile(par2Path, pkt, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	n := renameByPAR2(dir, log)
+	if n != 1 {
+		t.Fatalf("expected 1 rename, got %d", n)
+	}
+
+	// file_0 should now be movie.part01.rar
+	if _, err := os.Stat(filepath.Join(dir, "movie.part01.rar")); err != nil {
+		t.Errorf("expected movie.part01.rar to exist: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "file_0")); err == nil {
+		t.Error("file_0 should have been renamed")
+	}
+}
+
+func TestRenameByPAR2_NoParFiles(t *testing.T) {
+	dir := t.TempDir()
+	log := testLogger()
+
+	createTempFile(t, dir, "file_0")
+	createTempFile(t, dir, "file_1")
+
+	n := renameByPAR2(dir, log)
+	if n != 0 {
+		t.Errorf("expected 0 renames with no PAR2 files, got %d", n)
+	}
+}
+
+func TestRenameByPAR2_AlreadyCorrect(t *testing.T) {
+	dir := t.TempDir()
+	log := testLogger()
+
+	data := []byte("some content for the file")
+	dataPath := filepath.Join(dir, "movie.mkv")
+	if err := os.WriteFile(dataPath, data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	hash16k := computeHash16k(data)
+	hashFull := md5.Sum(data)
+	fileID := md5.Sum([]byte("id"))
+	pkt := buildTestPAR2FileDescPacket(fileID, hashFull, hash16k, int64(len(data)), "movie.mkv")
+
+	par2Path := filepath.Join(dir, "test.par2")
+	if err := os.WriteFile(par2Path, pkt, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	n := renameByPAR2(dir, log)
+	if n != 0 {
+		t.Errorf("expected 0 renames (already correct), got %d", n)
+	}
+}
+
+func TestRenameByPAR2_ObfuscatedPAR2(t *testing.T) {
+	dir := t.TempDir()
+	log := testLogger()
+
+	// Data file
+	data := make([]byte, 5000)
+	for i := range data {
+		data[i] = byte(i % 200)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "file_0"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// PAR2 file named without .par2 extension (obfuscated)
+	hash16k := computeHash16k(data)
+	hashFull := md5.Sum(data)
+	fileID := md5.Sum([]byte("id"))
+	pkt := buildTestPAR2FileDescPacket(fileID, hashFull, hash16k, int64(len(data)), "real_name.mkv")
+
+	// Write PAR2 as "file_1" — no .par2 extension, magic scan should find it
+	if err := os.WriteFile(filepath.Join(dir, "file_1"), pkt, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	n := renameByPAR2(dir, log)
+	if n < 1 {
+		t.Fatalf("expected at least 1 rename from obfuscated PAR2, got %d", n)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "real_name.mkv")); err != nil {
+		t.Errorf("expected real_name.mkv to exist: %v", err)
+	}
+}
+
+func TestRenameByPAR2_Collision(t *testing.T) {
+	dir := t.TempDir()
+	log := testLogger()
+
+	data := []byte("collision test data")
+	if err := os.WriteFile(filepath.Join(dir, "file_0"), data, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Create the target filename already
+	if err := os.WriteFile(filepath.Join(dir, "target.mkv"), []byte("existing"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	hash16k := computeHash16k(data)
+	hashFull := md5.Sum(data)
+	fileID := md5.Sum([]byte("id"))
+	pkt := buildTestPAR2FileDescPacket(fileID, hashFull, hash16k, int64(len(data)), "target.mkv")
+	if err := os.WriteFile(filepath.Join(dir, "test.par2"), pkt, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	n := renameByPAR2(dir, log)
+	if n != 0 {
+		t.Errorf("expected 0 renames (collision), got %d", n)
+	}
+
+	// file_0 should still exist
+	if _, err := os.Stat(filepath.Join(dir, "file_0")); err != nil {
+		t.Error("file_0 should still exist after collision skip")
+	}
 }
