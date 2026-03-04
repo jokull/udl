@@ -1,19 +1,19 @@
 {{define "queue_rows.html"}}
 <table>
-  <tr><th>Title</th><th>Source</th><th>Progress</th><th>Size</th><th>Started</th></tr>
+  <tr><th>Title</th><th>Status</th><th>Source</th><th>Progress</th><th>Size</th></tr>
   {{range .}}
   <tr>
     <td>
       {{if .TmdbID}}<a href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
       <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
     </td>
+    <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td class="small">{{fmtSource .Source .NzbName}}</td>
     <td>
       <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
       {{fmtProgress .Progress}}
     </td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
-    <td class="small">{{fmtNullTimeStr .StartedAt}}</td>
   </tr>
   {{end}}
   {{if not .}}

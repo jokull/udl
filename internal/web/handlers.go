@@ -199,26 +199,22 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var active, queued, failed []database.QueueItem
+	var queue, failed []database.QueueItem
 	for _, d := range items {
 		switch d.Status {
-		case "downloading", "post_processing":
-			active = append(active, d)
-		case "queued":
-			queued = append(queued, d)
+		case "downloading", "post_processing", "queued":
+			queue = append(queue, d)
 		case "failed":
 			failed = append(failed, d)
 		}
 	}
 
 	data := struct {
-		Active []database.QueueItem
-		Queued []database.QueueItem
+		Queue  []database.QueueItem
 		Failed []database.QueueItem
 		Page   string
 	}{
-		Active: active,
-		Queued: queued,
+		Queue:  queue,
 		Failed: failed,
 		Page:   "queue",
 	}
