@@ -115,15 +115,22 @@ func (d *Downloader) Start(ctx context.Context) {
 		}
 	}
 
-	// Clean up stale .udl-tmp files from interrupted imports.
+
+	// Clean up stale .udl-tmp files from interrupted imports (runs in background
+	// because filepath.Walk on a large external library can take minutes).
 	if cfg != nil {
-		if n := organize.CleanStaleTmpFiles(cfg.Library.Movies, cfg.Library.TV); n > 0 {
-			d.svc.log.Warn("cleaned stale .udl-tmp files from previous crash", "count", n)
-		}
+		go func() {
+			if n := organize.CleanStaleTmpFiles(cfg.Library.Movies, cfg.Library.TV); n > 0 {
+				d.svc.log.Warn("cleaned stale .udl-tmp files from previous crash", "count", n)
+			}
+		}()
 	}
 
 	// Scan DB for pending items and seed the channel.
-	if pending, err := db.PendingMedia(); err == nil {
+	if pending, err := db.PendingMedia(); err != nil {
+		d.svc.log.Error("downloader: failed to query pending media on startup", "error", err)
+	} else {
+		d.svc.log.Info("downloader: seeding work channel", "pending", len(pending))
 		for _, item := range pending {
 			if item.Status == "post_processing" {
 				d.svc.log.Info("resuming post-processing from previous run", "title", item.Title)
@@ -399,6 +406,7 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 	if err != nil {
 		return d.fail(item, fmt.Sprintf("parse NZB: %v", err))
 	}
+	d.svc.log.Info("usenet: starting NNTP download", "title", item.Title, "files", len(parsed.Files))
 
 	// 4. Create download directory under incomplete.
 	dlDir := d.downloadDir(item)
