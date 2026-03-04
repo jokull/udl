@@ -10,10 +10,14 @@
   <tr><th>Title</th><th>Year</th><th>Status</th><th>Added</th><th></th></tr>
   {{range .Series}}
   <tr>
-    <td>{{.Title}}</td>
+    <td>
+      {{.Title}}
+      {{if .TmdbID}}<a class="ext" href="{{tmdbURL "tv" .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
+      {{if .ImdbID.Valid}}<a class="ext" href="https://www.imdb.com/title/{{.ImdbID.String}}/" target="_blank" rel="noopener">imdb</a>{{end}}
+    </td>
     <td>{{.Year}}</td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
-    <td class="small">{{fmtTime .AddedAt}}</td>
+    <td class="small">{{fmtNullTimeStr .AddedAt}}</td>
     <td>
       <button hx-get="/series/{{.ID}}/episodes"
               hx-target="#episodes-{{.ID}}"

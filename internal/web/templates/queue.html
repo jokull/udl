@@ -9,10 +9,14 @@
 <h2>Downloading</h2>
 <div hx-ext="sse" sse-connect="/sse/queue" sse-swap="queue">
 <table>
-  <tr><th>Title</th><th>Progress</th><th>Size</th><th>Started</th></tr>
+  <tr><th>Title</th><th>Source</th><th>Progress</th><th>Size</th><th>Started</th></tr>
   {{range .Active}}
   <tr>
-    <td>{{.Title}}</td>
+    <td>
+      {{if .TmdbID}}<a href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+      <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
+    </td>
+    <td class="small">{{fmtSource .Source .NzbName}}</td>
     <td>
       <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
       {{fmtProgress .Progress}}
@@ -28,12 +32,16 @@
 {{if .Queued}}
 <h2>Queued</h2>
 <table>
-  <tr><th>Title</th><th>Size</th><th>Added</th></tr>
+  <tr><th>Title</th><th>Source</th><th>Size</th><th>Added</th></tr>
   {{range .Queued}}
   <tr>
-    <td>{{.Title}}</td>
+    <td>
+      {{if .TmdbID}}<a href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+      <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
+    </td>
+    <td class="small">{{fmtSource .Source .NzbName}}</td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
-    <td class="small">{{fmtTime .AddedAt}}</td>
+    <td class="small">{{fmtNullTimeStr .AddedAt}}</td>
   </tr>
   {{end}}
 </table>
@@ -45,9 +53,12 @@
   <tr><th>Title</th><th>Error</th><th>Added</th><th></th></tr>
   {{range .Failed}}
   <tr>
-    <td>{{.Title}}</td>
+    <td>
+      {{if .TmdbID}}<a href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+      <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
+    </td>
     <td class="small">{{nullable .ErrorMsg}}</td>
-    <td class="small">{{fmtTime .AddedAt}}</td>
+    <td class="small">{{fmtNullTimeStr .AddedAt}}</td>
     <td>
       <button hx-post="/queue/retry/{{.Category}}/{{.MediaID}}" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Retry this download?">retry</button>
     </td>

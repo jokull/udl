@@ -10,9 +10,11 @@
   <tr><th>Time</th><th>Type</th><th>Title</th><th>Event</th><th>Quality</th><th>Source</th></tr>
   {{range .Events}}
   <tr>
-    <td class="small">{{fmtTime .CreatedAt}}</td>
+    <td class="small">{{fmtNullTimeStr .CreatedAt}}</td>
     <td>{{.MediaType}}</td>
-    <td>{{.Title}}</td>
+    <td>
+      {{if .TmdbID}}<a href="{{tmdbURL .MediaType .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+    </td>
     <td><span class="status {{statusClass .Event}}">{{.Event}}</span></td>
     <td>{{nullable .Quality}}</td>
     <td class="small">{{nullable .Source}}</td>
