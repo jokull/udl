@@ -394,10 +394,10 @@ func (e *Engine) fetchFromPool(ctx context.Context, pool *Pool, messageID string
 		default:
 		}
 
-		conn, err := pool.Get()
+		conn, err := pool.Get(ctx)
 		if err != nil {
 			lastErr = err
-			break // pool-level error (backoff, etc.), don't retry
+			break // pool-level error (backoff, ctx cancel, etc.), don't retry
 		}
 
 		body, err := conn.Body(messageID)

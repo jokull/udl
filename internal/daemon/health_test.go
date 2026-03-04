@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"testing"
@@ -268,7 +269,7 @@ func TestPoolStatus_Backoff(t *testing.T) {
 	}, log)
 
 	// Attempt to get a connection — should fail and set consecutiveFails.
-	_, err := pool.Get()
+	_, err := pool.Get(context.Background())
 	if err == nil {
 		t.Fatal("expected error from refused connection")
 	}

@@ -1,6 +1,7 @@
 package nntp
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -54,8 +55,9 @@ func NewPool(config ProviderConfig, log *slog.Logger) *Pool {
 }
 
 // Get returns an available connection, creating one if needed and under the limit.
-// Blocks if all connections are in use. Returns an error if the pool is in backoff.
-func (p *Pool) Get() (*Conn, error) {
+// Blocks if all connections are in use. Returns an error if the pool is in backoff
+// or the context is cancelled.
+func (p *Pool) Get(ctx context.Context) (*Conn, error) {
 	// Check backoff before attempting anything.
 	p.mu.Lock()
 	if time.Now().Before(p.backoffUntil) {
@@ -66,6 +68,11 @@ func (p *Pool) Get() (*Conn, error) {
 	p.mu.Unlock()
 
 	for {
+		// Check context before each attempt.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
 		// Try to grab an idle connection without blocking.
 		select {
 		case c := <-p.conns:
@@ -101,13 +108,17 @@ func (p *Pool) Get() (*Conn, error) {
 		}
 		p.mu.Unlock()
 
-		// All connections in use — block until one is returned.
-		c := <-p.conns
-		if c == nil {
-			// nil sentinel from Return() — a slot freed up, retry.
-			continue
+		// All connections in use — block until one is returned or ctx is cancelled.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case c := <-p.conns:
+			if c == nil {
+				// nil sentinel from Return() — a slot freed up, retry.
+				continue
+			}
+			return c, nil
 		}
-		return c, nil
 	}
 }
 

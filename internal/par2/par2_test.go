@@ -235,8 +235,12 @@ func TestHash16k_SmallFile(t *testing.T) {
 
 func TestParseFile_RealPAR2(t *testing.T) {
 	path := "/Volumes/Plex/downloads/incomplete/movie-89/par.par2"
-	if _, err := os.Stat(path); err != nil {
+	info, err := os.Stat(path)
+	if err != nil {
 		t.Skip("real PAR2 file not available:", path)
+	}
+	if info.Size() == 0 {
+		t.Skip("real PAR2 file is empty (truncated by failed download)")
 	}
 
 	entries, err := ParseFile(path)
