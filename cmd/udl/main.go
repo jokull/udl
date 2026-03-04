@@ -162,6 +162,22 @@ var tvRefreshCmd = &cobra.Command{
 	RunE:  runTVRefresh,
 }
 
+var tvMonitorCmd = &cobra.Command{
+	Use:   "monitor [tmdb-id]",
+	Short: "Show or change season monitoring for a series",
+	Long: `Show or change which seasons are monitored for a series.
+
+Examples:
+  udl tv monitor 1396                  # show monitoring status
+  udl tv monitor 1396 --season 3       # monitor S03
+  udl tv monitor 1396 --season 3 --off # unmonitor S03
+  udl tv monitor 1396 --latest         # only latest season
+  udl tv monitor 1396 --all            # monitor everything
+  udl tv monitor 1396 --none           # unmonitor everything`,
+	Args: cobra.ExactArgs(1),
+	RunE: runTVMonitor,
+}
+
 var plexCmd = &cobra.Command{
 	Use:   "plex",
 	Short: "Plex friends integration",
@@ -285,7 +301,12 @@ var configPathCmd = &cobra.Command{
 
 func init() {
 	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd)
-	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd)
+	tvMonitorCmd.Flags().IntP("season", "s", -1, "Season number to monitor/unmonitor")
+	tvMonitorCmd.Flags().Bool("off", false, "Unmonitor the specified season")
+	tvMonitorCmd.Flags().Bool("latest", false, "Monitor only the latest season")
+	tvMonitorCmd.Flags().Bool("all", false, "Monitor all seasons")
+	tvMonitorCmd.Flags().Bool("none", false, "Unmonitor all seasons")
+	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd, tvMonitorCmd)
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
 	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
@@ -781,7 +802,14 @@ func runHistory(cmd *cobra.Command, args []string) error {
 			q = h.Quality.String
 		}
 		id := mediaTag(h.MediaType, h.TmdbID, h.Season, h.EpisodeNum, h.MediaID)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, h.Title, h.Event, q, h.CreatedAt.Format("2006-01-02 15:04"))
+		createdAt := "—"
+		if h.CreatedAt.Valid {
+			createdAt = h.CreatedAt.String
+			if len(createdAt) > 16 {
+				createdAt = createdAt[:16]
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, h.Title, h.Event, q, createdAt)
 	}
 	return w.Flush()
 }
@@ -811,7 +839,14 @@ func runBlocklist(cmd *cobra.Command, args []string) error {
 			reason = reason[:60] + "..."
 		}
 		media := mediaTag(e.MediaType, e.TmdbID, e.Season, e.EpisodeNum, e.MediaID)
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", e.ID, media, e.ReleaseTitle, reason, e.CreatedAt.Format("2006-01-02 15:04"))
+		createdAt := "—"
+		if e.CreatedAt.Valid {
+			createdAt = e.CreatedAt.String
+			if len(createdAt) > 16 {
+				createdAt = createdAt[:16]
+			}
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", e.ID, media, e.ReleaseTitle, reason, createdAt)
 	}
 	return w.Flush()
 }
@@ -908,6 +943,65 @@ func runTVRefresh(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("checked %d series, %d new episodes, %d marked ended\n",
 		reply.Checked, reply.NewEpisodes, reply.Ended)
+	return nil
+}
+
+func runTVMonitor(cmd *cobra.Command, args []string) error {
+	tmdbID, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("TMDB ID must be a number (use 'udl tv list' to find it)")
+	}
+
+	season, _ := cmd.Flags().GetInt("season")
+	off, _ := cmd.Flags().GetBool("off")
+	latest, _ := cmd.Flags().GetBool("latest")
+	all, _ := cmd.Flags().GetBool("all")
+	none, _ := cmd.Flags().GetBool("none")
+
+	mode := ""
+	switch {
+	case latest:
+		mode = "latest"
+	case all:
+		mode = "all"
+	case none:
+		mode = "none"
+	case season >= 0 && off:
+		mode = "off"
+	case season >= 0:
+		mode = "on"
+	}
+
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.MonitorSeasonArgs{TmdbID: tmdbID, Season: season, Mode: mode}
+	var reply daemon.MonitorSeasonReply
+	if err := client.Call("Service.MonitorSeason", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("%s (%d)\n\n", reply.Title, reply.Year)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SEASON\tMONITORED\tWANTED\tCOMPLETED\tTOTAL")
+	for _, s := range reply.Seasons {
+		label := "--"
+		if s.Monitored == s.Total {
+			label = "[x]"
+		} else if s.Monitored > 0 {
+			label = fmt.Sprintf("[%d/%d]", s.Monitored, s.Total)
+		}
+		fmt.Fprintf(w, "S%02d\t%s\t%d\t%d\t%d\n", s.Season, label, s.Wanted, s.Completed, s.Total)
+	}
+	w.Flush()
+
+	if reply.Affected > 0 {
+		fmt.Printf("\n%d episodes updated\n", reply.Affected)
+	}
 	return nil
 }
 

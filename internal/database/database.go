@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -20,7 +21,7 @@ type DB struct {
 func Open(path string) (*DB, error) {
 	// Use _pragma DSN parameters so every pooled connection gets foreign_keys=ON.
 	// WAL mode is per-database (persistent), but we set it here too for first open.
-	dsn := path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)"
+	dsn := path + "?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 	if path == ":memory:" {
 		dsn = ":memory:?_pragma=foreign_keys(1)"
 	}
@@ -146,7 +147,23 @@ CREATE TABLE IF NOT EXISTS blocklist (
 		}
 	}
 
+	// Add monitored column to episodes (idempotent).
+	_, err = db.Exec(`ALTER TABLE episodes ADD COLUMN monitored INTEGER NOT NULL DEFAULT 1`)
+	if err != nil && !isAlterDuplicate(err) {
+		return fmt.Errorf("add monitored column: %w", err)
+	}
+
+	// Index on monitored column (must come after ALTER TABLE).
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_episodes_monitored_status ON episodes(monitored, status)`); err != nil {
+		return fmt.Errorf("create index: %w", err)
+	}
+
 	return nil
+}
+
+func isAlterDuplicate(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists")
 }
 
 // ---------------------------------------------------------------------------
@@ -321,10 +338,11 @@ func (db *DB) UpdateSeriesRefreshedAt(id int64) error {
 func (db *DB) WantedEpisodes() ([]Episode, error) {
 	rows, err := db.Query(
 		`SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		        e.status, e.quality, e.file_path, s.title
+		        e.monitored, e.status, e.quality, e.file_path, s.title
 		 FROM episodes e
 		 JOIN series s ON s.id = e.series_id
 		 WHERE e.status = 'wanted'
+		   AND e.monitored = 1
 		   AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
 		 ORDER BY s.title, e.season, e.episode`,
 	)
@@ -337,7 +355,7 @@ func (db *DB) WantedEpisodes() ([]Episode, error) {
 	for rows.Next() {
 		var ep Episode
 		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
-			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
 			&ep.SeriesTitle); err != nil {
 			return nil, err
 		}
@@ -354,7 +372,7 @@ func (db *DB) UpcomingEpisodes(days int) ([]Episode, error) {
 	}
 	rows, err := db.Query(`
 		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		       e.status, e.quality, e.file_path, s.title
+		       e.monitored, e.status, e.quality, e.file_path, s.title, s.tmdb_id
 		FROM episodes e
 		JOIN series s ON s.id = e.series_id
 		WHERE e.air_date IS NOT NULL AND e.air_date != ''
@@ -370,8 +388,8 @@ func (db *DB) UpcomingEpisodes(days int) ([]Episode, error) {
 	for rows.Next() {
 		var ep Episode
 		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
-			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
-			&ep.SeriesTitle); err != nil {
+			&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.SeriesTitle, &ep.SeriesTmdbID); err != nil {
 			return nil, err
 		}
 		episodes = append(episodes, ep)
@@ -383,7 +401,7 @@ func (db *DB) UpcomingEpisodes(days int) ([]Episode, error) {
 func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
 	rows, err := db.Query(`
 		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		       e.status, e.quality, e.file_path, s.title
+		       e.monitored, e.status, e.quality, e.file_path, s.title
 		FROM episodes e
 		JOIN series s ON s.id = e.series_id
 		WHERE e.series_id = ?
@@ -397,7 +415,7 @@ func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
 	for rows.Next() {
 		var ep Episode
 		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
-			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
 			&ep.SeriesTitle); err != nil {
 			return nil, err
 		}
@@ -422,10 +440,11 @@ func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
 	}
 	rows, err := db.Query(`
 		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		       e.status, e.quality, e.file_path, e.last_searched_at, s.title, s.tvdb_id
+		       e.monitored, e.status, e.quality, e.file_path, e.last_searched_at, s.title, s.tvdb_id
 		FROM episodes e
 		JOIN series s ON s.id = e.series_id
 		WHERE e.status = 'wanted'
+		  AND e.monitored = 1
 		  AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
 		  AND (
 		    e.last_searched_at IS NULL
@@ -452,7 +471,7 @@ func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
 	for rows.Next() {
 		var ep Episode
 		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
-			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+			&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
 			&ep.LastSearchedAt, &ep.SeriesTitle, &ep.TvdbID); err != nil {
 			return nil, err
 		}
@@ -465,6 +484,76 @@ func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
 func (db *DB) UpdateEpisodeSearchedAt(id int64) error {
 	_, err := db.Exec(`UPDATE episodes SET last_searched_at = CURRENT_TIMESTAMP WHERE id = ?`, id)
 	return err
+}
+
+// SetSeasonMonitored sets the monitored flag for all episodes in a given season.
+func (db *DB) SetSeasonMonitored(seriesID int64, season int, monitored bool) (int64, error) {
+	val := 0
+	if monitored {
+		val = 1
+	}
+	res, err := db.Exec(
+		`UPDATE episodes SET monitored = ? WHERE series_id = ? AND season = ?`,
+		val, seriesID, season,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// SetAllEpisodesMonitored sets the monitored flag for all episodes of a series.
+func (db *DB) SetAllEpisodesMonitored(seriesID int64, monitored bool) (int64, error) {
+	val := 0
+	if monitored {
+		val = 1
+	}
+	res, err := db.Exec(
+		`UPDATE episodes SET monitored = ? WHERE series_id = ?`,
+		val, seriesID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// SeasonMonitoringSummary returns per-season counts of total, monitored, wanted, and completed episodes.
+func (db *DB) SeasonMonitoringSummary(seriesID int64) ([]SeasonMonitorInfo, error) {
+	rows, err := db.Query(`
+		SELECT season,
+		       COUNT(*) AS total,
+		       SUM(CASE WHEN monitored = 1 THEN 1 ELSE 0 END) AS monitored,
+		       SUM(CASE WHEN status = 'wanted' AND monitored = 1 THEN 1 ELSE 0 END) AS wanted,
+		       SUM(CASE WHEN status IN ('downloaded', 'completed') THEN 1 ELSE 0 END) AS completed
+		FROM episodes
+		WHERE series_id = ?
+		GROUP BY season
+		ORDER BY season`, seriesID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var seasons []SeasonMonitorInfo
+	for rows.Next() {
+		var s SeasonMonitorInfo
+		if err := rows.Scan(&s.Season, &s.Total, &s.Monitored, &s.Wanted, &s.Completed); err != nil {
+			return nil, err
+		}
+		seasons = append(seasons, s)
+	}
+	return seasons, rows.Err()
+}
+
+// MaxSeason returns the highest season number for a series, excluding season 0 (specials).
+func (db *DB) MaxSeason(seriesID int64) (int, error) {
+	var max int
+	err := db.QueryRow(
+		`SELECT COALESCE(MAX(season), 0) FROM episodes WHERE series_id = ? AND season > 0`,
+		seriesID,
+	).Scan(&max)
+	return max, err
 }
 
 // UpdateEpisodeStatus updates the status, quality, and file_path of an episode.
@@ -508,12 +597,12 @@ func (db *DB) GetEpisode(id int64) (*Episode, error) {
 	var ep Episode
 	err := db.QueryRow(
 		`SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		        e.status, e.quality, e.file_path, s.title
+		        e.monitored, e.status, e.quality, e.file_path, s.title
 		 FROM episodes e
 		 JOIN series s ON s.id = e.series_id
 		 WHERE e.id = ?`, id,
 	).Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
-		&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+		&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
 		&ep.SeriesTitle)
 	if err != nil {
 		return nil, err
@@ -785,13 +874,13 @@ func (db *DB) FindEpisode(seriesID int64, season, episode int) (*Episode, error)
 	var ep Episode
 	err := db.QueryRow(
 		`SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		        e.status, e.quality, e.file_path, s.title
+		        e.monitored, e.status, e.quality, e.file_path, s.title
 		 FROM episodes e
 		 JOIN series s ON s.id = e.series_id
 		 WHERE e.series_id = ? AND e.season = ? AND e.episode = ?`,
 		seriesID, season, episode,
 	).Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
-		&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
+		&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
 		&ep.SeriesTitle)
 	if err == sql.ErrNoRows {
 		return nil, nil

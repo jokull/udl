@@ -2,7 +2,6 @@ package database
 
 import (
 	"database/sql"
-	"time"
 )
 
 // Movie represents a movie tracked by the system.
@@ -15,7 +14,7 @@ type Movie struct {
 	Status   string
 	Quality  sql.NullString
 	FilePath sql.NullString
-	AddedAt  time.Time
+	AddedAt  sql.NullString
 	// Download fields (populated when status is queued/downloading/post_processing/failed).
 	NzbURL          sql.NullString
 	NzbName         sql.NullString
@@ -36,8 +35,17 @@ type Series struct {
 	Title           string
 	Year            int
 	Status          string
-	AddedAt         time.Time
-	LastRefreshedAt sql.NullTime
+	AddedAt         sql.NullString
+	LastRefreshedAt sql.NullString
+}
+
+// SeasonMonitorInfo summarizes monitoring state for a single season.
+type SeasonMonitorInfo struct {
+	Season    int
+	Total     int
+	Monitored int
+	Wanted    int
+	Completed int
 }
 
 // Episode represents a single episode of a series.
@@ -48,6 +56,7 @@ type Episode struct {
 	Episode        int
 	Title          sql.NullString
 	AirDate        sql.NullString
+	Monitored      bool
 	Status         string
 	Quality        sql.NullString
 	FilePath       sql.NullString
@@ -62,8 +71,9 @@ type Episode struct {
 	DownloadSource    sql.NullString
 	DownloadStartedAt sql.NullString
 	// Populated by joins — not stored directly in the episodes table.
-	SeriesTitle string
-	TvdbID      sql.NullInt64
+	SeriesTitle  string
+	SeriesTmdbID int
+	TvdbID       sql.NullInt64
 }
 
 // QueueItem is a unified view of a movie or episode in the download queue.
@@ -84,7 +94,7 @@ type QueueItem struct {
 	ErrorMsg        sql.NullString
 	Source          sql.NullString
 	StartedAt       sql.NullString
-	AddedAt         time.Time
+	AddedAt         sql.NullString
 }
 
 // Indexer represents a Newznab-compatible indexer.
@@ -105,7 +115,7 @@ type History struct {
 	Event     string
 	Source    sql.NullString
 	Quality  sql.NullString
-	CreatedAt time.Time
+	CreatedAt sql.NullString
 	// Populated by joins — not stored in history table.
 	TmdbID     int // movie tmdb_id or series tmdb_id (for episodes)
 	Season     int // episode season (0 for movies)
@@ -119,7 +129,7 @@ type BlocklistEntry struct {
 	MediaID      int64
 	ReleaseTitle string
 	Reason       string
-	CreatedAt    time.Time
+	CreatedAt    sql.NullString
 	// Populated by joins — not stored in blocklist table.
 	TmdbID     int // movie tmdb_id or series tmdb_id (for episodes)
 	Season     int // episode season (0 for movies)

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"bytes"
 	"net/http"
 	"strconv"
 
@@ -90,6 +91,14 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "series.html", data)
 }
 
+// SeasonGroup groups episodes by season for template rendering.
+type SeasonGroup struct {
+	SeriesID  int64
+	Season    int
+	Monitored bool
+	Episodes  []database.Episode
+}
+
 func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -98,35 +107,34 @@ func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	episodes, err := s.db.EpisodesForSeries(id)
+	s.renderEpisodesPartial(w, id)
+}
+
+func (s *Server) renderEpisodesPartial(w http.ResponseWriter, seriesID int64) {
+	episodes, err := s.db.EpisodesForSeries(seriesID)
 	if err != nil {
 		s.serverError(w, "load episodes", err)
 		return
 	}
 
 	// Group by season
-	type SeasonGroup struct {
-		Season   int
-		Episodes []database.Episode
-	}
-	var seasons []SeasonGroup
 	seasonMap := make(map[int]*SeasonGroup)
 	for _, ep := range episodes {
 		sg, ok := seasonMap[ep.Season]
 		if !ok {
-			sg = &SeasonGroup{Season: ep.Season}
+			sg = &SeasonGroup{SeriesID: seriesID, Season: ep.Season, Monitored: true}
 			seasonMap[ep.Season] = sg
-			seasons = append(seasons, *sg)
+		}
+		if !ep.Monitored {
+			sg.Monitored = false
 		}
 		sg.Episodes = append(sg.Episodes, ep)
 	}
-	// Rebuild from map to get correct references
-	seasons = nil
+	// Sort keys
 	keys := make([]int, 0, len(seasonMap))
 	for k := range seasonMap {
 		keys = append(keys, k)
 	}
-	// Sort keys
 	for i := 0; i < len(keys); i++ {
 		for j := i + 1; j < len(keys); j++ {
 			if keys[i] > keys[j] {
@@ -134,6 +142,7 @@ func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	var seasons []SeasonGroup
 	for _, k := range keys {
 		seasons = append(seasons, *seasonMap[k])
 	}
@@ -145,6 +154,42 @@ func (s *Server) handleSeriesEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.renderPartial(w, "episodes_partial.html", data)
+}
+
+func (s *Server) handleToggleSeasonMonitor(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	seriesID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid series id", http.StatusBadRequest)
+		return
+	}
+	seasonStr := r.PathValue("season")
+	season, err := strconv.Atoi(seasonStr)
+	if err != nil {
+		http.Error(w, "invalid season", http.StatusBadRequest)
+		return
+	}
+
+	// Check current state to toggle
+	summary, err := s.db.SeasonMonitoringSummary(seriesID)
+	if err != nil {
+		s.serverError(w, "season summary", err)
+		return
+	}
+	currentlyMonitored := false
+	for _, si := range summary {
+		if si.Season == season {
+			currentlyMonitored = si.Monitored == si.Total
+			break
+		}
+	}
+
+	if _, err := s.db.SetSeasonMonitored(seriesID, season, !currentlyMonitored); err != nil {
+		s.serverError(w, "toggle season monitor", err)
+		return
+	}
+
+	s.renderEpisodesPartial(w, seriesID)
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
@@ -268,6 +313,7 @@ func (s *Server) handleRetryDownload(w http.ResponseWriter, r *http.Request) {
 }
 
 // render executes a full page template (wrapped in layout).
+// It buffers the output so template errors produce clean 500s instead of partial responses.
 func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {
 	t, ok := s.pages[name]
 	if !ok {
@@ -275,10 +321,14 @@ func (s *Server) render(w http.ResponseWriter, name string, data interface{}) {
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := t.ExecuteTemplate(w, "layout", data); err != nil {
+	var buf bytes.Buffer
+	if err := t.ExecuteTemplate(&buf, "layout", data); err != nil {
 		s.log.Error("web: render template", "template", name, "error", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	buf.WriteTo(w)
 }
 
 // renderPartial executes a template fragment (no layout).

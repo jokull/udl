@@ -197,6 +197,23 @@ type RemoveSeriesReply struct {
 	Year   int
 }
 
+// --- Season monitoring types ---
+
+// MonitorSeasonArgs contains arguments for the MonitorSeason RPC method.
+type MonitorSeasonArgs struct {
+	TmdbID int
+	Season int    // specific season number (-1 means not specified)
+	Mode   string // "", "on", "off", "latest", "all", "none"
+}
+
+// MonitorSeasonReply contains the reply for the MonitorSeason RPC method.
+type MonitorSeasonReply struct {
+	Title    string
+	Year     int
+	Affected int64
+	Seasons  []database.SeasonMonitorInfo
+}
+
 // --- Queue retry types ---
 
 // RetryDownloadArgs contains arguments for the RetryDownload RPC method.
@@ -467,6 +484,19 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 		}
 		reply.EpisodeCount = len(episodes)
 		s.log.Info("added episodes", "series", series.Title, "count", len(episodes))
+
+		// Default to monitoring only the latest season.
+		maxSeason := 0
+		for _, ep := range episodes {
+			if ep.Season > maxSeason {
+				maxSeason = ep.Season
+			}
+		}
+		if maxSeason > 0 {
+			s.db.SetAllEpisodesMonitored(id, false)
+			s.db.SetSeasonMonitored(id, maxSeason, true)
+			s.log.Info("monitoring latest season only", "series", series.Title, "season", maxSeason)
+		}
 	}
 
 	reply.Title = series.Title
@@ -575,8 +605,12 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	reply.LibraryTV = s.cfg.Library.TV
 
 	// Count movies and series.
-	s.db.QueryRow(`SELECT COUNT(*) FROM movies`).Scan(&reply.MovieCount)
-	s.db.QueryRow(`SELECT COUNT(*) FROM series`).Scan(&reply.SeriesCount)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM movies`).Scan(&reply.MovieCount); err != nil {
+		s.log.Error("status: count movies", "error", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM series`).Scan(&reply.SeriesCount); err != nil {
+		s.log.Error("status: count series", "error", err)
+	}
 
 	// Health checks.
 	if s.dl != nil {
@@ -626,6 +660,62 @@ func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply)
 	reply.Title = series.Title
 	reply.Year = series.Year
 	return s.db.RemoveSeries(series.ID)
+}
+
+// MonitorSeason manages per-season monitoring for a series.
+func (s *Service) MonitorSeason(args *MonitorSeasonArgs, reply *MonitorSeasonReply) error {
+	if args.TmdbID == 0 {
+		return fmt.Errorf("MonitorSeason: TMDB ID is required")
+	}
+	series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
+	if err != nil {
+		return fmt.Errorf("MonitorSeason: %w", err)
+	}
+	if series == nil {
+		return fmt.Errorf("MonitorSeason: no series with TMDB ID %d", args.TmdbID)
+	}
+	reply.Title = series.Title
+	reply.Year = series.Year
+
+	switch args.Mode {
+	case "on":
+		if args.Season < 0 {
+			return fmt.Errorf("MonitorSeason: --season is required with --on")
+		}
+		reply.Affected, err = s.db.SetSeasonMonitored(series.ID, args.Season, true)
+	case "off":
+		if args.Season < 0 {
+			return fmt.Errorf("MonitorSeason: --season is required with --off")
+		}
+		reply.Affected, err = s.db.SetSeasonMonitored(series.ID, args.Season, false)
+	case "latest":
+		maxSeason, err2 := s.db.MaxSeason(series.ID)
+		if err2 != nil {
+			return fmt.Errorf("MonitorSeason: %w", err2)
+		}
+		if maxSeason == 0 {
+			return fmt.Errorf("MonitorSeason: no seasons found")
+		}
+		s.db.SetAllEpisodesMonitored(series.ID, false)
+		reply.Affected, err = s.db.SetSeasonMonitored(series.ID, maxSeason, true)
+	case "all":
+		reply.Affected, err = s.db.SetAllEpisodesMonitored(series.ID, true)
+	case "none":
+		reply.Affected, err = s.db.SetAllEpisodesMonitored(series.ID, false)
+	case "":
+		// Show status only — no changes.
+	default:
+		return fmt.Errorf("MonitorSeason: unknown mode %q", args.Mode)
+	}
+	if err != nil {
+		return fmt.Errorf("MonitorSeason: %w", err)
+	}
+
+	reply.Seasons, err = s.db.SeasonMonitoringSummary(series.ID)
+	if err != nil {
+		return fmt.Errorf("MonitorSeason: %w", err)
+	}
+	return nil
 }
 
 // RetryDownload resets failed media items to wanted and re-searches for them.
@@ -1345,11 +1435,18 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 			return fmt.Errorf("daemon: create web server: %w", err)
 		}
 		webServer = ws
+		webErrCh := make(chan error, 1)
 		go func() {
 			if err := webServer.ListenAndServe(); err != nil && err.Error() != "http: Server closed" {
-				log.Error("web server error", "error", err)
+				webErrCh <- err
 			}
 		}()
+		select {
+		case err := <-webErrCh:
+			log.Error("web server failed to start — dashboard unavailable", "error", err, "addr", fmt.Sprintf("%s:%d", cfg.Web.Bind, cfg.Web.Port))
+		case <-time.After(100 * time.Millisecond):
+			log.Info("web server started", "addr", fmt.Sprintf("%s:%d", cfg.Web.Bind, cfg.Web.Port))
+		}
 	}
 
 	// Start scheduler (episode search + movie search sweep + TMDB refresh).

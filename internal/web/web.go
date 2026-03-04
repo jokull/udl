@@ -77,7 +77,7 @@ func New(db *database.DB, cfg *config.Config, log *slog.Logger, statusFn StatusF
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Web.Bind, cfg.Web.Port),
-		Handler:      s.mux,
+		Handler:      s.logMiddleware(s.mux),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
@@ -109,6 +109,28 @@ func (s *Server) loadTemplates() error {
 		"fmtProgress":     tplFmtProgress,
 		"statusClass":     tplStatusClass,
 		"seasonEp":        tplSeasonEp,
+		"fmtSource": func(source sql.NullString, nzbName sql.NullString) string {
+			if !source.Valid || source.String == "" {
+				return "—"
+			}
+			if source.String == "plex" && nzbName.Valid {
+				// NzbName is "plex:ServerName" for plex downloads
+				if idx := len("plex:"); len(nzbName.String) > idx {
+					return "plex: " + nzbName.String[idx:]
+				}
+				return "plex"
+			}
+			return source.String
+		},
+		"tmdbURL": func(category string, tmdbID int) string {
+			if tmdbID == 0 {
+				return ""
+			}
+			if category == "movie" {
+				return fmt.Sprintf("https://www.themoviedb.org/movie/%d", tmdbID)
+			}
+			return fmt.Sprintf("https://www.themoviedb.org/tv/%d", tmdbID)
+		},
 	}
 
 	layoutBytes, err := templateFS.ReadFile("templates/layout.html")
@@ -173,6 +195,37 @@ func (s *Server) routes() {
 
 	// Actions
 	s.mux.HandleFunc("POST /queue/retry/{category}/{id}", s.handleRetryDownload)
+	s.mux.HandleFunc("POST /series/{id}/season/{season}/toggle", s.handleToggleSeasonMonitor)
+}
+
+// --- HTTP middleware ---
+
+// statusWriter wraps http.ResponseWriter to capture the status code.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// logMiddleware logs each HTTP request with method, path, status, and duration.
+func (s *Server) logMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(sw, r)
+		s.log.Info("http", "method", r.Method, "path", r.URL.Path,
+			"status", sw.status, "duration", time.Since(start).Round(time.Millisecond))
+	})
 }
 
 // --- Template helpers ---

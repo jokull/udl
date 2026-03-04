@@ -131,6 +131,9 @@ button:hover, .btn:hover {
   margin-bottom: 1.5em;
 }
 
+.ext { font-size: 0.75em; color: #999; text-decoration: none; margin-left: 0.3em; }
+.ext:hover { color: #000; }
+
 .muted { color: #999; }
 .small { font-size: 0.85em; }
 
@@ -148,3 +151,24 @@ dd {
   margin-left: 150px;
   margin-bottom: 0.3em;
 }
+
+.season-header {
+  display: flex;
+  align-items: center;
+  gap: 0.8em;
+  margin: 0.8em 0 0.3em;
+}
+
+.season-header h3 { margin: 0; }
+
+.btn-sm {
+  font-size: 0.75em;
+  padding: 0.1em 0.5em;
+}
+
+.btn-active {
+  background: #000;
+  color: #fff;
+}
+
+tr.unmonitored { opacity: 0.5; }
