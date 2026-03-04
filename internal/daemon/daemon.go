@@ -1453,29 +1453,22 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	// Start web server if configured.
 	var webServer *web.Server
 	if cfg.Web.Port > 0 {
-		statusFn := func() (*web.StatusData, error) {
-			var reply StatusReply
-			if err := svc.Status(&Empty{}, &reply); err != nil {
-				return nil, err
-			}
-			return &web.StatusData{
-				Running:       reply.Running,
-				QueueSize:     reply.QueueSize,
-				Downloading:   reply.Downloading,
-				IndexerCount:  reply.IndexerCount,
-				MovieCount:    reply.MovieCount,
-				SeriesCount:   reply.SeriesCount,
-				LibraryMovies: reply.LibraryMovies,
-				LibraryTV:     reply.LibraryTV,
-				FailedCount:   reply.FailedCount,
-				BlockedCount:  reply.BlockedCount,
-			}, nil
-		}
 		retryFn := func(category string, mediaID int64) error {
 			var reply RetryDownloadReply
 			return svc.RetryDownload(&RetryDownloadArgs{Category: category, MediaID: mediaID}, &reply)
 		}
-		ws, err := web.New(db, cfg, log, statusFn, retryFn)
+		pauseFn := func(pause bool) {
+			if pause {
+				dl.Pause()
+			} else {
+				dl.Resume()
+			}
+		}
+		isPausedFn := func() bool { return dl.IsPaused() }
+		evictFn := func(category string, mediaID int64) error {
+			return db.EvictFromQueue(category, mediaID)
+		}
+		ws, err := web.New(db, cfg, log, retryFn, pauseFn, isPausedFn, evictFn)
 		if err != nil {
 			ln.Close()
 			return fmt.Errorf("daemon: create web server: %w", err)

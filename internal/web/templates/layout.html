@@ -11,10 +11,9 @@
 <body>
   <nav>
     <strong>UDL</strong> &mdash;
-    <a href="/" {{if eq .Page "dashboard"}}class="active"{{end}}>Dashboard</a>
+    <a href="/" {{if eq .Page "queue"}}class="active"{{end}}>Queue</a>
     <a href="/movies" {{if eq .Page "movies"}}class="active"{{end}}>Movies</a>
     <a href="/series" {{if eq .Page "series"}}class="active"{{end}}>Series</a>
-    <a href="/queue" {{if eq .Page "queue"}}class="active"{{end}}>Queue</a>
     <a href="/schedule" {{if eq .Page "schedule"}}class="active"{{end}}>Schedule</a>
     <a href="/history" {{if eq .Page "history"}}class="active"{{end}}>History</a>
   </nav>

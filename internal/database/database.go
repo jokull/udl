@@ -1072,8 +1072,16 @@ func (db *DB) PendingMedia() ([]QueueItem, error) {
 		return nil, err
 	}
 	// Sort: post_processing first, then downloading, then queued.
+	// Within same status tier, plex sources come before usenet (fast completions first).
 	sort.Slice(items, func(i, j int) bool {
-		return queueStatusPriority(items[i].Status) < queueStatusPriority(items[j].Status)
+		pi, pj := queueStatusPriority(items[i].Status), queueStatusPriority(items[j].Status)
+		if pi != pj {
+			return pi < pj
+		}
+		if items[i].Source != items[j].Source {
+			return items[i].Source.Valid && items[i].Source.String == "plex"
+		}
+		return false
 	})
 	return items, nil
 }
@@ -1224,6 +1232,47 @@ func (db *DB) MediaQueueStats() (queued, downloading int, err error) {
 			SELECT status FROM episodes WHERE status IN ('queued', 'downloading', 'post_processing')
 		)`).Scan(&queued, &downloading)
 	return
+}
+
+// EvictFromQueue removes an item from the queue.
+// Movies: deletes the movie row entirely.
+// Episodes: clears download fields, sets status='wanted', sets monitored=0.
+func (db *DB) EvictFromQueue(category string, mediaID int64) error {
+	switch category {
+	case "movie":
+		_, err := db.Exec(`DELETE FROM movies WHERE id = ?`, mediaID)
+		return err
+	case "episode":
+		_, err := db.Exec(`
+			UPDATE episodes SET
+				status = 'wanted',
+				monitored = 0,
+				nzb_url = NULL, nzb_name = NULL,
+				download_progress = 0, download_size = NULL, download_bytes = 0,
+				download_error = NULL, download_source = NULL, download_started_at = NULL
+			WHERE id = ?`, mediaID)
+		return err
+	default:
+		return fmt.Errorf("unknown category: %s", category)
+	}
+}
+
+// QueueTotalSize returns the sum of download_size for all active queue items.
+func (db *DB) QueueTotalSize() (int64, error) {
+	var total sql.NullInt64
+	err := db.QueryRow(`
+		SELECT SUM(download_size) FROM (
+			SELECT download_size FROM movies WHERE status IN ('queued', 'downloading', 'post_processing') AND download_size IS NOT NULL
+			UNION ALL
+			SELECT download_size FROM episodes WHERE status IN ('queued', 'downloading', 'post_processing') AND download_size IS NOT NULL
+		)`).Scan(&total)
+	if err != nil {
+		return 0, err
+	}
+	if !total.Valid {
+		return 0, nil
+	}
+	return total.Int64, nil
 }
 
 // FailedMediaCount24h returns the count of media items that failed in the last 24 hours.

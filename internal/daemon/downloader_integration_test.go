@@ -644,7 +644,7 @@ func TestPipeline_FailedNzbFetch(t *testing.T) {
 	history, _ := db.ListHistory(10)
 	var found bool
 	for _, h := range history {
-		if h.Event == "failed" && h.MediaID == movieID {
+		if strings.HasPrefix(h.Event, "failed") && h.MediaID == movieID {
 			found = true
 		}
 	}

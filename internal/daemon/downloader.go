@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -37,15 +38,27 @@ type PoolStatuser interface {
 }
 
 // Downloader picks items from the download queue and processes them.
-// Uses the Service for shared config/db/log access (same pattern as Scheduler).
+// Uses two workers: one for NNTP/Plex downloads, one for post-processing.
+// This prevents slow post-processing (PAR2/RAR) from blocking new downloads.
 type Downloader struct {
-	svc      *Service
-	engine   DownloadEngine
-	indexers []*newznab.Client
-	workCh   chan database.QueueItem // buffered, cap 32
-	stop     chan struct{}
-	stopOnce sync.Once
+	svc           *Service
+	engine        DownloadEngine
+	indexers      []*newznab.Client
+	downloadCh    chan database.QueueItem // buffered, cap 32, for queued items
+	postProcessCh chan database.QueueItem // buffered, cap 8, for post_processing items
+	stop          chan struct{}
+	stopOnce      sync.Once
+	paused        atomic.Bool
 }
+
+// Pause pauses the download queue processing.
+func (d *Downloader) Pause() { d.paused.Store(true) }
+
+// Resume resumes the download queue processing.
+func (d *Downloader) Resume() { d.paused.Store(false) }
+
+// IsPaused returns whether the downloader is paused.
+func (d *Downloader) IsPaused() bool { return d.paused.Load() }
 
 // NewDownloader creates a downloader with NNTP engine initialized from config providers.
 func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
@@ -72,11 +85,12 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 	}
 
 	return &Downloader{
-		svc:      svc,
-		engine:   engine,
-		indexers: indexers,
-		workCh:   make(chan database.QueueItem, 32),
-		stop:     make(chan struct{}),
+		svc:           svc,
+		engine:        engine,
+		indexers:       indexers,
+		downloadCh:    make(chan database.QueueItem, 32),
+		postProcessCh: make(chan database.QueueItem, 8),
+		stop:          make(chan struct{}),
 	}
 }
 
@@ -84,20 +98,25 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 // Used in tests to inject a fake engine that doesn't require real NNTP providers.
 func NewDownloaderWithEngine(svc *Service, engine DownloadEngine) *Downloader {
 	return &Downloader{
-		svc:    svc,
-		engine: engine,
-		workCh: make(chan database.QueueItem, 32),
-		stop:   make(chan struct{}),
+		svc:           svc,
+		engine:        engine,
+		downloadCh:    make(chan database.QueueItem, 32),
+		postProcessCh: make(chan database.QueueItem, 8),
+		stop:          make(chan struct{}),
 	}
 }
 
-// Enqueue sends a queue item to the worker goroutine for immediate processing.
+// Enqueue sends a queue item to the appropriate worker channel based on status.
 // Non-blocking — drops the item if the channel is full (watchdog will recover it).
 func (d *Downloader) Enqueue(item database.QueueItem) {
+	ch := d.downloadCh
+	if item.Status == "post_processing" {
+		ch = d.postProcessCh
+	}
 	select {
-	case d.workCh <- item:
+	case ch <- item:
 	default:
-		d.svc.log.Debug("work channel full, watchdog will pick up", "title", item.Title)
+		d.svc.log.Debug("channel full, watchdog will pick up", "title", item.Title)
 	}
 }
 
@@ -139,19 +158,10 @@ func (d *Downloader) Start(ctx context.Context) {
 		}
 	}
 
-	// Worker goroutine: processes items from the channel sequentially.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-d.stop:
-				return
-			case item := <-d.workCh:
-				d.processItem(ctx, item)
-			}
-		}
-	}()
+	// Download worker: picks up queued items, runs NNTP/Plex download phase.
+	go d.downloadWorker(ctx)
+	// Post-process worker: picks up post_processing items, runs PAR2/RAR/import.
+	go d.postProcessWorker(ctx)
 
 	// Watchdog goroutine: 30s tick, resets stuck items + re-enqueues missed ones.
 	go func() {
@@ -171,14 +181,15 @@ func (d *Downloader) Start(ctx context.Context) {
 }
 
 // Stop signals the downloader to stop. Safe to call multiple times.
-// Drains the work channel to prevent goroutine leaks from blocked senders.
+// Drains both channels to prevent goroutine leaks from blocked senders.
 func (d *Downloader) Stop() {
 	d.stopOnce.Do(func() {
 		close(d.stop)
-		// Drain work channel so any goroutines blocked on send can proceed.
+		// Drain channels so any goroutines blocked on send can proceed.
 		for {
 			select {
-			case <-d.workCh:
+			case <-d.downloadCh:
+			case <-d.postProcessCh:
 			default:
 				d.engine.Close()
 				return
@@ -243,6 +254,222 @@ func (d *Downloader) processItem(ctx context.Context, item database.QueueItem) {
 	if err != nil {
 		d.svc.log.Error("download failed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "error", err)
 	}
+}
+
+// downloadWorker processes queued items: NNTP download or Plex stream.
+// Each item gets a 4-hour timeout to prevent indefinite hangs.
+func (d *Downloader) downloadWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-d.stop:
+			return
+		case item := <-d.downloadCh:
+			// Wait while paused — re-check every 2s.
+			for d.paused.Load() {
+				select {
+				case <-ctx.Done():
+					return
+				case <-d.stop:
+					return
+				case <-time.After(2 * time.Second):
+				}
+			}
+			itemCtx, cancel := context.WithTimeout(ctx, 4*time.Hour)
+			d.processDownload(itemCtx, item)
+			cancel()
+		}
+	}
+}
+
+// postProcessWorker processes post_processing items: PAR2/RAR/import.
+// Each item gets a 2-hour timeout (par2 has its own 30min timeout as first line of defense).
+func (d *Downloader) postProcessWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-d.stop:
+			return
+		case item := <-d.postProcessCh:
+			for d.paused.Load() {
+				select {
+				case <-ctx.Done():
+					return
+				case <-d.stop:
+					return
+				case <-time.After(2 * time.Second):
+				}
+			}
+			itemCtx, cancel := context.WithTimeout(ctx, 2*time.Hour)
+			d.processPostProcessing(itemCtx, item)
+			cancel()
+		}
+	}
+}
+
+// processDownload handles a single download item (NNTP or Plex).
+// Re-reads status from DB to avoid processing stale items.
+func (d *Downloader) processDownload(ctx context.Context, item database.QueueItem) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Re-read status from DB.
+	table := "movies"
+	if item.Category == "episode" {
+		table = "episodes"
+	}
+	var currentStatus string
+	if err := d.svc.db.QueryRow(fmt.Sprintf(`SELECT status FROM %s WHERE id = ?`, table), item.MediaID).Scan(&currentStatus); err != nil {
+		d.svc.log.Warn("processDownload: could not read current status, skipping", "category", item.Category, "media_id", item.MediaID, "error", err)
+		return
+	}
+	switch currentStatus {
+	case "queued", "downloading":
+		item.Status = currentStatus
+	default:
+		return // no longer active or moved to post_processing
+	}
+
+	d.svc.log.Info("download worker: processing", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "status", item.Status)
+
+	var err error
+	if item.Source.Valid && item.Source.String == "plex" {
+		err = d.processPlexDownload(ctx, item)
+	} else {
+		err = d.processUsenetDownloadOnly(ctx, item)
+	}
+
+	if err != nil {
+		d.svc.log.Error("download failed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "error", err)
+	}
+}
+
+// processPostProcessing handles a single post_processing item.
+// Re-reads status from DB to avoid processing stale items.
+func (d *Downloader) processPostProcessing(ctx context.Context, item database.QueueItem) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	// Re-read status from DB.
+	table := "movies"
+	if item.Category == "episode" {
+		table = "episodes"
+	}
+	var currentStatus string
+	if err := d.svc.db.QueryRow(fmt.Sprintf(`SELECT status FROM %s WHERE id = ?`, table), item.MediaID).Scan(&currentStatus); err != nil {
+		d.svc.log.Warn("processPostProcessing: could not read current status, skipping", "category", item.Category, "media_id", item.MediaID, "error", err)
+		return
+	}
+	if currentStatus != "post_processing" {
+		return // no longer in post_processing
+	}
+
+	d.svc.log.Info("post-process worker: processing", "category", item.Category, "media_id", item.MediaID, "title", item.Title)
+
+	dlDir := d.downloadDir(item)
+
+	// Check if directory was deleted between enqueue and processing.
+	if _, err := os.Stat(dlDir); os.IsNotExist(err) {
+		if err := d.fail(item, "post-process: download directory missing"); err != nil {
+			d.svc.log.Error("post-processing failed", "title", item.Title, "error", err)
+		}
+		return
+	}
+
+	// Check if file was already imported (crash between import and DB update).
+	if dstPath, q := d.expectedLibraryPath(item); dstPath != "" {
+		if _, err := os.Stat(dstPath); err == nil {
+			d.svc.log.Info("post-process: file already imported, completing", "title", item.Title, "path", dstPath)
+			if err := d.completeDownload(item, q, dstPath, dlDir); err != nil {
+				d.svc.log.Error("post-processing complete failed", "title", item.Title, "error", err)
+			}
+			return
+		}
+	}
+
+	if err := d.postProcessImportComplete(ctx, item, dlDir); err != nil {
+		d.svc.log.Error("post-processing failed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "error", err)
+	}
+}
+
+// processUsenetDownloadOnly handles the NNTP download phase only.
+// After download completes, sets status to post_processing and hands off to postProcessCh.
+func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item database.QueueItem) error {
+	// 1. Update status to "downloading".
+	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "downloading"); err != nil {
+		return fmt.Errorf("update status to downloading: %w", err)
+	}
+
+	// 2. Check disk space before starting.
+	if item.SizeBytes.Valid {
+		if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, item.SizeBytes.Int64, 2); err != nil {
+			return d.fail(item, err.Error())
+		}
+	}
+
+	// 3. Fetch NZB bytes from the item's nzb_url.
+	if !item.NzbURL.Valid || item.NzbURL.String == "" {
+		return d.fail(item, "download has no NZB URL")
+	}
+	nzbURL := item.NzbURL.String
+
+	nzbData, err := d.fetchNZB(nzbURL)
+	if err != nil {
+		return d.fail(item, fmt.Sprintf("fetch NZB: %v", err))
+	}
+
+	// 4. Parse NZB XML.
+	parsed, err := nzb.Parse(bytes.NewReader(nzbData))
+	if err != nil {
+		return d.fail(item, fmt.Sprintf("parse NZB: %v", err))
+	}
+	d.svc.log.Info("usenet: starting NNTP download", "title", item.Title, "files", len(parsed.Files))
+
+	// 5. Create download directory under incomplete.
+	dlDir := d.downloadDir(item)
+	if err := os.MkdirAll(dlDir, 0o755); err != nil {
+		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
+	}
+
+	// Save NZB for potential resume.
+	_ = os.WriteFile(filepath.Join(dlDir, "manifest.nzb"), nzbData, 0o644)
+
+	// 6. NNTP Download with progress callback.
+	progressFn := func(p nntp.Progress) {
+		if p.TotalSegments == 0 {
+			return
+		}
+		progress := float64(p.DoneSegments) / float64(p.TotalSegments) * 100
+		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, p.BytesDownloaded)
+	}
+
+	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
+	if err != nil {
+		if strings.Contains(err.Error(), "segments failed") {
+			d.svc.log.Warn("some segments failed, proceeding to PAR2 repair", "title", item.Title, "error", err)
+		} else {
+			return d.fail(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
+		}
+	}
+
+	// 7. Update status to "post_processing" and hand off.
+	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "post_processing"); err != nil {
+		return fmt.Errorf("update status to post_processing: %w", err)
+	}
+	item.Status = "post_processing"
+
+	// Non-blocking send to post-process worker; watchdog recovers if full.
+	select {
+	case d.postProcessCh <- item:
+	default:
+		d.svc.log.Debug("postProcessCh full, watchdog will pick up", "title", item.Title)
+	}
+
+	return nil
 }
 
 // downloadDir returns the path to the incomplete directory for this item.
@@ -449,7 +676,7 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 // to the library, records completion, and cleans up. Used by both the normal
 // download pipeline and the resume path.
 func (d *Downloader) postProcessImportComplete(ctx context.Context, item database.QueueItem, downloadDir string) error {
-	result, err := postprocess.Process(downloadDir, d.svc.log)
+	result, err := postprocess.Process(ctx, downloadDir, d.svc.log)
 	if err != nil {
 		return d.fail(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
 	}
@@ -627,6 +854,31 @@ func (d *Downloader) expectedLibraryPath(item database.QueueItem) (string, quali
 	return "", q
 }
 
+// failEvent classifies a failure message into a descriptive history event.
+func failEvent(msg string) string {
+	lower := strings.ToLower(msg)
+	switch {
+	case strings.Contains(lower, "par2"):
+		return "failed:par2"
+	case strings.Contains(lower, "rar"):
+		return "failed:unpack"
+	case strings.Contains(lower, "nntp") || strings.Contains(lower, "segments failed"):
+		return "failed:nntp"
+	case strings.Contains(lower, "disk space"):
+		return "failed:disk"
+	case strings.Contains(lower, "nzb"):
+		return "failed:nzb"
+	case strings.Contains(lower, "no media files"):
+		return "failed:no-media"
+	case strings.Contains(lower, "plex"):
+		return "failed:plex"
+	case strings.Contains(lower, "encrypted"):
+		return "failed:encrypted"
+	default:
+		return "failed"
+	}
+}
+
 // fail marks the media item as failed, records a history event, blocklists the release,
 // and returns an error. If cleanupDir is provided, the directory is removed.
 func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...string) error {
@@ -639,8 +891,8 @@ func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...str
 		nzbName = item.NzbName.String
 	}
 
-	// Record failure in history and blocklist the release.
-	if err := d.svc.db.AddHistory(item.Category, item.MediaID, item.Title, "failed", nzbName, ""); err != nil {
+	// Record failure in history with a descriptive event.
+	if err := d.svc.db.AddHistory(item.Category, item.MediaID, item.Title, failEvent(msg), nzbName, ""); err != nil {
 		d.svc.log.Error("failed to record failure history", "title", item.Title, "error", err)
 	}
 	if nzbName != "" {

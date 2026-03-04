@@ -3,12 +3,25 @@
 {{define "title"}} — Queue{{end}}
 
 {{define "content"}}
-<h1>Queue</h1>
+<div style="display:flex;align-items:center;gap:1em;margin-bottom:0.5em">
+  <h1 style="margin:0">Queue</h1>
+  <span id="pause-toggle">
+    {{if .Paused}}
+    <button hx-post="/queue/resume" hx-swap="outerHTML" hx-target="#pause-toggle">Resume</button> <span class="status failed">PAUSED</span>
+    {{else}}
+    <button hx-post="/queue/pause" hx-swap="outerHTML" hx-target="#pause-toggle">Pause</button>
+    {{end}}
+  </span>
+  <span class="small muted">
+    {{if .FreeDisk}}Free: {{fmtBytes .FreeDisk}}{{end}}
+    {{if .QueueSize}} · Queued: {{fmtBytes .QueueSize}}{{end}}
+  </span>
+</div>
 
 {{if .Queue}}
 <div hx-ext="sse" sse-connect="/sse/queue" sse-swap="queue">
 <table>
-  <tr><th>Title</th><th>Status</th><th>Source</th><th>Progress</th><th>Size</th></tr>
+  <tr><th>Title</th><th>Status</th><th>Source</th><th>Progress</th><th>Size</th><th></th></tr>
   {{range .Queue}}
   <tr>
     <td>
@@ -16,12 +29,13 @@
       <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
     </td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
-    <td class="small">{{fmtSource .Source .NzbName}}</td>
+    <td class="small">{{fmtSource .Source .NzbName .NzbURL}}</td>
     <td>
       <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
       {{fmtProgress .Progress}}
     </td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
+    <td><button hx-post="/queue/evict/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Evict from queue?">evict</button></td>
   </tr>
   {{end}}
 </table>
@@ -42,6 +56,7 @@
     <td class="small">{{fmtNullTimeStr .AddedAt}}</td>
     <td>
       <button hx-post="/queue/retry/{{.Category}}/{{.MediaID}}" hx-swap="outerHTML" hx-target="closest tr" hx-confirm="Retry this download?">retry</button>
+      <button hx-post="/queue/evict/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Evict from queue?">evict</button>
     </td>
   </tr>
   {{end}}

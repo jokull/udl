@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -24,49 +26,44 @@ var templateFS embed.FS
 //go:embed static/*
 var staticFS embed.FS
 
-// StatusData holds dashboard status information.
-type StatusData struct {
-	Running       bool
-	QueueSize     int
-	Downloading   int
-	IndexerCount  int
-	MovieCount    int
-	SeriesCount   int
-	LibraryMovies string
-	LibraryTV     string
-	FailedCount   int
-	BlockedCount  int
-}
-
-// StatusFunc returns dashboard status data.
-type StatusFunc func() (*StatusData, error)
-
 // RetryFunc retries a failed download by category ("movie"/"episode") and media ID.
 type RetryFunc func(category string, mediaID int64) error
+
+// PauseFunc pauses or resumes the download queue.
+type PauseFunc func(pause bool)
+
+// IsPausedFunc returns whether the download queue is paused.
+type IsPausedFunc func() bool
+
+// EvictFunc removes an item from the queue. Movies are deleted; episodes are unmonitored.
+type EvictFunc func(category string, mediaID int64) error
 
 // Server is the embedded HTTP server.
 type Server struct {
 	db       *database.DB
 	cfg      *config.Config
 	log      *slog.Logger
-	status   StatusFunc
 	retry    RetryFunc
+	pause    PauseFunc
+	isPaused IsPausedFunc
+	evict    EvictFunc
 	mux      *http.ServeMux
 	pages    map[string]*template.Template // per-page templates (layout + page)
 	partials *template.Template            // shared partials (no layout)
 	server   *http.Server
 }
 
-// New creates a new web server. statusFn and retryFn provide the callbacks
-// that require daemon logic beyond simple DB reads.
-func New(db *database.DB, cfg *config.Config, log *slog.Logger, statusFn StatusFunc, retryFn RetryFunc) (*Server, error) {
+// New creates a new web server.
+func New(db *database.DB, cfg *config.Config, log *slog.Logger, retryFn RetryFunc, pauseFn PauseFunc, isPausedFn IsPausedFunc, evictFn EvictFunc) (*Server, error) {
 	s := &Server{
-		db:     db,
-		cfg:    cfg,
-		log:    log,
-		status: statusFn,
-		retry:  retryFn,
-		mux:    http.NewServeMux(),
+		db:       db,
+		cfg:      cfg,
+		log:      log,
+		retry:    retryFn,
+		pause:    pauseFn,
+		isPaused: isPausedFn,
+		evict:    evictFn,
+		mux:      http.NewServeMux(),
 	}
 
 	if err := s.loadTemplates(); err != nil {
@@ -109,7 +106,7 @@ func (s *Server) loadTemplates() error {
 		"fmtProgress":     tplFmtProgress,
 		"statusClass":     tplStatusClass,
 		"seasonEp":        tplSeasonEp,
-		"fmtSource": func(source sql.NullString, nzbName sql.NullString) string {
+		"fmtSource": func(source sql.NullString, nzbName sql.NullString, nzbURL sql.NullString) string {
 			if !source.Valid || source.String == "" {
 				return "—"
 			}
@@ -119,6 +116,9 @@ func (s *Server) loadTemplates() error {
 					return "plex: " + nzbName.String[idx:]
 				}
 				return "plex"
+			}
+			if source.String == "usenet" && nzbURL.Valid && nzbURL.String != "" {
+				return fmtIndexerName(nzbURL.String)
 			}
 			return source.String
 		},
@@ -141,7 +141,6 @@ func (s *Server) loadTemplates() error {
 	// Build per-page templates: each page gets its own clone of layout so
 	// the "content" and "title" blocks don't collide across pages.
 	pageFiles := []string{
-		"dashboard.html",
 		"movies.html",
 		"series.html",
 		"queue.html",
@@ -182,11 +181,10 @@ func (s *Server) routes() {
 	s.mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticSub))))
 
 	// Pages
-	s.mux.HandleFunc("GET /{$}", s.handleDashboard)
+	s.mux.HandleFunc("GET /{$}", s.handleQueue)
 	s.mux.HandleFunc("GET /movies", s.handleMovies)
 	s.mux.HandleFunc("GET /series", s.handleSeries)
 	s.mux.HandleFunc("GET /series/{id}/episodes", s.handleSeriesEpisodes)
-	s.mux.HandleFunc("GET /queue", s.handleQueue)
 	s.mux.HandleFunc("GET /schedule", s.handleSchedule)
 	s.mux.HandleFunc("GET /history", s.handleHistory)
 
@@ -195,6 +193,9 @@ func (s *Server) routes() {
 
 	// Actions
 	s.mux.HandleFunc("POST /queue/retry/{category}/{id}", s.handleRetryDownload)
+	s.mux.HandleFunc("POST /queue/pause", s.handlePause)
+	s.mux.HandleFunc("POST /queue/resume", s.handleResume)
+	s.mux.HandleFunc("POST /queue/evict/{category}/{id}", s.handleEvict)
 	s.mux.HandleFunc("POST /series/{id}/season/{season}/toggle", s.handleToggleSeasonMonitor)
 }
 
@@ -308,10 +309,33 @@ func tplStatusClass(status string) string {
 	case "ended":
 		return "ended"
 	default:
+		if strings.HasPrefix(status, "failed") {
+			return "failed"
+		}
 		return ""
 	}
 }
 
 func tplSeasonEp(season, episode int) string {
 	return fmt.Sprintf("S%02dE%02d", season, episode)
+}
+
+// fmtIndexerName extracts a short indexer name from an NZB URL.
+// e.g. "https://api.dognzb.cr/..." → "dognzb"
+func fmtIndexerName(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return "usenet"
+	}
+	host := u.Hostname()
+	// Strip "api." prefix
+	host = strings.TrimPrefix(host, "api.")
+	// Strip TLD: take everything before the last dot
+	if idx := strings.LastIndex(host, "."); idx > 0 {
+		host = host[:idx]
+	}
+	if host == "" {
+		return "usenet"
+	}
+	return host
 }

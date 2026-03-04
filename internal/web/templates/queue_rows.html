@@ -1,23 +1,24 @@
 {{define "queue_rows.html"}}
 <table>
-  <tr><th>Title</th><th>Status</th><th>Source</th><th>Progress</th><th>Size</th></tr>
-  {{range .}}
+  <tr><th>Title</th><th>Status</th><th>Source</th><th>Progress</th><th>Size</th><th></th></tr>
+  {{range .Items}}
   <tr>
     <td>
       {{if .TmdbID}}<a href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
       <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
     </td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
-    <td class="small">{{fmtSource .Source .NzbName}}</td>
+    <td class="small">{{fmtSource .Source .NzbName .NzbURL}}</td>
     <td>
       <div class="progress-bar"><div class="progress-fill" style="width:{{fmtProgress .Progress}}"></div></div>
       {{fmtProgress .Progress}}
     </td>
     <td>{{fmtNullBytes .SizeBytes}}</td>
+    <td><button hx-post="/queue/evict/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Evict from queue?">evict</button></td>
   </tr>
   {{end}}
-  {{if not .}}
-  <tr><td colspan="5" class="muted">No active downloads.</td></tr>
+  {{if not .Items}}
+  <tr><td colspan="6" class="muted">No active downloads.</td></tr>
   {{end}}
 </table>
 {{end}}

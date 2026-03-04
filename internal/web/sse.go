@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/jokull/udl/internal/database"
 )
 
 func (s *Server) handleSSEQueue(w http.ResponseWriter, r *http.Request) {
@@ -34,6 +36,11 @@ func (s *Server) handleSSEQueue(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// queueSSEData is the data passed to the queue_rows.html partial via SSE.
+type queueSSEData struct {
+	Items []database.QueueItem
+}
+
 func (s *Server) sendQueueSSE(w http.ResponseWriter, flusher http.Flusher) {
 	items, err := s.db.PendingMedia()
 	if err != nil {
@@ -41,9 +48,11 @@ func (s *Server) sendQueueSSE(w http.ResponseWriter, flusher http.Flusher) {
 		return
 	}
 
+	data := queueSSEData{Items: items}
+
 	// Render the queue rows partial
 	var htmlBuf bytes.Buffer
-	err = s.partials.ExecuteTemplate(&htmlBuf, "queue_rows.html", items)
+	err = s.partials.ExecuteTemplate(&htmlBuf, "queue_rows.html", data)
 	if err != nil {
 		s.log.Error("web: sse render", "error", err)
 		return

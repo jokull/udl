@@ -5,40 +5,10 @@ import (
 	"net/http"
 	"strconv"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/jokull/udl/internal/database"
 )
-
-func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
-	status, err := s.status()
-	if err != nil {
-		s.log.Error("web: dashboard status", "error", err)
-		status = &StatusData{Running: true}
-	}
-
-	queue, err := s.db.PendingMedia()
-	if err != nil {
-		s.log.Error("web: dashboard queue", "error", err)
-	}
-
-	history, err := s.db.ListHistory(5)
-	if err != nil {
-		s.log.Error("web: dashboard history", "error", err)
-	}
-
-	data := struct {
-		Status  *StatusData
-		Queue   []database.QueueItem
-		History []database.History
-		Page    string
-	}{
-		Status:  status,
-		Queue:   queue,
-		History: history,
-		Page:    "dashboard",
-	}
-
-	s.render(w, "dashboard.html", data)
-}
 
 func (s *Server) handleMovies(w http.ResponseWriter, r *http.Request) {
 	filter := r.URL.Query().Get("status")
@@ -209,17 +179,38 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	freeDisk := s.freeDiskBytes()
+	queueSize, _ := s.db.QueueTotalSize()
+
 	data := struct {
-		Queue  []database.QueueItem
-		Failed []database.QueueItem
-		Page   string
+		Queue     []database.QueueItem
+		Failed    []database.QueueItem
+		Paused    bool
+		FreeDisk  int64
+		QueueSize int64
+		Page      string
 	}{
-		Queue:  queue,
-		Failed: failed,
-		Page:   "queue",
+		Queue:     queue,
+		Failed:    failed,
+		Paused:    s.isPaused(),
+		FreeDisk:  freeDisk,
+		QueueSize: queueSize,
+		Page:      "queue",
 	}
 
 	s.render(w, "queue.html", data)
+}
+
+// freeDiskBytes returns available bytes on the incomplete downloads volume.
+func (s *Server) freeDiskBytes() int64 {
+	if s.cfg == nil || s.cfg.Paths.Incomplete == "" {
+		return 0
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(s.cfg.Paths.Incomplete, &stat); err != nil {
+		return 0
+	}
+	return int64(stat.Bavail) * int64(stat.Bsize)
 }
 
 func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
@@ -282,6 +273,41 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.render(w, "history.html", data)
+}
+
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	s.pause(true)
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span id="pause-toggle"><button hx-post="/queue/resume" hx-swap="outerHTML" hx-target="#pause-toggle">Resume</button> <span class="status failed">PAUSED</span></span>`))
+}
+
+func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
+	s.pause(false)
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span id="pause-toggle"><button hx-post="/queue/pause" hx-swap="outerHTML" hx-target="#pause-toggle">Pause</button></span>`))
+}
+
+func (s *Server) handleEvict(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid media id", http.StatusBadRequest)
+		return
+	}
+	if category != "movie" && category != "episode" {
+		http.Error(w, "invalid category", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.evict(category, id); err != nil {
+		s.log.Error("web: evict", "category", category, "id", id, "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Return empty response — htmx hx-swap="delete" removes the row
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) handleRetryDownload(w http.ResponseWriter, r *http.Request) {

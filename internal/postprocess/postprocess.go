@@ -1,6 +1,7 @@
 package postprocess
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jokull/udl/internal/par2"
 	"github.com/nwaples/rardecode/v2"
@@ -294,7 +296,8 @@ func renameByPAR2(dir string, log *slog.Logger) int {
 
 // Process runs the full post-processing pipeline on a download directory.
 // Stages: PAR2 rename -> magic rename -> AppleDouble cleanup -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
-func Process(dir string, log *slog.Logger) (*Result, error) {
+// The context is checked between stages for prompt cancellation on shutdown.
+func Process(ctx context.Context, dir string, log *slog.Logger) (*Result, error) {
 	result := &Result{}
 
 	// Stage 0: Rename obfuscated files using PAR2 manifest hash matching.
@@ -305,6 +308,10 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 	// Stage 0.5: Rename remaining obfuscated files by magic bytes (fallback).
 	if err := renameByMagic(dir, log); err != nil {
 		log.Warn("rename by magic failed", "error", err)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("post-processing canceled: %w", err)
 	}
 
 	// Stage 1: Delete macOS AppleDouble resource fork files before PAR2.
@@ -319,7 +326,7 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 	} else if par2File != "" {
 		log.Info("found PAR2 index file", "file", par2File)
 
-		needsRepair, err := par2Verify(par2File, log)
+		needsRepair, err := par2Verify(ctx, par2File, log)
 		if err != nil {
 			// PAR2 failure is non-fatal if RAR files exist (common with obfuscated
 			// releases where filenames don't match the PAR2 manifest).
@@ -333,7 +340,7 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 			}
 		} else if needsRepair {
 			log.Info("PAR2 indicates repair needed, running repair")
-			if err := par2Repair(par2File, log); err != nil {
+			if err := par2Repair(ctx, par2File, log); err != nil {
 				result.Success = false
 				result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
 				return result, fmt.Errorf("par2 repair failed: %w", err)
@@ -344,6 +351,10 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 		}
 	} else {
 		log.Info("no PAR2 files found, skipping verify/repair")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("post-processing canceled: %w", err)
 	}
 
 	// Stage 3: RAR extraction
@@ -363,6 +374,10 @@ func Process(dir string, log *slog.Logger) (*Result, error) {
 		}
 	} else {
 		log.Info("no RAR archives found, skipping extraction")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("post-processing canceled: %w", err)
 	}
 
 	// Stage 4: Cleanup
@@ -431,11 +446,19 @@ func findPAR2File(dir string) (string, error) {
 	return allMatches[0], nil
 }
 
+// par2Timeout is the maximum time to wait for par2cmdline to complete.
+// 12GB of data takes ~90s to verify; 30 minutes is generous.
+const par2Timeout = 30 * time.Minute
+
 // par2Verify runs par2 verify on a PAR2 file.
 // Returns needsRepair=true if exit code is 1 (repairable).
 // Exit code 2 means damage is irreparable (not enough recovery data).
-func par2Verify(par2File string, log *slog.Logger) (needsRepair bool, err error) {
-	cmd := exec.Command("par2", "verify", par2File)
+// The par2Timeout is applied as a child of the parent context, so both
+// the per-item timeout and the par2-specific timeout can cancel the command.
+func par2Verify(ctx context.Context, par2File string, log *slog.Logger) (needsRepair bool, err error) {
+	ctx, cancel := context.WithTimeout(ctx, par2Timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "par2", "verify", par2File)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
@@ -455,8 +478,10 @@ func par2Verify(par2File string, log *slog.Logger) (needsRepair bool, err error)
 }
 
 // par2Repair runs par2 repair on a PAR2 file.
-func par2Repair(par2File string, log *slog.Logger) error {
-	cmd := exec.Command("par2", "repair", par2File)
+func par2Repair(ctx context.Context, par2File string, log *slog.Logger) error {
+	ctx, cancel := context.WithTimeout(ctx, par2Timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "par2", "repair", par2File)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("par2 repair failed: %s: %w", string(output), err)
