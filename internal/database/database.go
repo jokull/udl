@@ -158,6 +158,16 @@ CREATE TABLE IF NOT EXISTS blocklist (
 		return fmt.Errorf("create index: %w", err)
 	}
 
+	// Add original_language column to movies and series (idempotent).
+	_, err = db.Exec(`ALTER TABLE movies ADD COLUMN original_language TEXT`)
+	if err != nil && !isAlterDuplicate(err) {
+		return fmt.Errorf("add movies original_language column: %w", err)
+	}
+	_, err = db.Exec(`ALTER TABLE series ADD COLUMN original_language TEXT`)
+	if err != nil && !isAlterDuplicate(err) {
+		return fmt.Errorf("add series original_language column: %w", err)
+	}
+
 	return nil
 }
 
@@ -171,10 +181,10 @@ func isAlterDuplicate(err error) bool {
 // ---------------------------------------------------------------------------
 
 // AddMovie inserts a new movie with status 'wanted' and returns the new row ID.
-func (db *DB) AddMovie(tmdbID int, imdbID, title string, year int) (int64, error) {
+func (db *DB) AddMovie(tmdbID int, imdbID, title string, year int, originalLanguage string) (int64, error) {
 	res, err := db.Exec(
-		`INSERT INTO movies (tmdb_id, imdb_id, title, year) VALUES (?, ?, ?, ?)`,
-		tmdbID, nullString(imdbID), title, year,
+		`INSERT INTO movies (tmdb_id, imdb_id, title, year, original_language) VALUES (?, ?, ?, ?, ?)`,
+		tmdbID, nullString(imdbID), title, year, nullString(originalLanguage),
 	)
 	if err != nil {
 		return 0, err
@@ -185,7 +195,7 @@ func (db *DB) AddMovie(tmdbID int, imdbID, title string, year int) (int64, error
 // ListMovies returns all movies ordered by added_at descending.
 func (db *DB) ListMovies() ([]Movie, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at, download_error
+		`SELECT id, tmdb_id, imdb_id, title, year, original_language, status, quality, file_path, added_at, download_error
 		 FROM movies ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -196,7 +206,7 @@ func (db *DB) ListMovies() ([]Movie, error) {
 	var movies []Movie
 	for rows.Next() {
 		var m Movie
-		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year, &m.OriginalLanguage,
 			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt, &m.DownloadError); err != nil {
 			return nil, err
 		}
@@ -208,7 +218,7 @@ func (db *DB) ListMovies() ([]Movie, error) {
 // WantedMovies returns movies with status='wanted'.
 func (db *DB) WantedMovies() ([]Movie, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at
+		`SELECT id, tmdb_id, imdb_id, title, year, original_language, status, quality, file_path, added_at
 		 FROM movies WHERE status = 'wanted' ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -219,7 +229,7 @@ func (db *DB) WantedMovies() ([]Movie, error) {
 	var movies []Movie
 	for rows.Next() {
 		var m Movie
-		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year, &m.OriginalLanguage,
 			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt); err != nil {
 			return nil, err
 		}
@@ -261,10 +271,10 @@ func (db *DB) UpdateMovieStatus(id int64, status, quality, filePath string) erro
 // ---------------------------------------------------------------------------
 
 // AddSeries inserts a new series with status 'monitored' and returns the new row ID.
-func (db *DB) AddSeries(tmdbID, tvdbID int, imdbID, title string, year int) (int64, error) {
+func (db *DB) AddSeries(tmdbID, tvdbID int, imdbID, title string, year int, originalLanguage string) (int64, error) {
 	res, err := db.Exec(
-		`INSERT INTO series (tmdb_id, tvdb_id, imdb_id, title, year) VALUES (?, ?, ?, ?, ?)`,
-		tmdbID, nullInt(tvdbID), nullString(imdbID), title, year,
+		`INSERT INTO series (tmdb_id, tvdb_id, imdb_id, title, year, original_language) VALUES (?, ?, ?, ?, ?, ?)`,
+		tmdbID, nullInt(tvdbID), nullString(imdbID), title, year, nullString(originalLanguage),
 	)
 	if err != nil {
 		return 0, err
@@ -275,7 +285,7 @@ func (db *DB) AddSeries(tmdbID, tvdbID int, imdbID, title string, year int) (int
 // ListSeries returns all series ordered by added_at descending.
 func (db *DB) ListSeries() ([]Series, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at, last_refreshed_at
+		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, original_language, status, added_at, last_refreshed_at
 		 FROM series ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -286,7 +296,7 @@ func (db *DB) ListSeries() ([]Series, error) {
 	var list []Series
 	for rows.Next() {
 		var s Series
-		if err := rows.Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year,
+		if err := rows.Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year, &s.OriginalLanguage,
 			&s.Status, &s.AddedAt, &s.LastRefreshedAt); err != nil {
 			return nil, err
 		}

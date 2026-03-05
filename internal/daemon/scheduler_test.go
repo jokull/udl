@@ -20,7 +20,7 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	t.Cleanup(func() { db.Close() })
 
 	// Add a wanted TV episode.
-	seriesID, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011)
+	seriesID, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011, "")
 	if err != nil {
 		t.Fatalf("AddSeries: %v", err)
 	}
@@ -32,7 +32,7 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	}
 
 	// Add a second series.
-	seriesID2, err := db.AddSeries(66732, 305288, "tt4574334", "Stranger Things", 2016)
+	seriesID2, err := db.AddSeries(66732, 305288, "tt4574334", "Stranger Things", 2016, "")
 	if err != nil {
 		t.Fatalf("AddSeries: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestSearchableEpisodes_FutureEpisode(t *testing.T) {
 	}
 	t.Cleanup(func() { db.Close() })
 
-	seriesID, err := db.AddSeries(1, 100, "", "Future Show", 2026)
+	seriesID, err := db.AddSeries(1, 100, "", "Future Show", 2026, "")
 	if err != nil {
 		t.Fatalf("AddSeries: %v", err)
 	}

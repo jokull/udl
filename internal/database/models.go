@@ -6,15 +6,16 @@ import (
 
 // Movie represents a movie tracked by the system.
 type Movie struct {
-	ID       int64
-	TmdbID   int
-	ImdbID   sql.NullString
-	Title    string
-	Year     int
-	Status   string
-	Quality  sql.NullString
-	FilePath sql.NullString
-	AddedAt  sql.NullString
+	ID               int64
+	TmdbID           int
+	ImdbID           sql.NullString
+	Title            string
+	Year             int
+	OriginalLanguage sql.NullString
+	Status           string
+	Quality          sql.NullString
+	FilePath         sql.NullString
+	AddedAt          sql.NullString
 	// Download fields (populated when status is queued/downloading/post_processing/failed).
 	NzbURL          sql.NullString
 	NzbName         sql.NullString
@@ -28,15 +29,16 @@ type Movie struct {
 
 // Series represents a TV series tracked by the system.
 type Series struct {
-	ID              int64
-	TmdbID          int
-	TvdbID          sql.NullInt64
-	ImdbID          sql.NullString
-	Title           string
-	Year            int
-	Status          string
-	AddedAt         sql.NullString
-	LastRefreshedAt sql.NullString
+	ID               int64
+	TmdbID           int
+	TvdbID           sql.NullInt64
+	ImdbID           sql.NullString
+	Title            string
+	Year             int
+	OriginalLanguage sql.NullString
+	Status           string
+	AddedAt          sql.NullString
+	LastRefreshedAt  sql.NullString
 }
 
 // SeasonMonitorInfo summarizes monitoring state for a single season.

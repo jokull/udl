@@ -560,7 +560,7 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 		return fmt.Errorf("AddMovie: %w", err)
 	}
 
-	id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year)
+	id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year, movie.OriginalLanguage)
 	if err != nil {
 		// Check if it already exists.
 		existing, findErr := s.db.FindMovieByTmdbID(movie.TMDBID)
@@ -967,7 +967,7 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 		return fmt.Errorf("AddSeries: %w", err)
 	}
 
-	id, err := s.db.AddSeries(series.TMDBID, series.TVDBID, series.IMDBID, series.Title, series.Year)
+	id, err := s.db.AddSeries(series.TMDBID, series.TVDBID, series.IMDBID, series.Title, series.Year, series.OriginalLanguage)
 	if err != nil {
 		existing, findErr := s.db.FindSeriesByTmdbID(series.TMDBID)
 		if findErr != nil || existing == nil {

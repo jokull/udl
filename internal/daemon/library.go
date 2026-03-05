@@ -380,7 +380,7 @@ func (s *Service) LibraryImport(args *LibraryImportArgs, reply *LibraryImportRep
 			} else {
 				// Series not tracked — add it and the episode.
 				if args.Execute {
-					seriesID, err := s.db.AddSeries(series.tmdbID, series.tvdbID, series.imdbID, series.title, series.year)
+					seriesID, err := s.db.AddSeries(series.tmdbID, series.tvdbID, series.imdbID, series.title, series.year, "")
 					if err != nil {
 						reply.Errors = append(reply.Errors, fmt.Sprintf("add series %s: %v", series.title, err))
 						continue
@@ -541,7 +541,7 @@ func (s *Service) LibraryImport(args *LibraryImportArgs, reply *LibraryImportRep
 				if dbMovie != nil {
 					movieID = dbMovie.ID
 				} else {
-					movieID, err = s.db.AddMovie(movie.tmdbID, movie.imdbID, movie.title, movie.year)
+					movieID, err = s.db.AddMovie(movie.tmdbID, movie.imdbID, movie.title, movie.year, "")
 					if err != nil {
 						reply.Errors = append(reply.Errors, fmt.Sprintf("add movie %s: %v", movie.title, err))
 						continue

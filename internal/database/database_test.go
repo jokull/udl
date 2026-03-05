@@ -43,10 +43,10 @@ func TestForeignKeys(t *testing.T) {
 func TestAddAndListMovies(t *testing.T) {
 	db := mustOpen(t)
 
-	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999); err != nil {
+	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AddMovie(680, "tt0110912", "Pulp Fiction", 1994); err != nil {
+	if _, err := db.AddMovie(680, "tt0110912", "Pulp Fiction", 1994, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -69,10 +69,10 @@ func TestAddAndListMovies(t *testing.T) {
 func TestWantedMovies(t *testing.T) {
 	db := mustOpen(t)
 
-	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999); err != nil {
+	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.AddMovie(680, "tt0110912", "Pulp Fiction", 1994); err != nil {
+	if _, err := db.AddMovie(680, "tt0110912", "Pulp Fiction", 1994, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -97,7 +97,7 @@ func TestWantedMovies(t *testing.T) {
 func TestUpdateMovieStatus(t *testing.T) {
 	db := mustOpen(t)
 
-	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999); err != nil {
+	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999, ""); err != nil {
 		t.Fatal(err)
 	}
 	movies, _ := db.ListMovies()
@@ -123,7 +123,7 @@ func TestUpdateMovieStatus(t *testing.T) {
 func TestAddAndListSeries(t *testing.T) {
 	db := mustOpen(t)
 
-	if _, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011); err != nil {
+	if _, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -142,7 +142,7 @@ func TestAddAndListSeries(t *testing.T) {
 func TestAddEpisodeAndWantedEpisodes(t *testing.T) {
 	db := mustOpen(t)
 
-	if _, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011); err != nil {
+	if _, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011, ""); err != nil {
 		t.Fatal(err)
 	}
 	series, _ := db.ListSeries()
@@ -180,11 +180,11 @@ func TestAddEpisodeAndWantedEpisodes(t *testing.T) {
 func TestDuplicateTmdbID(t *testing.T) {
 	db := mustOpen(t)
 
-	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999); err != nil {
+	if _, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Adding the same tmdb_id again should fail due to UNIQUE constraint.
-	_, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999)
+	_, err := db.AddMovie(550, "tt0137523", "Fight Club", 1999, "")
 	if err == nil {
 		t.Fatal("expected error for duplicate tmdb_id, got nil")
 	}
@@ -193,7 +193,7 @@ func TestDuplicateTmdbID(t *testing.T) {
 func TestEpisodeUniqueConstraint(t *testing.T) {
 	db := mustOpen(t)
 
-	if _, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011); err != nil {
+	if _, err := db.AddSeries(1399, 121361, "tt0944947", "Game of Thrones", 2011, ""); err != nil {
 		t.Fatal(err)
 	}
 	series, _ := db.ListSeries()
@@ -233,7 +233,7 @@ func TestFindMovieByTmdbID(t *testing.T) {
 	}
 
 	// Add a movie and find it.
-	db.AddMovie(12345, "tt1234567", "Test Movie", 2024)
+	db.AddMovie(12345, "tt1234567", "Test Movie", 2024, "")
 	m, err = db.FindMovieByTmdbID(12345)
 	if err != nil {
 		t.Fatal(err)
@@ -254,7 +254,7 @@ func TestFindSeriesByTmdbID(t *testing.T) {
 		t.Fatal("expected nil for non-existent tmdb_id")
 	}
 
-	db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023)
+	db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023, "")
 	s, err = db.FindSeriesByTmdbID(9999)
 	if err != nil {
 		t.Fatal(err)
@@ -267,7 +267,7 @@ func TestFindSeriesByTmdbID(t *testing.T) {
 func TestFindEpisode(t *testing.T) {
 	db := mustOpen(t)
 
-	sid, _ := db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023)
+	sid, _ := db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023, "")
 	db.AddEpisode(sid, 1, 3, "Episode Three", "2023-03-01")
 
 	// Not found.
@@ -298,9 +298,9 @@ func TestFindEpisode(t *testing.T) {
 func TestAllMovieFilePaths(t *testing.T) {
 	db := mustOpen(t)
 
-	id1, _ := db.AddMovie(111, "tt0000111", "Movie One", 2020)
-	id2, _ := db.AddMovie(222, "tt0000222", "Movie Two", 2021)
-	db.AddMovie(333, "tt0000333", "Movie Three", 2022) // no file_path
+	id1, _ := db.AddMovie(111, "tt0000111", "Movie One", 2020, "")
+	id2, _ := db.AddMovie(222, "tt0000222", "Movie Two", 2021, "")
+	db.AddMovie(333, "tt0000333", "Movie Three", 2022, "") // no file_path
 
 	db.UpdateMovieStatus(id1, "downloaded", "WEBDL-1080p", "/movies/one.mkv")
 	db.UpdateMovieStatus(id2, "downloaded", "Bluray-1080p", "/movies/two.mkv")
@@ -320,7 +320,7 @@ func TestAllMovieFilePaths(t *testing.T) {
 func TestAllEpisodeFilePaths(t *testing.T) {
 	db := mustOpen(t)
 
-	sid, _ := db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023)
+	sid, _ := db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023, "")
 	db.AddEpisode(sid, 1, 1, "Ep1", "2023-01-01")
 	db.AddEpisode(sid, 1, 2, "Ep2", "2023-01-08")
 

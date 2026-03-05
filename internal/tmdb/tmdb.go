@@ -25,10 +25,11 @@ func New(apiKey string) (*Client, error) {
 
 // Movie represents a movie search result.
 type Movie struct {
-	TMDBID int
-	IMDBID string
-	Title  string
-	Year   int
+	TMDBID           int
+	IMDBID           string
+	Title            string
+	Year             int
+	OriginalLanguage string // ISO 639-1 code (e.g. "en", "ja", "zh")
 }
 
 // MovieInfo contains extended metadata for LLM-assisted release selection.
@@ -40,12 +41,13 @@ type MovieInfo struct {
 
 // Series represents a TV series search result.
 type Series struct {
-	TMDBID int
-	TVDBID int
-	IMDBID string
-	Title  string
-	Year   int
-	Status string // "Returning Series", "Ended", "Canceled", etc. from TMDB
+	TMDBID           int
+	TVDBID           int
+	IMDBID           string
+	Title            string
+	Year             int
+	Status           string // "Returning Series", "Ended", "Canceled", etc. from TMDB
+	OriginalLanguage string // ISO 639-1 code
 }
 
 // Episode represents a TV episode.
@@ -158,10 +160,11 @@ func (c *Client) GetMovie(tmdbID int) (*Movie, error) {
 		return nil, fmt.Errorf("tmdb: get movie %d: %w", tmdbID, err)
 	}
 	return &Movie{
-		TMDBID: int(details.ID),
-		IMDBID: details.IMDbID,
-		Title:  details.Title,
-		Year:   parseYear(details.ReleaseDate),
+		TMDBID:           int(details.ID),
+		IMDBID:           details.IMDbID,
+		Title:            details.Title,
+		Year:             parseYear(details.ReleaseDate),
+		OriginalLanguage: details.OriginalLanguage,
 	}, nil
 }
 
@@ -238,12 +241,13 @@ func (c *Client) GetSeries(tmdbID int) (*Series, error) {
 		return nil, fmt.Errorf("tmdb: get tv external ids %d: %w", tmdbID, err)
 	}
 	return &Series{
-		TMDBID: int(details.ID),
-		TVDBID: int(extIDs.TVDBID),
-		IMDBID: extIDs.IMDbID,
-		Title:  details.Name,
-		Year:   parseYear(details.FirstAirDate),
-		Status: details.Status,
+		TMDBID:           int(details.ID),
+		TVDBID:           int(extIDs.TVDBID),
+		IMDBID:           extIDs.IMDbID,
+		Title:            details.Name,
+		Year:             parseYear(details.FirstAirDate),
+		Status:           details.Status,
+		OriginalLanguage: details.OriginalLanguage,
 	}, nil
 }
 

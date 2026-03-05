@@ -139,7 +139,7 @@ func TestGrabBest_SkipsBlocklisted(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(12345, "tt1234567", "Test Movie", 2024)
+	movieID, _ := db.AddMovie(12345, "tt1234567", "Test Movie", 2024, "")
 
 	cfg := &config.Config{
 		Prefs: quality.Prefs{
@@ -207,7 +207,7 @@ func TestGrabBest_AllBlocklisted(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(12345, "tt1234567", "Test Movie", 2024)
+	movieID, _ := db.AddMovie(12345, "tt1234567", "Test Movie", 2024, "")
 
 	cfg := &config.Config{
 		Prefs: quality.Prefs{
@@ -258,7 +258,7 @@ func TestFail_AutoBlocklists(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(12345, "tt1234567", "Bad Download", 2024)
+	movieID, _ := db.AddMovie(12345, "tt1234567", "Bad Download", 2024, "")
 
 	// Serve an empty NZB — will fail with "no media files".
 	srv := serveNZB(emptyNZB())

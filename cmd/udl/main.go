@@ -656,7 +656,7 @@ func runMovieList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tSTATUS\tQUALITY\tADDED\tFILE")
+	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tLANG\tSTATUS\tQUALITY\tADDED\tFILE")
 	for _, m := range reply.Movies {
 		q := ""
 		if m.Quality.Valid {
@@ -673,7 +673,11 @@ func runMovieList(cmd *cobra.Command, args []string) error {
 		if m.FilePath.Valid && m.FilePath.String != "" {
 			file = filepath.Base(m.FilePath.String)
 		}
-		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\t%s\t%s\n", m.TmdbID, m.Title, m.Year, m.Status, q, added, file)
+		lang := ""
+		if m.OriginalLanguage.Valid {
+			lang = m.OriginalLanguage.String
+		}
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n", m.TmdbID, m.Title, m.Year, lang, m.Status, q, added, file)
 	}
 	return w.Flush()
 }
@@ -843,10 +847,14 @@ func runTVList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tSTATUS\tEPS\tWANTED\tHAVE")
+	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tLANG\tSTATUS\tEPS\tWANTED\tHAVE")
 	for _, s := range reply.Series {
 		counts := reply.Counts[s.ID]
-		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%d\t%d\t%d\n", s.TmdbID, s.Title, s.Year, s.Status, counts[0], counts[1], counts[2])
+		lang := ""
+		if s.OriginalLanguage.Valid {
+			lang = s.OriginalLanguage.String
+		}
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\t%d\t%d\t%d\n", s.TmdbID, s.Title, s.Year, lang, s.Status, counts[0], counts[1], counts[2])
 	}
 	return w.Flush()
 }

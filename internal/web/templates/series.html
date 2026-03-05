@@ -7,7 +7,7 @@
 
 {{if .Series}}
 <table>
-  <tr><th>Title</th><th>Year</th><th>Status</th><th>Added</th><th></th></tr>
+  <tr><th>Title</th><th>Year</th><th>Lang</th><th>Status</th><th>Added</th><th></th></tr>
   {{range .Series}}
   <tr>
     <td>
@@ -16,6 +16,7 @@
       {{if .ImdbID.Valid}}<a class="ext" href="https://www.imdb.com/title/{{.ImdbID.String}}/" target="_blank" rel="noopener">imdb</a>{{end}}
     </td>
     <td>{{.Year}}</td>
+    <td>{{nullable .OriginalLanguage}}</td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td class="small">{{fmtNullTimeStr .AddedAt}}</td>
     <td>
@@ -26,7 +27,7 @@
     </td>
   </tr>
   <tr>
-    <td colspan="5" id="episodes-{{.ID}}"></td>
+    <td colspan="6" id="episodes-{{.ID}}"></td>
   </tr>
   {{end}}
 </table>
