@@ -401,7 +401,8 @@ func (db *DB) UpcomingEpisodes(days int) ([]Episode, error) {
 func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
 	rows, err := db.Query(`
 		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		       e.monitored, e.status, e.quality, e.file_path, s.title
+		       e.monitored, e.status, e.quality, e.file_path, e.nzb_name,
+		       e.last_searched_at, s.title
 		FROM episodes e
 		JOIN series s ON s.id = e.series_id
 		WHERE e.series_id = ?
@@ -416,7 +417,7 @@ func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
 		var ep Episode
 		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
 			&ep.Title, &ep.AirDate, &ep.Monitored, &ep.Status, &ep.Quality, &ep.FilePath,
-			&ep.SeriesTitle); err != nil {
+			&ep.NzbName, &ep.LastSearchedAt, &ep.SeriesTitle); err != nil {
 			return nil, err
 		}
 		episodes = append(episodes, ep)
@@ -687,6 +688,181 @@ func (db *DB) ListHistory(limit int) ([]History, error) {
 	return events, rows.Err()
 }
 
+// ListHistoryFiltered returns history events filtered by optional media type
+// and event kind. Empty strings mean "all". Limit 0 defaults to 50.
+func (db *DB) ListHistoryFiltered(mediaType, event string, limit int) ([]History, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	query := `
+		SELECT h.id, h.media_type, h.media_id, h.title, h.event, h.source, h.quality, h.created_at,
+		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
+		       COALESCE(e.season, 0),
+		       COALESCE(e.episode, 0)
+		FROM history h
+		LEFT JOIN movies m ON h.media_type = 'movie' AND h.media_id = m.id
+		LEFT JOIN episodes e ON h.media_type = 'episode' AND h.media_id = e.id
+		LEFT JOIN series s ON e.series_id = s.id`
+
+	var conditions []string
+	var params []interface{}
+	if mediaType != "" {
+		conditions = append(conditions, "h.media_type = ?")
+		params = append(params, mediaType)
+	}
+	if event != "" {
+		conditions = append(conditions, "h.event = ?")
+		params = append(params, event)
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY h.created_at DESC LIMIT ?"
+	params = append(params, limit)
+
+	rows, err := db.Query(query, params...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []History
+	for rows.Next() {
+		var h History
+		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
+			&h.Source, &h.Quality, &h.CreatedAt,
+			&h.TmdbID, &h.Season, &h.EpisodeNum); err != nil {
+			return nil, err
+		}
+		events = append(events, h)
+	}
+	return events, rows.Err()
+}
+
+// ListHistoryForMedia returns history events for a specific media item.
+func (db *DB) ListHistoryForMedia(mediaType string, mediaID int64, limit int) ([]History, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.Query(`
+		SELECT h.id, h.media_type, h.media_id, h.title, h.event, h.source, h.quality, h.created_at,
+		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
+		       COALESCE(e.season, 0),
+		       COALESCE(e.episode, 0)
+		FROM history h
+		LEFT JOIN movies m ON h.media_type = 'movie' AND h.media_id = m.id
+		LEFT JOIN episodes e ON h.media_type = 'episode' AND h.media_id = e.id
+		LEFT JOIN series s ON e.series_id = s.id
+		WHERE h.media_type = ? AND h.media_id = ?
+		ORDER BY h.created_at DESC LIMIT ?`, mediaType, mediaID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []History
+	for rows.Next() {
+		var h History
+		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
+			&h.Source, &h.Quality, &h.CreatedAt,
+			&h.TmdbID, &h.Season, &h.EpisodeNum); err != nil {
+			return nil, err
+		}
+		events = append(events, h)
+	}
+	return events, rows.Err()
+}
+
+// ListHistoryForSeries returns history events for all episodes in a series.
+func (db *DB) ListHistoryForSeries(seriesID int64, limit int) ([]History, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := db.Query(`
+		SELECT h.id, h.media_type, h.media_id, h.title, h.event, h.source, h.quality, h.created_at,
+		       COALESCE(s.tmdb_id, 0),
+		       COALESCE(e.season, 0),
+		       COALESCE(e.episode, 0)
+		FROM history h
+		JOIN episodes e ON h.media_type = 'episode' AND h.media_id = e.id
+		JOIN series s ON e.series_id = s.id
+		WHERE e.series_id = ?
+		ORDER BY h.created_at DESC LIMIT ?`, seriesID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []History
+	for rows.Next() {
+		var h History
+		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
+			&h.Source, &h.Quality, &h.CreatedAt,
+			&h.TmdbID, &h.Season, &h.EpisodeNum); err != nil {
+			return nil, err
+		}
+		events = append(events, h)
+	}
+	return events, rows.Err()
+}
+
+// ListBlocklistForMedia returns blocklist entries for a specific media item.
+func (db *DB) ListBlocklistForMedia(mediaType string, mediaID int64) ([]BlocklistEntry, error) {
+	rows, err := db.Query(`
+		SELECT b.id, b.media_type, b.media_id, b.release_title, b.reason, b.created_at,
+		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
+		       COALESCE(e.season, 0),
+		       COALESCE(e.episode, 0)
+		FROM blocklist b
+		LEFT JOIN movies m ON b.media_type = 'movie' AND b.media_id = m.id
+		LEFT JOIN episodes e ON b.media_type = 'episode' AND b.media_id = e.id
+		LEFT JOIN series s ON e.series_id = s.id
+		WHERE b.media_type = ? AND b.media_id = ?
+		ORDER BY b.created_at DESC`, mediaType, mediaID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []BlocklistEntry
+	for rows.Next() {
+		var e BlocklistEntry
+		if err := rows.Scan(&e.ID, &e.MediaType, &e.MediaID, &e.ReleaseTitle, &e.Reason, &e.CreatedAt,
+			&e.TmdbID, &e.Season, &e.EpisodeNum); err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// SeriesEpisodeCounts returns episode count summaries per series.
+// Returns a map of series ID → [total, wanted, downloaded].
+func (db *DB) SeriesEpisodeCounts() (map[int64][3]int, error) {
+	rows, err := db.Query(`
+		SELECT series_id,
+		       COUNT(*) AS total,
+		       SUM(CASE WHEN status = 'wanted' THEN 1 ELSE 0 END) AS wanted,
+		       SUM(CASE WHEN status = 'downloaded' THEN 1 ELSE 0 END) AS have
+		FROM episodes
+		GROUP BY series_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := make(map[int64][3]int)
+	for rows.Next() {
+		var seriesID int64
+		var total, wanted, have int
+		if err := rows.Scan(&seriesID, &total, &wanted, &have); err != nil {
+			return nil, err
+		}
+		counts[seriesID] = [3]int{total, wanted, have}
+	}
+	return counts, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // Blocklist CRUD
 // ---------------------------------------------------------------------------
@@ -811,6 +987,36 @@ func (db *DB) FindMovieByTitle(title string) (*Movie, error) {
 		 FROM movies WHERE LOWER(title) = LOWER(?) LIMIT 1`, title,
 	).Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
 		&m.Status, &m.Quality, &m.FilePath, &m.AddedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// GetMovieFull returns a movie with all fields including download columns.
+// Resolves by TmdbID or Title (case-insensitive).
+func (db *DB) GetMovieFull(tmdbID int, title string) (*Movie, error) {
+	var m Movie
+	var err error
+	q := `SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at,
+	             nzb_url, nzb_name, download_progress, download_size, download_bytes,
+	             download_error, download_source, download_started_at
+	      FROM movies`
+	if tmdbID != 0 {
+		err = db.QueryRow(q+" WHERE tmdb_id = ?", tmdbID).Scan(
+			&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt,
+			&m.NzbURL, &m.NzbName, &m.DownloadProgress, &m.DownloadSize, &m.DownloadBytes,
+			&m.DownloadError, &m.DownloadSource, &m.DownloadStartedAt)
+	} else if title != "" {
+		err = db.QueryRow(q+" WHERE LOWER(title) = LOWER(?) LIMIT 1", title).Scan(
+			&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt,
+			&m.NzbURL, &m.NzbName, &m.DownloadProgress, &m.DownloadSize, &m.DownloadBytes,
+			&m.DownloadError, &m.DownloadSource, &m.DownloadStartedAt)
+	} else {
+		return nil, fmt.Errorf("tmdb_id or title required")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -988,6 +1194,19 @@ func (db *DB) ResetEpisodeFile(id int64) error {
 	_, err := db.Exec(
 		`UPDATE episodes SET status = 'wanted', monitored = 0, file_path = NULL, quality = NULL WHERE id = ?`,
 		id,
+	)
+	return err
+}
+
+// ResetEpisodeToWanted resets an episode to wanted status, clearing file_path and quality
+// but keeping monitored unchanged. Used when deleting a single episode for re-download.
+func (db *DB) ResetEpisodeToWanted(id int64) error {
+	_, err := db.Exec(
+		`UPDATE episodes SET status = 'wanted', file_path = NULL, quality = NULL,
+		 nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+		 download_size = NULL, download_bytes = 0, download_error = NULL,
+		 download_source = NULL, download_started_at = NULL
+		 WHERE id = ?`, id,
 	)
 	return err
 }
@@ -1314,13 +1533,15 @@ func (db *DB) WantedItems() ([]WantedItem, error) {
 		SELECT 'movie', id, tmdb_id, 0,
 		       title || ' (' || year || ')',
 		       year || '-01-01',
-		       NULL
+		       NULL,
+		       (imdb_id IS NOT NULL AND imdb_id != '')
 		FROM movies WHERE status = 'wanted'
 		UNION ALL
 		SELECT 'episode', e.id, s.tmdb_id, e.series_id,
 		       s.title || ' · S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode) || ' ' || COALESCE(e.title, ''),
 		       e.air_date,
-		       e.last_searched_at
+		       e.last_searched_at,
+		       (s.tvdb_id IS NOT NULL AND s.tvdb_id != 0)
 		FROM episodes e
 		JOIN series s ON s.id = e.series_id
 		WHERE e.status = 'wanted'
@@ -1336,7 +1557,7 @@ func (db *DB) WantedItems() ([]WantedItem, error) {
 	for rows.Next() {
 		var wi WantedItem
 		if err := rows.Scan(&wi.Category, &wi.MediaID, &wi.TmdbID, &wi.SeriesID,
-			&wi.Title, &wi.AirDate, &wi.LastSearchedAt); err != nil {
+			&wi.Title, &wi.AirDate, &wi.LastSearchedAt, &wi.CanSearch); err != nil {
 			return nil, err
 		}
 		items = append(items, wi)

@@ -18,6 +18,8 @@ import (
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/postprocess"
+	"github.com/jokull/udl/internal/quality"
+	"github.com/jokull/udl/internal/seerr"
 	"github.com/jokull/udl/internal/tmdb"
 	"github.com/jokull/udl/internal/web"
 )
@@ -30,6 +32,7 @@ type Service struct {
 	plex     *plex.Client          // nil if Plex integration is disabled
 	indexers []*newznab.Client
 	dl       *Downloader // nil until downloader starts; used for health checks
+	llmCLI   string      // path to codex or claude CLI, empty if unavailable
 	log      *slog.Logger
 }
 
@@ -91,18 +94,89 @@ type AddMovieReply struct {
 
 // SearchMovieArgs contains arguments for the SearchMovie (indexer search) RPC method.
 type SearchMovieArgs struct {
-	TmdbID int // TMDB ID (required)
+	TmdbID int    // TMDB ID (required unless Title set)
+	Title  string // alternative to TmdbID: look up by title
 }
 
 // SearchMovieReply contains indexer search results for manual selection.
 type SearchMovieReply struct {
-	Results []ScoredRelease
+	Results         []ScoredRelease
+	ExistingQuality string // current quality on disk (empty if none)
 }
 
 // GrabMovieReleaseArgs contains arguments for the GrabMovieRelease RPC method.
 type GrabMovieReleaseArgs struct {
-	TmdbID int // TMDB ID (required)
-	Index  int // 1-based index into search results
+	TmdbID int    // TMDB ID (required unless Title set)
+	Title  string // alternative to TmdbID: look up by title
+	Index  int    // 1-based index into search results
+}
+
+// SearchEpisodeArgs contains arguments for the SearchEpisode RPC method.
+type SearchEpisodeArgs struct {
+	TmdbID  int    // series TMDB ID (required unless Title set)
+	Title   string // alternative to TmdbID: look up by title
+	Season  int
+	Episode int
+}
+
+// SearchEpisodeReply contains indexer search results for episode release selection.
+type SearchEpisodeReply struct {
+	Results         []ScoredRelease
+	ExistingQuality string // current quality on disk (empty if none)
+}
+
+// GrabEpisodeReleaseArgs contains arguments for the GrabEpisodeRelease RPC method.
+type GrabEpisodeReleaseArgs struct {
+	TmdbID  int    // series TMDB ID (required unless Title set)
+	Title   string // alternative to TmdbID: look up by title
+	Season  int
+	Episode int
+	Index   int // 1-based index into search results
+}
+
+// GrabEpisodeReleaseReply contains the reply for the GrabEpisodeRelease RPC method.
+type GrabEpisodeReleaseReply struct {
+	SeriesTitle string
+	Season      int
+	Episode     int
+	ReleaseName string
+	Quality     string
+}
+
+// SeriesEpisodesArgs contains arguments for the SeriesEpisodes RPC method.
+type SeriesEpisodesArgs struct {
+	TmdbID int    // series TMDB ID (required unless Title set)
+	Title  string // alternative to TmdbID: look up by title
+	Season int    // -1 for all seasons
+}
+
+// SeriesEpisodesReply contains the reply for the SeriesEpisodes RPC method.
+type SeriesEpisodesReply struct {
+	SeriesTitle string
+	Year        int
+	Episodes    []database.Episode
+}
+
+// MovieDeleteArgs contains arguments for the MovieDelete RPC method.
+type MovieDeleteArgs struct {
+	TmdbID  int    // TMDB ID (required unless Title set)
+	Title   string // alternative to TmdbID: look up by title
+	Execute bool   // false = dry-run
+	Search  bool   // re-search after delete
+}
+
+// MovieDeleteReply contains the reply for the MovieDelete RPC method.
+type MovieDeleteReply struct {
+	Title     string
+	Year      int
+	FilePath  string
+	SizeBytes int64
+	Deleted   bool
+}
+
+// WantedReply contains the reply for the Wanted RPC method.
+type WantedReply struct {
+	Items []database.WantedItem
 }
 
 // GrabMovieReleaseReply contains the reply for the GrabMovieRelease RPC method.
@@ -139,6 +213,7 @@ type AddSeriesReply struct {
 // SeriesListReply contains the reply for the ListSeries RPC method.
 type SeriesListReply struct {
 	Series []database.Series
+	Counts map[int64][3]int // series ID → [total, wanted, have]
 }
 
 // --- Queue types ---
@@ -148,10 +223,63 @@ type QueueReply struct {
 	Items []database.QueueItem
 }
 
+// HistoryArgs contains optional filters for the History RPC method.
+type HistoryArgs struct {
+	MediaType string // "movie" or "episode" (empty = all)
+	Event     string // "grabbed", "completed", "failed" (empty = all)
+	Limit     int    // 0 = default 50
+	TmdbID    int    // filter to a specific movie or series by TMDB ID
+	Season    int    // episode season (used with TmdbID for episode-level filter)
+	Episode   int    // episode number (used with TmdbID for episode-level filter)
+}
+
 // HistoryReply contains the reply for the History RPC method.
 type HistoryReply struct {
 	Events []database.History
 }
+
+// EvictQueueArgs identifies a single download to cancel.
+type EvictQueueArgs struct {
+	Category string // "movie" or "episode"
+	TmdbID   int
+	Season   int
+	Episode  int
+}
+
+// EvictQueueReply contains the result of an eviction.
+type EvictQueueReply struct {
+	Title string
+}
+
+// ConfigShowReply contains the active configuration for display.
+type ConfigShowReply struct {
+	ProfileName    string
+	MinQuality     string
+	Preferred      string
+	UpgradeUntil   string
+	MustNotContain []string
+	PreferredWords []string
+	RetentionDays  int
+	Indexers       []string
+	Providers      []string
+	LibraryTV      string
+	LibraryMovies  string
+	IncompletePath string
+	PlexEnabled    bool
+	SeerrEnabled   bool
+	WebPort        int
+}
+
+// SeriesWithCounts wraps a Series with episode count summaries.
+type SeriesWithCounts struct {
+	database.Series
+	EpisodeTotal  int
+	EpisodeWanted int
+	EpisodeHave   int
+}
+
+// SeriesListReplyV2 contains the reply for the ListSeries RPC method with counts.
+// We extend the existing SeriesListReply to include counts.
 
 // HealthCheck represents a single diagnostic check result.
 type HealthCheck struct {
@@ -179,7 +307,9 @@ type StatusReply struct {
 
 // RemoveMovieArgs contains arguments for the RemoveMovie RPC method.
 type RemoveMovieArgs struct {
-	TmdbID int // TMDB ID (required)
+	TmdbID    int    // TMDB ID (required unless Title set)
+	Title     string // alternative to TmdbID: look up by title
+	KeepFiles bool   // If true, only remove from DB, leave files on disk
 }
 
 // RemoveMovieReply contains the reply for the RemoveMovie RPC method.
@@ -191,7 +321,8 @@ type RemoveMovieReply struct {
 
 // RemoveSeriesArgs contains arguments for the RemoveSeries RPC method.
 type RemoveSeriesArgs struct {
-	TmdbID int // TMDB ID (required)
+	TmdbID int    // TMDB ID (required unless Title set)
+	Title  string // alternative to TmdbID: look up by title
 }
 
 // RemoveSeriesReply contains the reply for the RemoveSeries RPC method.
@@ -206,6 +337,7 @@ type RemoveSeriesReply struct {
 // MonitorSeasonArgs contains arguments for the MonitorSeason RPC method.
 type MonitorSeasonArgs struct {
 	TmdbID int
+	Title  string // alternative to TmdbID: look up by title
 	Season int    // specific season number (-1 means not specified)
 	Mode   string // "", "on", "off", "latest", "all", "none"
 }
@@ -245,6 +377,124 @@ type RefreshSeriesReply struct {
 	Checked     int
 	NewEpisodes int
 	Ended       int
+}
+
+// --- Movie/Series info types ---
+
+// MovieInfoArgs identifies a movie for the MovieInfo RPC.
+type MovieInfoArgs struct {
+	TmdbID int
+	Title  string
+}
+
+// MovieInfoReply contains full movie details for investigation.
+type MovieInfoReply struct {
+	TmdbID    int
+	Title     string
+	Year      int
+	Status    string
+	Quality   string
+	FilePath  string
+	ImdbID    string
+	CanSearch bool
+	AddedAt   string
+	// Download fields (when in queue).
+	NzbName    string
+	Progress   float64
+	SizeBytes  int64
+	Error      string
+	Source     string
+	StartedAt  string
+	// Related data.
+	History   []database.History
+	Blocklist []database.BlocklistEntry
+}
+
+// SeriesInfoArgs identifies a series for the SeriesInfo RPC.
+type SeriesInfoArgs struct {
+	TmdbID int
+	Title  string
+}
+
+// SeriesInfoReply contains full series details for investigation.
+type SeriesInfoReply struct {
+	TmdbID     int
+	TvdbID     int
+	Title      string
+	Year       int
+	Status     string
+	CanSearch  bool
+	AddedAt    string
+	// Episode summary.
+	EpisodeTotal  int
+	EpisodeWanted int
+	EpisodeHave   int
+	EpisodeFailed int
+	// Per-season breakdown.
+	Seasons []database.SeasonMonitorInfo
+	// Active downloads for this series.
+	ActiveDownloads []database.QueueItem
+	// History.
+	History []database.History
+}
+
+// ForceSearchArgs triggers an immediate search for wanted items.
+type ForceSearchArgs struct {
+	TmdbID  int    // 0 = search all wanted items
+	Title   string // alternative to TmdbID
+	Season  int    // episode season (used with TmdbID)
+	Episode int    // episode number (used with TmdbID)
+}
+
+// ForceSearchReply contains the result of a force search.
+type ForceSearchReply struct {
+	Count int // number of items searched
+}
+
+// --- Resolution helpers ---
+
+// resolveMovie resolves a movie by TmdbID or Title.
+func (s *Service) resolveMovie(tmdbID int, title string) (*database.Movie, error) {
+	if tmdbID != 0 {
+		m, err := s.db.FindMovieByTmdbID(tmdbID)
+		if err != nil {
+			return nil, err
+		}
+		if m == nil {
+			return nil, fmt.Errorf("no movie with TMDB ID %d", tmdbID)
+		}
+		return m, nil
+	}
+	if title != "" {
+		m, err := s.db.FindMovieByTitle(title)
+		if err != nil {
+			return nil, fmt.Errorf("no movie matching %q", title)
+		}
+		return m, nil
+	}
+	return nil, fmt.Errorf("TMDB ID or title is required")
+}
+
+// resolveSeries resolves a series by TmdbID or Title.
+func (s *Service) resolveSeries(tmdbID int, title string) (*database.Series, error) {
+	if tmdbID != 0 {
+		sr, err := s.db.FindSeriesByTmdbID(tmdbID)
+		if err != nil {
+			return nil, err
+		}
+		if sr == nil {
+			return nil, fmt.Errorf("no series with TMDB ID %d", tmdbID)
+		}
+		return sr, nil
+	}
+	if title != "" {
+		sr, err := s.db.FindSeriesByTitle(title)
+		if err != nil {
+			return nil, fmt.Errorf("no series matching %q", title)
+		}
+		return sr, nil
+	}
+	return nil, fmt.Errorf("TMDB ID or title is required")
 }
 
 // --- RPC methods ---
@@ -374,16 +624,10 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	if len(s.indexers) == 0 {
 		return fmt.Errorf("SearchMovie: no indexers configured")
 	}
-	if args.TmdbID == 0 {
-		return fmt.Errorf("SearchMovie: TMDB ID is required")
-	}
 
-	movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
+	movie, err := s.resolveMovie(args.TmdbID, args.Title)
 	if err != nil {
 		return fmt.Errorf("SearchMovie: %w", err)
-	}
-	if movie == nil {
-		return fmt.Errorf("SearchMovie: no movie with TMDB ID %d (use 'udl movie add' first)", args.TmdbID)
 	}
 
 	imdbID := ""
@@ -398,6 +642,26 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	if err != nil {
 		return fmt.Errorf("SearchMovie: %w", err)
 	}
+
+	// Annotate releases with blocklist/history status.
+	for i := range releases {
+		if releases[i].Rejected {
+			continue
+		}
+		if blocked, _ := s.db.IsBlocklisted("movie", movie.ID, releases[i].Release.Title); blocked {
+			releases[i].Rejected = true
+			releases[i].RejectionReason = "blocklisted"
+		} else if imported, _ := s.db.IsCompletedInHistory("movie", movie.ID, releases[i].Release.Title); imported {
+			releases[i].Rejected = true
+			releases[i].RejectionReason = "already completed"
+		}
+	}
+
+	existing := existingQualityFromDB(s.db, "movie", movie.ID)
+	if existing != quality.Unknown {
+		reply.ExistingQuality = existing.String()
+	}
+
 	reply.Results = releases
 	return nil
 }
@@ -409,19 +673,13 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 	if len(s.indexers) == 0 {
 		return fmt.Errorf("GrabMovieRelease: no indexers configured")
 	}
-	if args.TmdbID == 0 {
-		return fmt.Errorf("GrabMovieRelease: TMDB ID is required")
-	}
 	if args.Index < 1 {
 		return fmt.Errorf("GrabMovieRelease: index must be >= 1")
 	}
 
-	movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
+	movie, err := s.resolveMovie(args.TmdbID, args.Title)
 	if err != nil {
 		return fmt.Errorf("GrabMovieRelease: %w", err)
-	}
-	if movie == nil {
-		return fmt.Errorf("GrabMovieRelease: no movie with TMDB ID %d (use 'udl movie add' first)", args.TmdbID)
 	}
 
 	imdbID := ""
@@ -474,6 +732,223 @@ func (s *Service) GrabMovieRelease(args *GrabMovieReleaseArgs, reply *GrabMovieR
 	reply.Year = movie.Year
 	reply.ReleaseName = sr.Release.Title
 	reply.Quality = sr.Quality.String()
+	return nil
+}
+
+// SearchEpisode searches indexers for a specific episode of a series in the database.
+func (s *Service) SearchEpisode(args *SearchEpisodeArgs, reply *SearchEpisodeReply) error {
+	if len(s.indexers) == 0 {
+		return fmt.Errorf("SearchEpisode: no indexers configured")
+	}
+
+	series, err := s.resolveSeries(args.TmdbID, args.Title)
+	if err != nil {
+		return fmt.Errorf("SearchEpisode: %w", err)
+	}
+
+	tvdbID := 0
+	if series.TvdbID.Valid {
+		tvdbID = int(series.TvdbID.Int64)
+	}
+	if tvdbID == 0 {
+		return fmt.Errorf("SearchEpisode: %q has no TVDB ID", series.Title)
+	}
+
+	releases, err := s.SearchEpisodeReleases(tvdbID, args.Season, args.Episode)
+	if err != nil {
+		return fmt.Errorf("SearchEpisode: %w", err)
+	}
+
+	// Look up the specific episode for annotations.
+	ep, _ := s.db.FindEpisode(series.ID, args.Season, args.Episode)
+	if ep != nil {
+		for i := range releases {
+			if releases[i].Rejected {
+				continue
+			}
+			if blocked, _ := s.db.IsBlocklisted("episode", ep.ID, releases[i].Release.Title); blocked {
+				releases[i].Rejected = true
+				releases[i].RejectionReason = "blocklisted"
+			} else if imported, _ := s.db.IsCompletedInHistory("episode", ep.ID, releases[i].Release.Title); imported {
+				releases[i].Rejected = true
+				releases[i].RejectionReason = "already completed"
+			}
+		}
+		existing := existingQualityFromDB(s.db, "episode", ep.ID)
+		if existing != quality.Unknown {
+			reply.ExistingQuality = existing.String()
+		}
+	}
+
+	reply.Results = releases
+	return nil
+}
+
+// GrabEpisodeRelease searches indexers for an episode and grabs the release at the given index.
+func (s *Service) GrabEpisodeRelease(args *GrabEpisodeReleaseArgs, reply *GrabEpisodeReleaseReply) error {
+	if len(s.indexers) == 0 {
+		return fmt.Errorf("GrabEpisodeRelease: no indexers configured")
+	}
+	if args.Index < 1 {
+		return fmt.Errorf("GrabEpisodeRelease: index must be >= 1")
+	}
+
+	series, err := s.resolveSeries(args.TmdbID, args.Title)
+	if err != nil {
+		return fmt.Errorf("GrabEpisodeRelease: %w", err)
+	}
+
+	tvdbID := 0
+	if series.TvdbID.Valid {
+		tvdbID = int(series.TvdbID.Int64)
+	}
+	if tvdbID == 0 {
+		return fmt.Errorf("GrabEpisodeRelease: %q has no TVDB ID", series.Title)
+	}
+
+	ep, err := s.db.FindEpisode(series.ID, args.Season, args.Episode)
+	if err != nil {
+		return fmt.Errorf("GrabEpisodeRelease: %w", err)
+	}
+	if ep == nil {
+		return fmt.Errorf("GrabEpisodeRelease: no episode S%02dE%02d for %q", args.Season, args.Episode, series.Title)
+	}
+
+	releases, err := s.SearchEpisodeReleases(tvdbID, args.Season, args.Episode)
+	if err != nil {
+		return fmt.Errorf("GrabEpisodeRelease: %w", err)
+	}
+	if len(releases) == 0 {
+		return fmt.Errorf("GrabEpisodeRelease: no releases found for %q S%02dE%02d", series.Title, args.Season, args.Episode)
+	}
+	if args.Index > len(releases) {
+		return fmt.Errorf("GrabEpisodeRelease: index %d out of range (1-%d)", args.Index, len(releases))
+	}
+
+	sr := releases[args.Index-1]
+
+	if ep.Status != "wanted" && ep.Status != "failed" {
+		return fmt.Errorf("GrabEpisodeRelease: S%02dE%02d is %s, not available for download", args.Season, args.Episode, ep.Status)
+	}
+
+	enqueued, err := s.db.EnqueueDownload("episode", ep.ID, sr.Release.Link, sr.Release.Title, sr.Release.Size, "usenet")
+	if err != nil {
+		return fmt.Errorf("GrabEpisodeRelease: enqueue: %w", err)
+	}
+	if !enqueued {
+		return fmt.Errorf("GrabEpisodeRelease: could not enqueue (may already be active)")
+	}
+
+	title := series.Title
+	if ep.Title.Valid {
+		title = fmt.Sprintf("%s S%02dE%02d %s", series.Title, args.Season, args.Episode, ep.Title.String)
+	} else {
+		title = fmt.Sprintf("%s S%02dE%02d", series.Title, args.Season, args.Episode)
+	}
+	if err := s.db.AddHistory("episode", ep.ID, title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
+		s.log.Error("failed to record grab history", "error", err)
+	}
+
+	s.log.Info("manual grab",
+		"series", series.Title,
+		"season", args.Season,
+		"episode", args.Episode,
+		"release", sr.Release.Title,
+		"quality", sr.Quality,
+	)
+
+	reply.SeriesTitle = series.Title
+	reply.Season = args.Season
+	reply.Episode = args.Episode
+	reply.ReleaseName = sr.Release.Title
+	reply.Quality = sr.Quality.String()
+	return nil
+}
+
+// SeriesEpisodes returns episodes for a series, optionally filtered by season.
+func (s *Service) SeriesEpisodes(args *SeriesEpisodesArgs, reply *SeriesEpisodesReply) error {
+	series, err := s.resolveSeries(args.TmdbID, args.Title)
+	if err != nil {
+		return fmt.Errorf("SeriesEpisodes: %w", err)
+	}
+
+	episodes, err := s.db.EpisodesForSeries(series.ID)
+	if err != nil {
+		return fmt.Errorf("SeriesEpisodes: %w", err)
+	}
+
+	if args.Season >= 0 {
+		var filtered []database.Episode
+		for _, ep := range episodes {
+			if ep.Season == args.Season {
+				filtered = append(filtered, ep)
+			}
+		}
+		episodes = filtered
+	}
+
+	reply.SeriesTitle = series.Title
+	reply.Year = series.Year
+	reply.Episodes = episodes
+	return nil
+}
+
+// MovieDelete deletes a movie's file, resets to wanted, and optionally re-searches.
+func (s *Service) MovieDelete(args *MovieDeleteArgs, reply *MovieDeleteReply) error {
+	movie, err := s.resolveMovie(args.TmdbID, args.Title)
+	if err != nil {
+		return fmt.Errorf("MovieDelete: %w", err)
+	}
+
+	reply.Title = movie.Title
+	reply.Year = movie.Year
+
+	if movie.Status != "downloaded" || !movie.FilePath.Valid || movie.FilePath.String == "" {
+		return fmt.Errorf("MovieDelete: %q has no downloaded file (status: %s)", movie.Title, movie.Status)
+	}
+
+	reply.FilePath = movie.FilePath.String
+	if info, err := os.Stat(movie.FilePath.String); err == nil {
+		reply.SizeBytes = info.Size()
+	}
+
+	if args.Execute {
+		movieDir := filepath.Dir(movie.FilePath.String)
+		if err := os.RemoveAll(movieDir); err != nil {
+			return fmt.Errorf("MovieDelete: failed to delete %s: %w", movieDir, err)
+		}
+		reply.Deleted = true
+		s.log.Info("MovieDelete: deleted movie folder", "path", movieDir)
+
+		// Reset to wanted.
+		if err := s.db.UpdateMovieStatus(movie.ID, "wanted", "", ""); err != nil {
+			s.log.Warn("MovieDelete: failed to reset status", "error", err)
+		}
+
+		// Blocklist old NZB if present, then re-search.
+		if args.Search {
+			if movie.NzbName.Valid && movie.NzbName.String != "" {
+				s.db.AddBlocklist("movie", movie.ID, movie.NzbName.String, "manually deleted for re-download")
+				s.log.Info("MovieDelete: blocklisted release", "name", movie.NzbName.String)
+			}
+			s.retryMedia("movie", movie.ID)
+		}
+
+		s.db.AddHistory("movie", movie.ID,
+			fmt.Sprintf("%s (%d)", movie.Title, movie.Year),
+			"deleted", "manual", "")
+	}
+
+	return nil
+}
+
+// Wanted returns all wanted movies and episodes.
+func (s *Service) Wanted(args *Empty, reply *WantedReply) error {
+	items, err := s.db.WantedItems()
+	if err != nil {
+		return fmt.Errorf("Wanted: %w", err)
+	}
+	reply.Items = items
 	return nil
 }
 
@@ -567,13 +1042,19 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 	return nil
 }
 
-// ListSeries returns all series in the database.
+// ListSeries returns all series in the database with episode counts.
 func (s *Service) ListSeries(args *Empty, reply *SeriesListReply) error {
 	series, err := s.db.ListSeries()
 	if err != nil {
 		return err
 	}
 	reply.Series = series
+	counts, err := s.db.SeriesEpisodeCounts()
+	if err != nil {
+		s.log.Error("failed to get episode counts", "error", err)
+	} else {
+		reply.Counts = counts
+	}
 	return nil
 }
 
@@ -626,9 +1107,111 @@ func (s *Service) ResumeAll(args *Empty, reply *Empty) error {
 	return nil
 }
 
-// History returns download history events.
-func (s *Service) History(args *Empty, reply *HistoryReply) error {
-	events, err := s.db.ListHistory(50)
+// EvictQueue cancels a single download and resets the media item to wanted.
+func (s *Service) EvictQueue(args *EvictQueueArgs, reply *EvictQueueReply) error {
+	switch args.Category {
+	case "movie":
+		movie, err := s.resolveMovie(args.TmdbID, "")
+		if err != nil {
+			return fmt.Errorf("EvictQueue: %w", err)
+		}
+		if err := s.db.ClearMediaDownloadFields("movie", movie.ID); err != nil {
+			return fmt.Errorf("EvictQueue: clear fields: %w", err)
+		}
+		if err := s.db.UpdateMovieStatus(movie.ID, "wanted", "", ""); err != nil {
+			return fmt.Errorf("EvictQueue: update status: %w", err)
+		}
+		reply.Title = movie.Title
+	case "episode":
+		series, err := s.resolveSeries(args.TmdbID, "")
+		if err != nil {
+			return fmt.Errorf("EvictQueue: %w", err)
+		}
+		ep, err := s.db.FindEpisode(series.ID, args.Season, args.Episode)
+		if err != nil {
+			return fmt.Errorf("EvictQueue: %w", err)
+		}
+		if ep == nil {
+			return fmt.Errorf("EvictQueue: episode S%02dE%02d not found", args.Season, args.Episode)
+		}
+		if err := s.db.ClearMediaDownloadFields("episode", ep.ID); err != nil {
+			return fmt.Errorf("EvictQueue: clear fields: %w", err)
+		}
+		if err := s.db.UpdateEpisodeStatus(ep.ID, "wanted", "", ""); err != nil {
+			return fmt.Errorf("EvictQueue: update status: %w", err)
+		}
+		reply.Title = fmt.Sprintf("%s S%02dE%02d", series.Title, args.Season, args.Episode)
+	default:
+		return fmt.Errorf("EvictQueue: invalid category %q", args.Category)
+	}
+	s.log.Info("evicted from queue", "category", args.Category, "title", reply.Title)
+	return nil
+}
+
+// ConfigShow returns the active configuration for display.
+func (s *Service) ConfigShow(args *Empty, reply *ConfigShowReply) error {
+	reply.ProfileName = s.cfg.Quality.Profile
+	reply.MinQuality = s.cfg.Prefs.Min.String()
+	reply.Preferred = s.cfg.Prefs.Preferred.String()
+	reply.UpgradeUntil = s.cfg.Prefs.UpgradeUntil.String()
+	reply.MustNotContain = s.cfg.Quality.MustNotContain
+	reply.PreferredWords = s.cfg.Quality.PreferredWords
+	reply.RetentionDays = s.cfg.Usenet.RetentionDays
+	for _, idx := range s.cfg.Indexers {
+		reply.Indexers = append(reply.Indexers, idx.Name)
+	}
+	for _, p := range s.cfg.Usenet.Providers {
+		reply.Providers = append(reply.Providers, fmt.Sprintf("%s (%s:%d, %d conn)", p.Name, p.Host, p.Port, p.Connections))
+	}
+	reply.LibraryTV = s.cfg.Library.TV
+	reply.LibraryMovies = s.cfg.Library.Movies
+	reply.IncompletePath = s.cfg.Paths.Incomplete
+	reply.PlexEnabled = s.cfg.Plex.Token != ""
+	reply.SeerrEnabled = s.cfg.Seerr.URL != "" && s.cfg.Seerr.APIKey != ""
+	reply.WebPort = s.cfg.Web.Port
+	return nil
+}
+
+// History returns download history events with optional filtering.
+func (s *Service) History(args *HistoryArgs, reply *HistoryReply) error {
+	// Per-item filtering by TmdbID.
+	if args.TmdbID != 0 {
+		// Try movie first.
+		movie, _ := s.db.FindMovieByTmdbID(args.TmdbID)
+		if movie != nil {
+			events, err := s.db.ListHistoryForMedia("movie", movie.ID, args.Limit)
+			if err != nil {
+				return fmt.Errorf("History: %w", err)
+			}
+			reply.Events = events
+			return nil
+		}
+		// Try series.
+		series, _ := s.db.FindSeriesByTmdbID(args.TmdbID)
+		if series != nil {
+			if args.Season > 0 && args.Episode > 0 {
+				ep, err := s.db.FindEpisode(series.ID, args.Season, args.Episode)
+				if err != nil || ep == nil {
+					return fmt.Errorf("History: episode S%02dE%02d not found", args.Season, args.Episode)
+				}
+				events, err := s.db.ListHistoryForMedia("episode", ep.ID, args.Limit)
+				if err != nil {
+					return fmt.Errorf("History: %w", err)
+				}
+				reply.Events = events
+				return nil
+			}
+			events, err := s.db.ListHistoryForSeries(series.ID, args.Limit)
+			if err != nil {
+				return fmt.Errorf("History: %w", err)
+			}
+			reply.Events = events
+			return nil
+		}
+		return fmt.Errorf("History: no movie or series with TMDB ID %d", args.TmdbID)
+	}
+
+	events, err := s.db.ListHistoryFiltered(args.MediaType, args.Event, args.Limit)
 	if err != nil {
 		return fmt.Errorf("History: %w", err)
 	}
@@ -672,35 +1255,34 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	return nil
 }
 
-// RemoveMovie removes a movie from the database (not from disk).
+// RemoveMovie removes a movie from the database and deletes its files from disk.
 func (s *Service) RemoveMovie(args *RemoveMovieArgs, reply *RemoveMovieReply) error {
-	if args.TmdbID == 0 {
-		return fmt.Errorf("RemoveMovie: TMDB ID is required")
-	}
-	movie, err := s.db.FindMovieByTmdbID(args.TmdbID)
+	movie, err := s.resolveMovie(args.TmdbID, args.Title)
 	if err != nil {
 		return fmt.Errorf("RemoveMovie: %w", err)
-	}
-	if movie == nil {
-		return fmt.Errorf("RemoveMovie: no movie with TMDB ID %d", args.TmdbID)
 	}
 	reply.TmdbID = movie.TmdbID
 	reply.Title = movie.Title
 	reply.Year = movie.Year
+
+	// Delete movie folder from disk if file exists.
+	if !args.KeepFiles && movie.FilePath.Valid && movie.FilePath.String != "" {
+		movieDir := filepath.Dir(movie.FilePath.String)
+		if err := os.RemoveAll(movieDir); err != nil {
+			s.log.Warn("RemoveMovie: failed to delete movie folder", "path", movieDir, "error", err)
+		} else {
+			s.log.Info("RemoveMovie: deleted movie folder", "path", movieDir)
+		}
+	}
+
 	return s.db.RemoveMovie(movie.ID)
 }
 
 // RemoveSeries removes a series and its episodes from the database (not from disk).
 func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply) error {
-	if args.TmdbID == 0 {
-		return fmt.Errorf("RemoveSeries: TMDB ID is required")
-	}
-	series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
+	series, err := s.resolveSeries(args.TmdbID, args.Title)
 	if err != nil {
 		return fmt.Errorf("RemoveSeries: %w", err)
-	}
-	if series == nil {
-		return fmt.Errorf("RemoveSeries: no series with TMDB ID %d", args.TmdbID)
 	}
 	reply.TmdbID = series.TmdbID
 	reply.Title = series.Title
@@ -710,15 +1292,9 @@ func (s *Service) RemoveSeries(args *RemoveSeriesArgs, reply *RemoveSeriesReply)
 
 // MonitorSeason manages per-season monitoring for a series.
 func (s *Service) MonitorSeason(args *MonitorSeasonArgs, reply *MonitorSeasonReply) error {
-	if args.TmdbID == 0 {
-		return fmt.Errorf("MonitorSeason: TMDB ID is required")
-	}
-	series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
+	series, err := s.resolveSeries(args.TmdbID, args.Title)
 	if err != nil {
 		return fmt.Errorf("MonitorSeason: %w", err)
-	}
-	if series == nil {
-		return fmt.Errorf("MonitorSeason: no series with TMDB ID %d", args.TmdbID)
 	}
 	reply.Title = series.Title
 	reply.Year = series.Year
@@ -957,8 +1533,11 @@ type DeleteItem struct {
 // TVDeleteArgs contains arguments for the TVDelete RPC method.
 type TVDeleteArgs struct {
 	TmdbID  int
-	Season  int  // -1 means all seasons
-	Execute bool // false = dry-run
+	Title   string // alternative to TmdbID: look up by title
+	Season  int    // -1 means all seasons
+	Episode int    // -1 means all episodes in season
+	Execute bool   // false = dry-run
+	Search  bool   // re-search after delete (blocklists old NZB if present)
 }
 
 // TVDeleteReply contains the reply for the TVDelete RPC method.
@@ -1421,19 +2000,15 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 	return nil
 }
 
-// TVDelete deletes files for a series (optionally filtered to a single season),
-// resets episodes to wanted+unmonitored, and cleans up empty directories.
+// TVDelete deletes files for a series (optionally filtered to a single season or episode),
+// resets episodes to wanted, and cleans up empty directories.
+// When Episode is specified, keeps monitored status; otherwise unmonitors.
 // Dry-run by default; set Execute=true to actually delete.
+// When Search=true and Execute=true, blocklists the old NZB (if UDL-downloaded) and re-searches.
 func (s *Service) TVDelete(args *TVDeleteArgs, reply *TVDeleteReply) error {
-	if args.TmdbID == 0 {
-		return fmt.Errorf("TVDelete: TMDB ID is required")
-	}
-	series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
+	series, err := s.resolveSeries(args.TmdbID, args.Title)
 	if err != nil {
 		return fmt.Errorf("TVDelete: %w", err)
-	}
-	if series == nil {
-		return fmt.Errorf("TVDelete: no series with TMDB ID %d", args.TmdbID)
 	}
 
 	episodes, err := s.db.EpisodesForSeries(series.ID)
@@ -1441,8 +2016,13 @@ func (s *Service) TVDelete(args *TVDeleteArgs, reply *TVDeleteReply) error {
 		return fmt.Errorf("TVDelete: %w", err)
 	}
 
+	singleEpisode := args.Episode >= 0
+
 	for _, ep := range episodes {
 		if args.Season >= 0 && ep.Season != args.Season {
+			continue
+		}
+		if singleEpisode && ep.Episode != args.Episode {
 			continue
 		}
 		if ep.Status != "downloaded" || !ep.FilePath.Valid || ep.FilePath.String == "" {
@@ -1471,8 +2051,26 @@ func (s *Service) TVDelete(args *TVDeleteArgs, reply *TVDeleteReply) error {
 			} else {
 				item.Deleted = true
 			}
-			if err := s.db.ResetEpisodeFile(ep.ID); err != nil {
-				s.log.Warn("TVDelete: failed to reset episode", "id", ep.ID, "err", err)
+
+			if singleEpisode {
+				// Single episode: keep monitored, just reset to wanted.
+				if err := s.db.ResetEpisodeToWanted(ep.ID); err != nil {
+					s.log.Warn("TVDelete: failed to reset episode", "id", ep.ID, "err", err)
+				}
+			} else {
+				// Season/series: unmonitor as before.
+				if err := s.db.ResetEpisodeFile(ep.ID); err != nil {
+					s.log.Warn("TVDelete: failed to reset episode", "id", ep.ID, "err", err)
+				}
+			}
+
+			// Blocklist old NZB and re-search if requested.
+			if args.Search && item.Deleted {
+				if ep.NzbName.Valid && ep.NzbName.String != "" {
+					s.db.AddBlocklist("episode", ep.ID, ep.NzbName.String, "manually deleted for re-download")
+					s.log.Info("TVDelete: blocklisted release", "name", ep.NzbName.String)
+				}
+				s.retryMedia("episode", ep.ID)
 			}
 		}
 
@@ -1665,10 +2263,23 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 		}
 	}
 
+	// Initialize Seerr client if configured.
+	var seerrClient *seerr.Client
+	if cfg.Seerr.URL != "" && cfg.Seerr.APIKey != "" {
+		seerrClient = seerr.New(cfg.Seerr.URL, cfg.Seerr.APIKey)
+		log.Info("seerr: auto-approve enabled", "url", cfg.Seerr.URL)
+	}
+
 	log.Info("daemon listening", "socket", sockPath)
 
+	// Detect LLM CLI for release selection.
+	llmCLI := DetectLLMCLI()
+	if llmCLI != "" {
+		log.Info("LLM release picker enabled", "cli", llmCLI)
+	}
+
 	// Start RPC server — created before downloader so it can be passed to NewDownloader.
-	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, indexers: indexers, log: log}
+	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, indexers: indexers, llmCLI: llmCLI, log: log}
 	dl := NewDownloader(svc, log)
 	svc.dl = dl
 	server := rpc.NewServer()
@@ -1694,6 +2305,16 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 		}
 		isPausedFn := func() bool { return dl.IsPaused() }
 		evictFn := func(category string, mediaID int64) error {
+			if category == "movie" {
+				if movie, err := db.GetMovie(mediaID); err == nil && movie.FilePath.Valid && movie.FilePath.String != "" {
+					movieDir := filepath.Dir(movie.FilePath.String)
+					if err := os.RemoveAll(movieDir); err != nil {
+						log.Warn("evict: failed to delete movie folder", "path", movieDir, "error", err)
+					} else {
+						log.Info("evict: deleted movie folder", "path", movieDir)
+					}
+				}
+			}
 			return db.EvictFromQueue(category, mediaID)
 		}
 		searchFn := func(category string, mediaID int64) error {
@@ -1727,7 +2348,7 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	}
 
 	// Start scheduler (episode search + movie search sweep + TMDB refresh).
-	sched := NewScheduler(svc, tc)
+	sched := NewScheduler(svc, tc, seerrClient)
 	sched.Start(ctx)
 
 	// Check for par2cmdline availability.
@@ -1768,6 +2389,203 @@ func serve(ln net.Listener, cfg *config.Config, db *database.DB, tc *tmdb.Client
 
 	defer ln.Close()
 	server.Accept(ln) // blocks
+	return nil
+}
+
+// MovieInfo returns full details about a single movie for investigation.
+func (s *Service) MovieInfo(args *MovieInfoArgs, reply *MovieInfoReply) error {
+	movie, err := s.db.GetMovieFull(args.TmdbID, args.Title)
+	if err != nil {
+		return fmt.Errorf("MovieInfo: %w", err)
+	}
+
+	reply.TmdbID = movie.TmdbID
+	reply.Title = movie.Title
+	reply.Year = movie.Year
+	reply.Status = movie.Status
+	if movie.Quality.Valid {
+		reply.Quality = movie.Quality.String
+	}
+	if movie.FilePath.Valid {
+		reply.FilePath = movie.FilePath.String
+	}
+	if movie.ImdbID.Valid {
+		reply.ImdbID = movie.ImdbID.String
+	}
+	reply.CanSearch = movie.ImdbID.Valid && movie.ImdbID.String != ""
+	if movie.AddedAt.Valid {
+		reply.AddedAt = movie.AddedAt.String
+	}
+	if movie.NzbName.Valid {
+		reply.NzbName = movie.NzbName.String
+	}
+	reply.Progress = movie.DownloadProgress
+	if movie.DownloadSize.Valid {
+		reply.SizeBytes = movie.DownloadSize.Int64
+	}
+	if movie.DownloadError.Valid {
+		reply.Error = movie.DownloadError.String
+	}
+	if movie.DownloadSource.Valid {
+		reply.Source = movie.DownloadSource.String
+	}
+	if movie.DownloadStartedAt.Valid {
+		reply.StartedAt = movie.DownloadStartedAt.String
+	}
+
+	// History for this movie.
+	history, err := s.db.ListHistoryForMedia("movie", movie.ID, 20)
+	if err != nil {
+		s.log.Error("MovieInfo: history", "error", err)
+	} else {
+		reply.History = history
+	}
+
+	// Blocklist for this movie.
+	blocklist, err := s.db.ListBlocklistForMedia("movie", movie.ID)
+	if err != nil {
+		s.log.Error("MovieInfo: blocklist", "error", err)
+	} else {
+		reply.Blocklist = blocklist
+	}
+
+	return nil
+}
+
+// SeriesInfo returns full details about a series for investigation.
+func (s *Service) SeriesInfo(args *SeriesInfoArgs, reply *SeriesInfoReply) error {
+	series, err := s.resolveSeries(args.TmdbID, args.Title)
+	if err != nil {
+		return fmt.Errorf("SeriesInfo: %w", err)
+	}
+
+	reply.TmdbID = series.TmdbID
+	if series.TvdbID.Valid {
+		reply.TvdbID = int(series.TvdbID.Int64)
+	}
+	reply.Title = series.Title
+	reply.Year = series.Year
+	reply.Status = series.Status
+	reply.CanSearch = series.TvdbID.Valid && series.TvdbID.Int64 != 0
+	if series.AddedAt.Valid {
+		reply.AddedAt = series.AddedAt.String
+	}
+
+	// Episode counts from SeasonMonitoringSummary.
+	seasons, err := s.db.SeasonMonitoringSummary(series.ID)
+	if err != nil {
+		s.log.Error("SeriesInfo: season summary", "error", err)
+	} else {
+		reply.Seasons = seasons
+		for _, sm := range seasons {
+			reply.EpisodeTotal += sm.Total
+			reply.EpisodeWanted += sm.Wanted
+			reply.EpisodeHave += sm.Completed
+		}
+	}
+
+	// Count failed episodes.
+	allQueue, err := s.db.QueueItems(0)
+	if err == nil {
+		for _, qi := range allQueue {
+			if qi.Category == "episode" && qi.TmdbID == series.TmdbID {
+				reply.ActiveDownloads = append(reply.ActiveDownloads, qi)
+				if qi.Status == "failed" {
+					reply.EpisodeFailed++
+				}
+			}
+		}
+	}
+
+	// History for this series.
+	history, err := s.db.ListHistoryForSeries(series.ID, 20)
+	if err != nil {
+		s.log.Error("SeriesInfo: history", "error", err)
+	} else {
+		reply.History = history
+	}
+
+	return nil
+}
+
+// ForceSearch triggers an immediate indexer search for wanted items.
+func (s *Service) ForceSearch(args *ForceSearchArgs, reply *ForceSearchReply) error {
+	// No specific item — search all wanted.
+	if args.TmdbID == 0 && args.Title == "" {
+		s.log.Info("force search: all wanted items")
+		if err := s.db.ClearWantedEpisodeSearchTimers(); err != nil {
+			s.log.Error("force search: clear timers", "error", err)
+		}
+		go s.SearchWantedMovies()
+		movies, _ := s.db.WantedMovies()
+		episodes, _ := s.db.WantedEpisodes()
+		reply.Count = len(movies) + len(episodes)
+		return nil
+	}
+
+	// Try movie.
+	tmdbID := args.TmdbID
+	if tmdbID == 0 && args.Title != "" {
+		// Resolve title to TmdbID.
+		movie, err := s.db.FindMovieByTitle(args.Title)
+		if err == nil && movie != nil {
+			tmdbID = movie.TmdbID
+		} else {
+			series, err := s.db.FindSeriesByTitle(args.Title)
+			if err != nil || series == nil {
+				return fmt.Errorf("ForceSearch: no movie or series matching %q", args.Title)
+			}
+			tmdbID = series.TmdbID
+		}
+	}
+
+	movie, _ := s.db.FindMovieByTmdbID(tmdbID)
+	if movie != nil && args.Season == 0 && args.Episode == 0 {
+		s.log.Info("force search: movie", "title", movie.Title)
+		go s.SearchAndGrabMovie(movie)
+		reply.Count = 1
+		return nil
+	}
+
+	// Try series + episode.
+	series, _ := s.db.FindSeriesByTmdbID(tmdbID)
+	if series == nil {
+		return fmt.Errorf("ForceSearch: no movie or series with TMDB ID %d", tmdbID)
+	}
+
+	if args.Season > 0 && args.Episode > 0 {
+		ep, err := s.db.FindEpisode(series.ID, args.Season, args.Episode)
+		if err != nil || ep == nil {
+			return fmt.Errorf("ForceSearch: episode S%02dE%02d not found", args.Season, args.Episode)
+		}
+		tvdbID := 0
+		if series.TvdbID.Valid {
+			tvdbID = int(series.TvdbID.Int64)
+		}
+		s.log.Info("force search: episode", "series", series.Title, "season", args.Season, "episode", args.Episode)
+		go s.SearchAndGrabEpisode(ep, tvdbID)
+		reply.Count = 1
+		return nil
+	}
+
+	// Search all wanted episodes in this series.
+	episodes, err := s.db.WantedEpisodes()
+	if err != nil {
+		return fmt.Errorf("ForceSearch: %w", err)
+	}
+	count := 0
+	tvdbID := 0
+	if series.TvdbID.Valid {
+		tvdbID = int(series.TvdbID.Int64)
+	}
+	for i := range episodes {
+		if episodes[i].SeriesID == series.ID {
+			count++
+			ep := episodes[i]
+			go s.SearchAndGrabEpisode(&ep, tvdbID)
+		}
+	}
+	reply.Count = count
 	return nil
 }
 

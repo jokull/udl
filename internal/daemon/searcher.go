@@ -41,6 +41,7 @@ type ScoredRelease struct {
 	Score           int    // higher is better
 	Rejected        bool   // set by scoreRelease or GrabBest
 	RejectionReason string // human-readable rejection reason
+	Indexer         string // name of the indexer that returned this release
 }
 
 // SearchMovieReleases queries all indexers for a movie by IMDB ID, falling back
@@ -83,6 +84,7 @@ func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear
 
 		for _, rel := range releases {
 			scored := scoreRelease(rel, s.cfg)
+			scored.Indexer = client.Name
 			if scored.Quality == quality.Unknown {
 				continue
 			}
@@ -120,6 +122,7 @@ func (s *Service) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredRe
 			"tvdb", tvdbID, "season", season, "episode", episode, "count", len(releases))
 		for _, rel := range releases {
 			scored := scoreRelease(rel, s.cfg)
+			scored.Indexer = client.Name
 			if scored.Quality == quality.Unknown {
 				continue
 			}
@@ -216,6 +219,60 @@ func releaseAge(pubDate string) int {
 // GrabBest picks the best acceptable release and enqueues it for download.
 // Returns true if a release was grabbed.
 func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, error) {
+	// LLM-first path: ask codex/claude to pick the best release.
+	if s.llmCLI != "" && len(releases) > 0 {
+		idx, err := s.LLMPickRelease(releases, ctx)
+		if err != nil {
+			s.log.Warn("LLM pick failed, falling back to scoring", "error", err)
+		} else if idx == -1 {
+			s.log.Info("LLM said SKIP", "title", ctx.Title)
+			return false, nil
+		} else {
+			sr := releases[idx]
+			s.log.Info("LLM picked release", "index", idx+1, "title", sr.Release.Title, "quality", sr.Quality)
+
+			// Still enforce hard constraints after LLM pick.
+			if blocked, _ := s.db.IsBlocklisted(ctx.Category, ctx.MediaID, sr.Release.Title); blocked {
+				s.log.Warn("LLM pick is blocklisted, falling back to scoring", "title", sr.Release.Title)
+			} else if imported, _ := s.db.IsCompletedInHistory(ctx.Category, ctx.MediaID, sr.Release.Title); imported {
+				s.log.Warn("LLM pick already imported, falling back to scoring", "title", sr.Release.Title)
+			} else {
+				// Enqueue the LLM-picked release.
+				enqueued, err := s.db.EnqueueDownload(ctx.Category, ctx.MediaID, sr.Release.Link, sr.Release.Title, sr.Release.Size, "usenet")
+				if err != nil {
+					return false, fmt.Errorf("enqueue download: %w", err)
+				}
+				if !enqueued {
+					s.log.Debug("already active", "title", sr.Release.Title, "category", ctx.Category)
+					return false, nil
+				}
+				if err := s.db.AddHistory(ctx.Category, ctx.MediaID, sr.Parsed.Title, "grabbed", sr.Release.Title, sr.Quality.String()); err != nil {
+					s.log.Error("failed to record grab history", "error", err)
+				}
+				s.log.Info("grabbed release (LLM)",
+					"title", sr.Release.Title,
+					"quality", sr.Quality,
+					"score", sr.Score,
+					"category", ctx.Category,
+					"media_id", ctx.MediaID,
+				)
+				if s.dl != nil {
+					s.dl.Enqueue(database.QueueItem{
+						MediaID:   ctx.MediaID,
+						Category:  ctx.Category,
+						Title:     sr.Parsed.Title,
+						Status:    "queued",
+						NzbURL:    database.NullStr(sr.Release.Link),
+						NzbName:   database.NullStr(sr.Release.Title),
+						SizeBytes: database.NullInt(sr.Release.Size),
+						Source:    database.NullStr("usenet"),
+					})
+				}
+				return true, nil
+			}
+		}
+	}
+
 	rejCount := 0
 	grabbed := false
 

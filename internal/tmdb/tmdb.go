@@ -31,6 +31,13 @@ type Movie struct {
 	Year   int
 }
 
+// MovieInfo contains extended metadata for LLM-assisted release selection.
+type MovieInfo struct {
+	OriginalLanguage string   // ISO 639-1 code (e.g. "en", "ja", "de")
+	Overview         string   // plot summary
+	SpokenLanguages  []string // language names (e.g. "English", "Japanese")
+}
+
 // Series represents a TV series search result.
 type Series struct {
 	TMDBID int
@@ -155,6 +162,23 @@ func (c *Client) GetMovie(tmdbID int) (*Movie, error) {
 		IMDBID: details.IMDbID,
 		Title:  details.Title,
 		Year:   parseYear(details.ReleaseDate),
+	}, nil
+}
+
+// GetMovieInfo returns extended metadata for a movie (language, overview).
+func (c *Client) GetMovieInfo(tmdbID int) (*MovieInfo, error) {
+	details, err := c.api.GetMovieDetails(tmdbID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("tmdb: get movie info %d: %w", tmdbID, err)
+	}
+	var langs []string
+	for _, sl := range details.SpokenLanguages {
+		langs = append(langs, sl.Name)
+	}
+	return &MovieInfo{
+		OriginalLanguage: details.OriginalLanguage,
+		Overview:         details.Overview,
+		SpokenLanguages:  langs,
 	}, nil
 }
 

@@ -97,9 +97,11 @@ var ErrDestExists = fmt.Errorf("organize: destination already exists")
 // then hardlink, then copy+delete as last resort.
 // Returns ErrDestExists if the destination file already exists.
 func Import(src, dst string) error {
-	// Prevent overwriting existing files.
+	// Remove existing file at destination (upgrade / re-download).
 	if _, err := os.Stat(dst); err == nil {
-		return fmt.Errorf("%w: %s", ErrDestExists, dst)
+		if err := os.Remove(dst); err != nil {
+			return fmt.Errorf("organize: remove existing %s: %w", dst, err)
+		}
 	}
 
 	// Create parent directories.

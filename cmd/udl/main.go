@@ -69,17 +69,17 @@ var movieSearchCmd = &cobra.Command{
 }
 
 var movieReleasesCmd = &cobra.Command{
-	Use:   "releases [tmdb-id]",
+	Use:   "releases [tmdb-id-or-title]",
 	Short: "Search indexers for a movie in the database",
-	Long:  "Searches Usenet indexers for releases matching a movie already in the database.\nUse the movie's TMDB ID (from 'udl movie search' or 'udl movie list').",
+	Long:  "Searches Usenet indexers for releases matching a movie already in the database.\nAccepts TMDB ID or title.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runMovieReleases,
 }
 
 var movieGrabCmd = &cobra.Command{
-	Use:   "grab [tmdb-id] [#]",
+	Use:   "grab [tmdb-id-or-title] [#]",
 	Short: "Grab a specific indexer release for a movie",
-	Long:  "Searches indexers for a movie in the database and grabs the release at the given index.\nRun 'udl movie releases' first to see numbered results, then grab by number.",
+	Long:  "Searches indexers for a movie in the database and grabs the release at the given index.\nRun 'udl movie releases' first to see numbered results, then grab by number.\nAccepts TMDB ID or title.",
 	Args:  cobra.ExactArgs(2),
 	RunE:  runMovieGrab,
 }
@@ -142,18 +142,25 @@ var queueRetryCmd = &cobra.Command{
 	RunE:  runQueueRetry,
 }
 
+var queueEvictCmd = &cobra.Command{
+	Use:   "evict [movie:TMDB_ID|episode:TMDB_ID:S01E02]",
+	Short: "Cancel a single download and reset to wanted",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runQueueEvict,
+}
+
 var movieRemoveCmd = &cobra.Command{
-	Use:   "remove [tmdb-id]",
-	Short: "Remove a movie from monitoring (not from disk)",
-	Long:  "Remove a movie by its TMDB ID (from 'udl movie list').",
+	Use:   "remove [tmdb-id-or-title]",
+	Short: "Remove a movie and delete its files from disk",
+	Long:  "Remove a movie by TMDB ID or title. Use --keep-files to keep files on disk.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runMovieRemove,
 }
 
 var tvRemoveCmd = &cobra.Command{
-	Use:   "remove [tmdb-id]",
+	Use:   "remove [tmdb-id-or-title]",
 	Short: "Remove a series from monitoring (not from disk)",
-	Long:  "Remove a series by its TMDB ID (from 'udl tv list').",
+	Long:  "Remove a series by TMDB ID or title.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runTVRemove,
 }
@@ -165,16 +172,17 @@ var tvRefreshCmd = &cobra.Command{
 }
 
 var tvMonitorCmd = &cobra.Command{
-	Use:   "monitor [tmdb-id]",
+	Use:   "monitor [tmdb-id-or-title]",
 	Short: "Show or change season monitoring for a series",
 	Long: `Show or change which seasons are monitored for a series.
+Accepts TMDB ID or title.
 
 Examples:
   udl tv monitor 1396                  # show monitoring status
+  udl tv monitor "Breaking Bad" --all  # monitor everything
   udl tv monitor 1396 --season 3       # monitor S03
   udl tv monitor 1396 --season 3 --off # unmonitor S03
   udl tv monitor 1396 --latest         # only latest season
-  udl tv monitor 1396 --all            # monitor everything
   udl tv monitor 1396 --none           # unmonitor everything`,
 	Args: cobra.ExactArgs(1),
 	RunE: runTVMonitor,
@@ -272,10 +280,54 @@ var libraryPruneCmd = &cobra.Command{
 	RunE:  runLibraryPrune,
 }
 
+var tvReleasesCmd = &cobra.Command{
+	Use:   "releases [tmdb-id-or-title]",
+	Short: "Search indexers for episode releases",
+	Long:  "Searches Usenet indexers for releases matching a specific episode.\nRequires --season and --episode flags.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runTVReleases,
+}
+
+var tvGrabCmd = &cobra.Command{
+	Use:   "grab [tmdb-id-or-title] [#]",
+	Short: "Grab a specific indexer release for an episode",
+	Long:  "Searches indexers for an episode and grabs the release at the given index.\nRun 'udl tv releases' first to see numbered results, then grab by number.\nRequires --season and --episode flags.",
+	Args:  cobra.ExactArgs(2),
+	RunE:  runTVGrab,
+}
+
+var tvEpisodesCmd = &cobra.Command{
+	Use:   "episodes [tmdb-id-or-title]",
+	Short: "Show episodes for a series",
+	Long:  "Shows all episodes or a specific season for a series in the database.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runTVEpisodes,
+}
+
+var movieDeleteCmd = &cobra.Command{
+	Use:   "delete [tmdb-id-or-title]",
+	Short: "Delete a movie's file and reset to wanted",
+	Long:  "Delete the downloaded file for a movie and reset it to wanted for re-download.\nDry-run by default; use --execute to actually delete.\nUse --search to blocklist the old NZB and re-search.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runMovieDelete,
+}
+
+var wantedCmd = &cobra.Command{
+	Use:   "wanted",
+	Short: "Show all wanted movies and episodes",
+	RunE:  runWanted,
+}
+
+var scheduleCmd = &cobra.Command{
+	Use:   "schedule",
+	Short: "Show upcoming episodes",
+	RunE:  runSchedule,
+}
+
 var tvDeleteCmd = &cobra.Command{
-	Use:   "delete [tmdb-id]",
-	Short: "Delete files for a series (or specific season)",
-	Long:  "Delete files and unmonitor episodes. Dry-run by default. Use --execute to actually delete.",
+	Use:   "delete [title-or-tmdb-id]",
+	Short: "Delete files for a series, season, or episode",
+	Long:  "Delete files and reset episodes to wanted. Dry-run by default. Use --execute to actually delete.\nWhen --episode is specified, keeps episode monitored. Use --search to re-search immediately.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runTVDelete,
 }
@@ -316,24 +368,84 @@ var configPathCmd = &cobra.Command{
 	RunE:  runConfigPath,
 }
 
+var configShowCmd = &cobra.Command{
+	Use:   "show",
+	Short: "Show active configuration (quality profile, indexers, paths)",
+	RunE:  runConfigShow,
+}
+
+var movieInfoCmd = &cobra.Command{
+	Use:   "info [tmdb-id-or-title]",
+	Short: "Show full details for a movie",
+	Long:  "Show status, quality, file, IDs, download state, history, and blocklist for a movie.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runMovieInfo,
+}
+
+var tvInfoCmd = &cobra.Command{
+	Use:   "info [tmdb-id-or-title]",
+	Short: "Show full details for a series",
+	Long:  "Show status, IDs, episode counts, active downloads, and history for a series.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runTVInfo,
+}
+
+var searchTriggerCmd = &cobra.Command{
+	Use:   "search-trigger",
+	Short: "Trigger immediate indexer search for wanted items",
+	Long: `Force an immediate indexer search instead of waiting for the scheduler.
+
+Examples:
+  udl search-trigger                              # search all wanted items
+  udl search-trigger --tmdb 1057823               # search a specific movie
+  udl search-trigger --tmdb 42282 --season 6 --episode 1  # search a specific episode
+  udl search-trigger "Girls"                      # search by title`,
+	Args: cobra.RangeArgs(0, 1),
+	RunE: runSearchTrigger,
+}
+
 func init() {
-	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd)
+	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd, movieDeleteCmd, movieInfoCmd)
+	movieRemoveCmd.Flags().Bool("keep-files", false, "Only remove from database, keep files on disk")
+	movieDeleteCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
+	movieDeleteCmd.Flags().Bool("search", false, "Re-search after delete (blocklists old NZB)")
 	tvMonitorCmd.Flags().IntP("season", "s", -1, "Season number to monitor/unmonitor")
 	tvMonitorCmd.Flags().Bool("off", false, "Unmonitor the specified season")
 	tvMonitorCmd.Flags().Bool("latest", false, "Monitor only the latest season")
 	tvMonitorCmd.Flags().Bool("all", false, "Monitor all seasons")
 	tvMonitorCmd.Flags().Bool("none", false, "Unmonitor all seasons")
 	tvDeleteCmd.Flags().IntP("season", "s", -1, "Season number to delete (-1 means all)")
+	tvDeleteCmd.Flags().IntP("episode", "e", -1, "Episode number to delete (requires --season)")
 	tvDeleteCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
-	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd, tvMonitorCmd, tvDeleteCmd)
+	tvDeleteCmd.Flags().Bool("search", false, "Re-search after delete (blocklists old NZB if UDL-downloaded)")
+	tvReleasesCmd.Flags().IntP("season", "s", -1, "Season number (required)")
+	tvReleasesCmd.Flags().IntP("episode", "e", -1, "Episode number (required)")
+	tvReleasesCmd.MarkFlagRequired("season")
+	tvReleasesCmd.MarkFlagRequired("episode")
+	tvGrabCmd.Flags().IntP("season", "s", -1, "Season number (required)")
+	tvGrabCmd.Flags().IntP("episode", "e", -1, "Episode number (required)")
+	tvGrabCmd.MarkFlagRequired("season")
+	tvGrabCmd.MarkFlagRequired("episode")
+	tvEpisodesCmd.Flags().IntP("season", "s", -1, "Season number (-1 for all)")
+	tvCmd.AddCommand(tvAddCmd, tvSearchCmd, tvListCmd, tvRemoveCmd, tvRefreshCmd, tvMonitorCmd, tvDeleteCmd, tvReleasesCmd, tvGrabCmd, tvEpisodesCmd, tvInfoCmd)
+	scheduleCmd.Flags().Int("days", 30, "Number of days to look ahead")
 	queueClearCmd.Flags().Bool("unmonitored", false, "Only clear unmonitored episodes")
-	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd)
+	historyCmd.Flags().String("type", "", "Filter by media type (movie or episode)")
+	historyCmd.Flags().String("event", "", "Filter by event (grabbed, completed, failed)")
+	historyCmd.Flags().Int("limit", 0, "Maximum number of entries (default 50)")
+	historyCmd.Flags().Int("tmdb", 0, "Filter to a specific movie or series by TMDB ID")
+	historyCmd.Flags().IntP("season", "s", 0, "Episode season (used with --tmdb)")
+	historyCmd.Flags().IntP("episode", "e", 0, "Episode number (used with --tmdb)")
+	searchTriggerCmd.Flags().Int("tmdb", 0, "TMDB ID of the movie or series to search")
+	searchTriggerCmd.Flags().IntP("season", "s", 0, "Episode season (used with --tmdb)")
+	searchTriggerCmd.Flags().IntP("episode", "e", 0, "Episode number (used with --tmdb)")
+	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd, queueEvictCmd)
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
 	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
 	plexCleanupCmd.Flags().Bool("verbose", false, "Also show items that would be kept")
 	plexCmd.AddCommand(plexServersCmd, plexCheckCmd, plexCleanupCmd)
 	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
-	configCmd.AddCommand(configCheckCmd, configPathCmd)
+	configCmd.AddCommand(configCheckCmd, configPathCmd, configShowCmd)
 
 	migrateRadarrCmd.Flags().String("url", "", "Radarr base URL (e.g. http://localhost:7878)")
 	migrateRadarrCmd.Flags().String("apikey", "", "Radarr API key")
@@ -358,7 +470,7 @@ func init() {
 	libraryPruneCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
 	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd, libraryPruneIncompleteCmd, libraryVerifyCmd, libraryPruneCmd)
 
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd)
+	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd)
 }
 
 func main() {
@@ -544,13 +656,24 @@ func runMovieList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tSTATUS\tQUALITY")
+	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tSTATUS\tQUALITY\tADDED\tFILE")
 	for _, m := range reply.Movies {
 		q := ""
 		if m.Quality.Valid {
 			q = m.Quality.String
 		}
-		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\n", m.TmdbID, m.Title, m.Year, m.Status, q)
+		added := ""
+		if m.AddedAt.Valid {
+			added = m.AddedAt.String
+			if len(added) > 10 {
+				added = added[:10]
+			}
+		}
+		file := ""
+		if m.FilePath.Valid && m.FilePath.String != "" {
+			file = filepath.Base(m.FilePath.String)
+		}
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\t%s\t%s\n", m.TmdbID, m.Title, m.Year, m.Status, q, added, file)
 	}
 	return w.Flush()
 }
@@ -586,18 +709,18 @@ func runMovieSearch(cmd *cobra.Command, args []string) error {
 }
 
 func runMovieReleases(cmd *cobra.Command, args []string) error {
-	tmdbID, err := strconv.Atoi(args[0])
-	if err != nil {
-		return fmt.Errorf("TMDB ID must be a number (use 'udl movie search' to find it)")
-	}
-
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	rpcArgs := &daemon.SearchMovieArgs{TmdbID: tmdbID}
+	rpcArgs := &daemon.SearchMovieArgs{}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
 
 	var reply daemon.SearchMovieReply
 	if err := client.Call("Service.SearchMovie", rpcArgs, &reply); err != nil {
@@ -609,26 +732,11 @@ func runMovieReleases(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "#\tTITLE\tQUALITY\tSIZE\tSCORE")
-	for i, r := range reply.Results {
-		size := fmt.Sprintf("%.1f GB", float64(r.Release.Size)/(1024*1024*1024))
-		if r.Release.Size < 1024*1024*1024 {
-			size = fmt.Sprintf("%.0f MB", float64(r.Release.Size)/(1024*1024))
-		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\n", i+1, r.Release.Title, r.Quality, size, r.Score)
-		if i >= 19 {
-			break // show top 20
-		}
-	}
-	return w.Flush()
+	printReleases(reply.Results, reply.ExistingQuality)
+	return nil
 }
 
 func runMovieGrab(cmd *cobra.Command, args []string) error {
-	tmdbID, err := strconv.Atoi(args[0])
-	if err != nil {
-		return fmt.Errorf("first argument must be a TMDB ID (use 'udl movie search' to find it)")
-	}
 	index, err := strconv.Atoi(args[1])
 	if err != nil {
 		return fmt.Errorf("second argument must be a release number (use 'udl movie releases' to find it)")
@@ -640,14 +748,19 @@ func runMovieGrab(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
-	rpcArgs := &daemon.GrabMovieReleaseArgs{TmdbID: tmdbID, Index: index}
+	rpcArgs := &daemon.GrabMovieReleaseArgs{Index: index}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
 
 	var reply daemon.GrabMovieReleaseReply
 	if err := client.Call("Service.GrabMovieRelease", rpcArgs, &reply); err != nil {
 		return err
 	}
 
-	fmt.Printf("grabbed: %s (%d) [tmdb=%d]\n", reply.Title, reply.Year, tmdbID)
+	fmt.Printf("grabbed: %s (%d)\n", reply.Title, reply.Year)
 	fmt.Printf("  release: %s\n", reply.ReleaseName)
 	fmt.Printf("  quality: %s\n", reply.Quality)
 	return nil
@@ -730,9 +843,10 @@ func runTVList(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tSTATUS")
+	fmt.Fprintln(w, "TMDB ID\tTITLE\tYEAR\tSTATUS\tEPS\tWANTED\tHAVE")
 	for _, s := range reply.Series {
-		fmt.Fprintf(w, "%d\t%s\t%d\t%s\n", s.TmdbID, s.Title, s.Year, s.Status)
+		counts := reply.Counts[s.ID]
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%d\t%d\t%d\n", s.TmdbID, s.Title, s.Year, s.Status, counts[0], counts[1], counts[2])
 	}
 	return w.Flush()
 }
@@ -755,7 +869,7 @@ func runQueue(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTITLE\tSTATUS\tPROGRESS")
+	fmt.Fprintln(w, "ID\tTITLE\tSTATUS\tPROGRESS\tSIZE\tERROR")
 	for _, d := range reply.Items {
 		progress := d.Progress
 		if progress > 100 {
@@ -763,10 +877,22 @@ func runQueue(cmd *cobra.Command, args []string) error {
 		}
 		id := mediaTag(d.Category, d.TmdbID, d.Season, d.EpisodeNum, d.MediaID)
 		progressStr := fmt.Sprintf("%.0f%%", progress)
-		if d.Status == "post_processing" && d.ErrorMsg.Valid && d.ErrorMsg.String != "" {
-			progressStr = fmt.Sprintf("%.0f%% %s", progress, d.ErrorMsg.String)
+		size := "-"
+		if d.SizeBytes.Valid && d.SizeBytes.Int64 > 0 {
+			size = formatSize(d.SizeBytes.Int64)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", id, d.Title, d.Status, progressStr)
+		errMsg := ""
+		if d.ErrorMsg.Valid && d.ErrorMsg.String != "" {
+			errMsg = d.ErrorMsg.String
+			// During post_processing, download_error holds phase labels, not errors.
+			if d.Status == "post_processing" && isPhaseLabel(errMsg) {
+				errMsg = "[phase] " + errMsg
+			}
+			if len(errMsg) > 60 {
+				errMsg = errMsg[:60] + "..."
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", id, d.Title, d.Status, progressStr, size, errMsg)
 	}
 	return w.Flush()
 }
@@ -827,8 +953,16 @@ func runHistory(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
+	mediaType, _ := cmd.Flags().GetString("type")
+	event, _ := cmd.Flags().GetString("event")
+	limit, _ := cmd.Flags().GetInt("limit")
+	tmdbID, _ := cmd.Flags().GetInt("tmdb")
+	season, _ := cmd.Flags().GetInt("season")
+	episode, _ := cmd.Flags().GetInt("episode")
+
+	rpcArgs := &daemon.HistoryArgs{MediaType: mediaType, Event: event, Limit: limit, TmdbID: tmdbID, Season: season, Episode: episode}
 	var reply daemon.HistoryReply
-	if err := client.Call("Service.History", &daemon.Empty{}, &reply); err != nil {
+	if err := client.Call("Service.History", rpcArgs, &reply); err != nil {
 		return err
 	}
 
@@ -838,11 +972,15 @@ func runHistory(cmd *cobra.Command, args []string) error {
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tTITLE\tEVENT\tQUALITY\tTIME")
+	fmt.Fprintln(w, "ID\tTITLE\tEVENT\tQUALITY\tSOURCE\tTIME")
 	for _, h := range reply.Events {
 		q := ""
 		if h.Quality.Valid {
 			q = h.Quality.String
+		}
+		source := ""
+		if h.Source.Valid {
+			source = h.Source.String
 		}
 		id := mediaTag(h.MediaType, h.TmdbID, h.Season, h.EpisodeNum, h.MediaID)
 		createdAt := "—"
@@ -852,7 +990,7 @@ func runHistory(cmd *cobra.Command, args []string) error {
 				createdAt = createdAt[:16]
 			}
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", id, h.Title, h.Event, q, createdAt)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", id, h.Title, h.Event, q, source, createdAt)
 	}
 	return w.Flush()
 }
@@ -930,10 +1068,7 @@ func runBlocklistRemove(cmd *cobra.Command, args []string) error {
 }
 
 func runMovieRemove(cmd *cobra.Command, args []string) error {
-	tmdbID, err := strconv.Atoi(args[0])
-	if err != nil {
-		return fmt.Errorf("TMDB ID must be a number (use 'udl movie list' to find it)")
-	}
+	keepFiles, _ := cmd.Flags().GetBool("keep-files")
 
 	client, err := daemon.Dial()
 	if err != nil {
@@ -941,7 +1076,13 @@ func runMovieRemove(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
-	rpcArgs := &daemon.RemoveMovieArgs{TmdbID: tmdbID}
+	rpcArgs := &daemon.RemoveMovieArgs{KeepFiles: keepFiles}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
 	var reply daemon.RemoveMovieReply
 	if err := client.Call("Service.RemoveMovie", rpcArgs, &reply); err != nil {
 		return err
@@ -951,18 +1092,19 @@ func runMovieRemove(cmd *cobra.Command, args []string) error {
 }
 
 func runTVRemove(cmd *cobra.Command, args []string) error {
-	tmdbID, err := strconv.Atoi(args[0])
-	if err != nil {
-		return fmt.Errorf("TMDB ID must be a number (use 'udl tv list' to find it)")
-	}
-
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
 	}
 	defer client.Close()
 
-	rpcArgs := &daemon.RemoveSeriesArgs{TmdbID: tmdbID}
+	rpcArgs := &daemon.RemoveSeriesArgs{}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
 	var reply daemon.RemoveSeriesReply
 	if err := client.Call("Service.RemoveSeries", rpcArgs, &reply); err != nil {
 		return err
@@ -972,11 +1114,6 @@ func runTVRemove(cmd *cobra.Command, args []string) error {
 }
 
 func runTVDelete(cmd *cobra.Command, args []string) error {
-	tmdbID, err := strconv.Atoi(args[0])
-	if err != nil {
-		return fmt.Errorf("TMDB ID must be a number (use 'udl tv list' to find it)")
-	}
-
 	client, err := daemon.Dial()
 	if err != nil {
 		return fmt.Errorf("cannot connect to daemon: %w", err)
@@ -984,9 +1121,28 @@ func runTVDelete(cmd *cobra.Command, args []string) error {
 	defer client.Close()
 
 	season, _ := cmd.Flags().GetInt("season")
+	episode, _ := cmd.Flags().GetInt("episode")
 	execute, _ := cmd.Flags().GetBool("execute")
+	search, _ := cmd.Flags().GetBool("search")
 
-	rpcArgs := &daemon.TVDeleteArgs{TmdbID: tmdbID, Season: season, Execute: execute}
+	if episode >= 0 && season < 0 {
+		return fmt.Errorf("--episode requires --season")
+	}
+
+	rpcArgs := &daemon.TVDeleteArgs{
+		Season:  season,
+		Episode: episode,
+		Execute: execute,
+		Search:  search,
+	}
+
+	// Accept TMDB ID or title.
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
 	var reply daemon.TVDeleteReply
 	if err := client.Call("Service.TVDelete", rpcArgs, &reply); err != nil {
 		return err
@@ -1014,6 +1170,9 @@ func runTVDelete(cmd *cobra.Command, args []string) error {
 
 	if execute {
 		fmt.Printf("\n%d files deleted, %s reclaimed\n", len(reply.Items), formatSize(reply.TotalBytes))
+		if search {
+			fmt.Println("re-search triggered")
+		}
 	} else {
 		fmt.Printf("\n%d files, %s total (dry-run: use --execute to delete)\n", len(reply.Items), formatSize(reply.TotalBytes))
 	}
@@ -1087,11 +1246,6 @@ func runTVRefresh(cmd *cobra.Command, args []string) error {
 }
 
 func runTVMonitor(cmd *cobra.Command, args []string) error {
-	tmdbID, err := strconv.Atoi(args[0])
-	if err != nil {
-		return fmt.Errorf("TMDB ID must be a number (use 'udl tv list' to find it)")
-	}
-
 	season, _ := cmd.Flags().GetInt("season")
 	off, _ := cmd.Flags().GetBool("off")
 	latest, _ := cmd.Flags().GetBool("latest")
@@ -1118,7 +1272,12 @@ func runTVMonitor(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
-	rpcArgs := &daemon.MonitorSeasonArgs{TmdbID: tmdbID, Season: season, Mode: mode}
+	rpcArgs := &daemon.MonitorSeasonArgs{Season: season, Mode: mode}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
 	var reply daemon.MonitorSeasonReply
 	if err := client.Call("Service.MonitorSeason", rpcArgs, &reply); err != nil {
 		return err
@@ -1200,6 +1359,96 @@ func runQueueRetry(cmd *cobra.Command, args []string) error {
 		fmt.Printf("retried %d download(s)\n", reply.Count)
 	}
 	return nil
+}
+
+func runQueueEvict(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.EvictQueueArgs{}
+	parts := strings.SplitN(args[0], ":", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("invalid format %q — use movie:TMDB_ID or episode:TMDB_ID:S01E02", args[0])
+	}
+	category := parts[0]
+	if category != "movie" && category != "episode" {
+		return fmt.Errorf("invalid category %q — use movie or episode", category)
+	}
+	rpcArgs.Category = category
+	if category == "movie" {
+		tmdbID, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return fmt.Errorf("invalid TMDB ID %q: %w", parts[1], err)
+		}
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		epParts := strings.SplitN(parts[1], ":", 2)
+		if len(epParts) != 2 {
+			return fmt.Errorf("invalid episode format %q — use episode:TMDB_ID:S01E02", args[0])
+		}
+		tmdbID, err := strconv.Atoi(epParts[0])
+		if err != nil {
+			return fmt.Errorf("invalid series TMDB ID %q: %w", epParts[0], err)
+		}
+		var season, episode int
+		if _, err := fmt.Sscanf(strings.ToUpper(epParts[1]), "S%dE%d", &season, &episode); err != nil {
+			return fmt.Errorf("invalid episode identifier %q — expected S01E02 format", epParts[1])
+		}
+		rpcArgs.TmdbID = tmdbID
+		rpcArgs.Season = season
+		rpcArgs.Episode = episode
+	}
+
+	var reply daemon.EvictQueueReply
+	if err := client.Call("Service.EvictQueue", rpcArgs, &reply); err != nil {
+		return err
+	}
+	fmt.Printf("evicted %q from queue\n", reply.Title)
+	return nil
+}
+
+func runConfigShow(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.ConfigShowReply
+	if err := client.Call("Service.ConfigShow", &daemon.Empty{}, &reply); err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "Quality Profile\t%s\n", reply.ProfileName)
+	fmt.Fprintf(w, "Min Quality\t%s\n", reply.MinQuality)
+	fmt.Fprintf(w, "Preferred\t%s\n", reply.Preferred)
+	fmt.Fprintf(w, "Upgrade Until\t%s\n", reply.UpgradeUntil)
+	if len(reply.MustNotContain) > 0 {
+		fmt.Fprintf(w, "Must Not Contain\t%s\n", strings.Join(reply.MustNotContain, ", "))
+	}
+	if len(reply.PreferredWords) > 0 {
+		fmt.Fprintf(w, "Preferred Words\t%s\n", strings.Join(reply.PreferredWords, ", "))
+	}
+	if reply.RetentionDays > 0 {
+		fmt.Fprintf(w, "Retention\t%d days\n", reply.RetentionDays)
+	}
+	fmt.Fprintf(w, "Indexers\t%s\n", strings.Join(reply.Indexers, ", "))
+	for _, p := range reply.Providers {
+		fmt.Fprintf(w, "Provider\t%s\n", p)
+	}
+	fmt.Fprintf(w, "Library TV\t%s\n", reply.LibraryTV)
+	fmt.Fprintf(w, "Library Movies\t%s\n", reply.LibraryMovies)
+	fmt.Fprintf(w, "Incomplete\t%s\n", reply.IncompletePath)
+	fmt.Fprintf(w, "Plex\t%v\n", reply.PlexEnabled)
+	fmt.Fprintf(w, "Seerr\t%v\n", reply.SeerrEnabled)
+	if reply.WebPort > 0 {
+		fmt.Fprintf(w, "Web Port\t%d\n", reply.WebPort)
+	}
+	return w.Flush()
 }
 
 func runPlexServers(cmd *cobra.Command, args []string) error {
@@ -1379,6 +1628,576 @@ func formatSize(bytes int64) string {
 	}
 	mb := float64(bytes) / (1024 * 1024)
 	return fmt.Sprintf("%.0f MB", mb)
+}
+
+// printReleases prints a table of scored releases with enhanced columns.
+func printReleases(results []daemon.ScoredRelease, existingQuality string) {
+	if existingQuality != "" {
+		fmt.Printf("Current quality: %s\n\n", existingQuality)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "#\tTITLE\tQUALITY\tSOURCE\tSIZE\tAGE\tGROUP\tINDEXER\tSCORE\tSTATUS")
+	for i, r := range results {
+		size := fmt.Sprintf("%.1f GB", float64(r.Release.Size)/(1024*1024*1024))
+		if r.Release.Size < 1024*1024*1024 {
+			size = fmt.Sprintf("%.0f MB", float64(r.Release.Size)/(1024*1024))
+		}
+		age := "-"
+		if r.Release.PubDate != "" {
+			if t, err := time.Parse(time.RFC1123Z, r.Release.PubDate); err == nil {
+				days := int(time.Since(t).Hours() / 24)
+				age = fmt.Sprintf("%dd", days)
+			} else if t, err := time.Parse(time.RFC1123, r.Release.PubDate); err == nil {
+				days := int(time.Since(t).Hours() / 24)
+				age = fmt.Sprintf("%dd", days)
+			}
+		}
+		group := r.Parsed.Group
+		if group == "" {
+			group = "-"
+		}
+		source := r.Parsed.Source
+		if source == "" {
+			source = "-"
+		}
+		indexer := r.Indexer
+		if indexer == "" {
+			indexer = "-"
+		}
+		status := ""
+		if r.Rejected {
+			status = r.RejectionReason
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", i+1, r.Release.Title, r.Quality, source, size, age, group, indexer, r.Score, status)
+		if i >= 19 {
+			break
+		}
+	}
+	w.Flush()
+}
+
+func runTVReleases(cmd *cobra.Command, args []string) error {
+	season, _ := cmd.Flags().GetInt("season")
+	episode, _ := cmd.Flags().GetInt("episode")
+
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.SearchEpisodeArgs{Season: season, Episode: episode}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
+	var reply daemon.SearchEpisodeReply
+	if err := client.Call("Service.SearchEpisode", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Results) == 0 {
+		fmt.Println("no releases found")
+		return nil
+	}
+
+	printReleases(reply.Results, reply.ExistingQuality)
+	return nil
+}
+
+func runTVGrab(cmd *cobra.Command, args []string) error {
+	season, _ := cmd.Flags().GetInt("season")
+	episode, _ := cmd.Flags().GetInt("episode")
+	index, err := strconv.Atoi(args[1])
+	if err != nil {
+		return fmt.Errorf("second argument must be a release number (use 'udl tv releases' to find it)")
+	}
+
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.GrabEpisodeReleaseArgs{Season: season, Episode: episode, Index: index}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
+	var reply daemon.GrabEpisodeReleaseReply
+	if err := client.Call("Service.GrabEpisodeRelease", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("grabbed: %s S%02dE%02d\n", reply.SeriesTitle, reply.Season, reply.Episode)
+	fmt.Printf("  release: %s\n", reply.ReleaseName)
+	fmt.Printf("  quality: %s\n", reply.Quality)
+	return nil
+}
+
+func runTVEpisodes(cmd *cobra.Command, args []string) error {
+	season, _ := cmd.Flags().GetInt("season")
+
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.SeriesEpisodesArgs{Season: season}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
+	var reply daemon.SeriesEpisodesReply
+	if err := client.Call("Service.SeriesEpisodes", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Episodes) == 0 {
+		fmt.Println("no episodes")
+		return nil
+	}
+
+	fmt.Printf("%s (%d)\n\n", reply.SeriesTitle, reply.Year)
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "S/E\tTITLE\tAIR DATE\tMON\tSTATUS\tQUALITY\tFILE\tLAST SEARCHED")
+	for _, ep := range reply.Episodes {
+		se := fmt.Sprintf("S%02dE%02d", ep.Season, ep.Episode)
+		title := ""
+		if ep.Title.Valid {
+			title = ep.Title.String
+		}
+		airDate := "-"
+		if ep.AirDate.Valid && ep.AirDate.String != "" {
+			airDate = ep.AirDate.String
+		}
+		mon := "--"
+		if ep.Monitored {
+			mon = "[x]"
+		}
+		q := ""
+		if ep.Quality.Valid {
+			q = ep.Quality.String
+		}
+		file := ""
+		if ep.FilePath.Valid && ep.FilePath.String != "" {
+			file = filepath.Base(ep.FilePath.String)
+		} else if ep.NzbName.Valid && ep.NzbName.String != "" {
+			file = ep.NzbName.String
+			if len(file) > 50 {
+				file = file[:50] + "..."
+			}
+		}
+		lastSearched := "-"
+		if ep.LastSearchedAt.Valid && ep.LastSearchedAt.String != "" {
+			lastSearched = ep.LastSearchedAt.String
+			if len(lastSearched) > 16 {
+				lastSearched = lastSearched[:16]
+			}
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", se, title, airDate, mon, ep.Status, q, file, lastSearched)
+	}
+	return w.Flush()
+}
+
+func runMovieDelete(cmd *cobra.Command, args []string) error {
+	execute, _ := cmd.Flags().GetBool("execute")
+	search, _ := cmd.Flags().GetBool("search")
+
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.MovieDeleteArgs{Execute: execute, Search: search}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
+	var reply daemon.MovieDeleteReply
+	if err := client.Call("Service.MovieDelete", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if execute {
+		fmt.Printf("deleted: %s (%d)\n", reply.Title, reply.Year)
+		fmt.Printf("  file: %s (%s)\n", reply.FilePath, formatSize(reply.SizeBytes))
+		if search {
+			fmt.Println("  re-search triggered")
+		}
+	} else {
+		fmt.Printf("would delete: %s (%d)\n", reply.Title, reply.Year)
+		fmt.Printf("  file: %s (%s)\n", reply.FilePath, formatSize(reply.SizeBytes))
+		fmt.Println("  (dry-run: use --execute to delete)")
+	}
+	return nil
+}
+
+func runWanted(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.WantedReply
+	if err := client.Call("Service.Wanted", &daemon.Empty{}, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Items) == 0 {
+		fmt.Println("nothing wanted")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "TYPE\tTMDB\tTITLE\tAIR DATE\tLAST SEARCHED\tSEARCHABLE")
+	for _, item := range reply.Items {
+		airDate := "-"
+		if item.AirDate.Valid && item.AirDate.String != "" {
+			airDate = item.AirDate.String
+		}
+		lastSearched := "-"
+		if item.LastSearchedAt.Valid && item.LastSearchedAt.String != "" {
+			lastSearched = item.LastSearchedAt.String
+			if len(lastSearched) > 16 {
+				lastSearched = lastSearched[:16]
+			}
+		}
+		searchable := "yes"
+		if !item.CanSearch {
+			searchable = "NO (missing ID)"
+		}
+		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n", item.Category, item.TmdbID, item.Title, airDate, lastSearched, searchable)
+	}
+	return w.Flush()
+}
+
+func runMovieInfo(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.MovieInfoArgs{}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
+	var reply daemon.MovieInfoReply
+	if err := client.Call("Service.MovieInfo", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("tmdb:%d  %s (%d)\n", reply.TmdbID, reply.Title, reply.Year)
+	fmt.Printf("status:      %s\n", reply.Status)
+	if reply.Quality != "" {
+		fmt.Printf("quality:     %s\n", reply.Quality)
+	}
+	if reply.FilePath != "" {
+		fmt.Printf("file:        %s\n", filepath.Base(reply.FilePath))
+	}
+	canSearch := "yes"
+	if !reply.CanSearch {
+		canSearch = "no (missing IMDB ID)"
+	}
+	imdb := reply.ImdbID
+	if imdb == "" {
+		imdb = "-"
+	}
+	fmt.Printf("imdb:        %s   can-search: %s\n", imdb, canSearch)
+	if reply.AddedAt != "" {
+		added := reply.AddedAt
+		if len(added) > 10 {
+			added = added[:10]
+		}
+		fmt.Printf("added:       %s\n", added)
+	}
+
+	// Download info if in queue.
+	if reply.NzbName != "" {
+		fmt.Printf("\ndownload:\n")
+		fmt.Printf("  nzb:       %s\n", reply.NzbName)
+		if reply.SizeBytes > 0 {
+			fmt.Printf("  size:      %s\n", formatSize(reply.SizeBytes))
+		}
+		fmt.Printf("  progress:  %.0f%%\n", reply.Progress)
+		if reply.Source != "" {
+			fmt.Printf("  source:    %s\n", reply.Source)
+		}
+		if reply.Error != "" {
+			errLabel := reply.Error
+			if reply.Status == "post_processing" && isPhaseLabel(errLabel) {
+				errLabel = "[phase] " + errLabel
+			}
+			fmt.Printf("  error:     %s\n", errLabel)
+		}
+	}
+
+	// History.
+	if len(reply.History) > 0 {
+		fmt.Printf("\nhistory:\n")
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "EVENT\tQUALITY\tSOURCE\tTIME")
+		for _, h := range reply.History {
+			q := ""
+			if h.Quality.Valid {
+				q = h.Quality.String
+			}
+			source := ""
+			if h.Source.Valid {
+				source = h.Source.String
+			}
+			createdAt := ""
+			if h.CreatedAt.Valid {
+				createdAt = h.CreatedAt.String
+				if len(createdAt) > 16 {
+					createdAt = createdAt[:16]
+				}
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", h.Event, q, source, createdAt)
+		}
+		w.Flush()
+	}
+
+	// Blocklist.
+	if len(reply.Blocklist) > 0 {
+		fmt.Printf("\nblocklist: %d entries\n", len(reply.Blocklist))
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "RELEASE\tREASON\tTIME")
+		for _, b := range reply.Blocklist {
+			release := b.ReleaseTitle
+			if len(release) > 50 {
+				release = release[:50] + "..."
+			}
+			createdAt := ""
+			if b.CreatedAt.Valid {
+				createdAt = b.CreatedAt.String
+				if len(createdAt) > 16 {
+					createdAt = createdAt[:16]
+				}
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\n", release, b.Reason, createdAt)
+		}
+		w.Flush()
+	}
+
+	return nil
+}
+
+func runTVInfo(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	rpcArgs := &daemon.SeriesInfoArgs{}
+	if tmdbID, err := strconv.Atoi(args[0]); err == nil {
+		rpcArgs.TmdbID = tmdbID
+	} else {
+		rpcArgs.Title = args[0]
+	}
+
+	var reply daemon.SeriesInfoReply
+	if err := client.Call("Service.SeriesInfo", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("tmdb:%d   %s (%d)\n", reply.TmdbID, reply.Title, reply.Year)
+	canSearch := "yes"
+	if !reply.CanSearch {
+		canSearch = "no (missing TVDB ID)"
+	}
+	tvdb := "-"
+	if reply.TvdbID != 0 {
+		tvdb = strconv.Itoa(reply.TvdbID)
+	}
+	fmt.Printf("tvdb:%s   can-search: %s\n", tvdb, canSearch)
+	fmt.Printf("status:      %s\n", reply.Status)
+	if reply.AddedAt != "" {
+		added := reply.AddedAt
+		if len(added) > 10 {
+			added = added[:10]
+		}
+		fmt.Printf("added:       %s\n", added)
+	}
+
+	fmt.Printf("\nepisodes: total=%d  wanted=%d  downloaded=%d", reply.EpisodeTotal, reply.EpisodeWanted, reply.EpisodeHave)
+	if reply.EpisodeFailed > 0 {
+		fmt.Printf("  failed=%d", reply.EpisodeFailed)
+	}
+	fmt.Println()
+
+	// Season breakdown.
+	if len(reply.Seasons) > 0 {
+		fmt.Println()
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "SEASON\tMON\tTOTAL\tWANTED\tHAVE")
+		for _, sm := range reply.Seasons {
+			mon := "--"
+			if sm.Monitored > 0 {
+				mon = "[x]"
+			}
+			fmt.Fprintf(w, "S%02d\t%s\t%d\t%d\t%d\n", sm.Season, mon, sm.Total, sm.Wanted, sm.Completed)
+		}
+		w.Flush()
+	}
+
+	// Active downloads.
+	if len(reply.ActiveDownloads) > 0 {
+		status := "active"
+		failCount := 0
+		for _, d := range reply.ActiveDownloads {
+			if d.Status == "failed" {
+				failCount++
+			}
+		}
+		if failCount == len(reply.ActiveDownloads) {
+			status = fmt.Sprintf("%d failed", failCount)
+		} else if failCount > 0 {
+			status = fmt.Sprintf("%d active, %d failed", len(reply.ActiveDownloads)-failCount, failCount)
+		}
+		fmt.Printf("\nactive downloads: %s\n", status)
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\tTITLE\tSTATUS\tPROGRESS\tERROR")
+		for _, d := range reply.ActiveDownloads {
+			id := mediaTag(d.Category, d.TmdbID, d.Season, d.EpisodeNum, d.MediaID)
+			errMsg := ""
+			if d.ErrorMsg.Valid && d.ErrorMsg.String != "" {
+				errMsg = d.ErrorMsg.String
+				if len(errMsg) > 50 {
+					errMsg = errMsg[:50] + "..."
+				}
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%.0f%%\t%s\n", id, d.Title, d.Status, d.Progress, errMsg)
+		}
+		w.Flush()
+	}
+
+	// History.
+	if len(reply.History) > 0 {
+		fmt.Printf("\nhistory (last %d):\n", len(reply.History))
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "EVENT\tSOURCE\tTIME")
+		for _, h := range reply.History {
+			source := ""
+			if h.Source.Valid {
+				source = h.Source.String
+			}
+			createdAt := ""
+			if h.CreatedAt.Valid {
+				createdAt = h.CreatedAt.String
+				if len(createdAt) > 16 {
+					createdAt = createdAt[:16]
+				}
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\n", h.Event, source, createdAt)
+		}
+		w.Flush()
+	}
+
+	return nil
+}
+
+func runSearchTrigger(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	tmdbID, _ := cmd.Flags().GetInt("tmdb")
+	season, _ := cmd.Flags().GetInt("season")
+	episode, _ := cmd.Flags().GetInt("episode")
+
+	rpcArgs := &daemon.ForceSearchArgs{
+		TmdbID:  tmdbID,
+		Season:  season,
+		Episode: episode,
+	}
+	if len(args) > 0 && tmdbID == 0 {
+		if id, err := strconv.Atoi(args[0]); err == nil {
+			rpcArgs.TmdbID = id
+		} else {
+			rpcArgs.Title = args[0]
+		}
+	}
+
+	var reply daemon.ForceSearchReply
+	if err := client.Call("Service.ForceSearch", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if reply.Count == 1 {
+		fmt.Println("triggered search for 1 item")
+	} else {
+		fmt.Printf("triggered search for %d wanted items\n", reply.Count)
+	}
+	return nil
+}
+
+// isPhaseLabel returns true if the error string is a post-processing phase label.
+func isPhaseLabel(s string) bool {
+	switch s {
+	case "par2 verify", "par2 repair", "rar extract", "importing", "cleanup":
+		return true
+	}
+	return false
+}
+
+func runSchedule(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	days, _ := cmd.Flags().GetInt("days")
+	rpcArgs := &daemon.ScheduleArgs{Days: days}
+	var reply daemon.ScheduleReply
+	if err := client.Call("Service.Schedule", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Episodes) == 0 {
+		fmt.Println("no upcoming episodes")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERIES\tS/E\tTITLE\tAIR DATE\tMON\tSTATUS")
+	for _, ep := range reply.Episodes {
+		se := fmt.Sprintf("S%02dE%02d", ep.Season, ep.Episode)
+		title := ""
+		if ep.Title.Valid {
+			title = ep.Title.String
+		}
+		airDate := "-"
+		if ep.AirDate.Valid {
+			airDate = ep.AirDate.String
+		}
+		mon := "--"
+		if ep.Monitored {
+			mon = "[x]"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", ep.SeriesTitle, se, title, airDate, mon, ep.Status)
+	}
+	return w.Flush()
 }
 
 func runLibraryImport(cmd *cobra.Command, args []string) error {

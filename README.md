@@ -39,7 +39,7 @@ TMDB IDs (the universal movie/TV identifier), and every list command outputs
 TMDB IDs as the first column so output can be piped into the next command. This
 makes UDL ideal for scripting and LLM agent workflows — no guessing, no
 interactive prompts, no internal database IDs, just TMDB IDs from search to
-grab to remove.
+grab to remove. Some commands also accept titles for convenience (e.g. `tv delete "Industry"`).
 
 **Workflow: search TMDB, then add by TMDB ID, then check releases — same ID throughout.**
 
@@ -85,9 +85,15 @@ udl tv search "Title"        # search TMDB for series
 udl tv add <tmdb-id>         # add by TMDB ID
 udl tv list                  # list series (shows TMDB IDs)
 udl tv remove <tmdb-id>      # remove from monitoring
-udl tv delete <tmdb-id>      # delete files for a series
+udl tv delete <title-or-id>  # delete files for a series, season, or episode
 udl tv monitor <tmdb-id>     # show/change season monitoring
 udl tv refresh               # refresh episode metadata from TMDB
+
+# Delete & re-download
+udl tv delete "Industry" -s 4 -e 8           # dry-run single episode
+udl tv delete "Industry" -s 4 -e 8 --execute # delete file, reset to wanted
+udl tv delete "Industry" -s 4 -e 8 --execute --search  # + blocklist old NZB & re-search
+udl tv delete "Industry" -s 4 --execute      # delete entire season
 
 # Queue & history
 udl queue                                    # show queue

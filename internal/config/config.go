@@ -19,6 +19,7 @@ type Config struct {
 	Indexers []Indexer        `toml:"indexers"`
 	TMDB     TMDBConfig       `toml:"tmdb"`
 	Plex     PlexConfig       `toml:"plex"`
+	Seerr    SeerrConfig      `toml:"seerr"`
 	Web      WebConfig        `toml:"web"`
 	Prefs    quality.Prefs    `toml:"-"` // populated after parsing from Quality strings
 }
@@ -82,6 +83,13 @@ type Indexer struct {
 	Name   string `toml:"name"`
 	URL    string `toml:"url"`
 	APIKey string `toml:"apikey"`
+}
+
+// SeerrConfig holds optional Seerr (Overseerr/Jellyseerr) integration settings.
+// When both URL and APIKey are set, UDL auto-approves pending requests.
+type SeerrConfig struct {
+	URL    string `toml:"url"`
+	APIKey string `toml:"api_key"`
 }
 
 // WebConfig holds optional web interface settings.

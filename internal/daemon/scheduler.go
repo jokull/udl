@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jokull/udl/internal/seerr"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
@@ -12,17 +13,19 @@ import (
 type Scheduler struct {
 	svc      *Service
 	tmdb     *tmdb.Client
+	seerr    *seerr.Client // nil if Seerr integration is disabled
 	stop     chan struct{}
 	stopOnce sync.Once
 }
 
 // NewScheduler creates a scheduler that shares the Service's searcher, DB,
 // and plex client.
-func NewScheduler(svc *Service, tc *tmdb.Client) *Scheduler {
+func NewScheduler(svc *Service, tc *tmdb.Client, sc *seerr.Client) *Scheduler {
 	return &Scheduler{
-		svc:  svc,
-		tmdb: tc,
-		stop: make(chan struct{}),
+		svc:   svc,
+		tmdb:  tc,
+		seerr: sc,
+		stop:  make(chan struct{}),
 	}
 }
 
@@ -31,6 +34,9 @@ func (s *Scheduler) Start(ctx context.Context) {
 	go s.episodeSearchLoop(ctx)
 	go s.searchLoop(ctx)
 	go s.refreshLoop(ctx)
+	if s.seerr != nil {
+		go s.seerrApproveLoop(ctx)
+	}
 }
 
 // Stop signals the scheduler to stop. Safe to call multiple times.
@@ -255,4 +261,47 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 	}
 
 	return result
+}
+
+// seerrApproveLoop periodically auto-approves pending Seerr requests.
+func (s *Scheduler) seerrApproveLoop(ctx context.Context) {
+	s.runSeerrApprove()
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			s.runSeerrApprove()
+		}
+	}
+}
+
+// runSeerrApprove fetches pending requests from Seerr and approves them.
+func (s *Scheduler) runSeerrApprove() {
+	pending, err := s.seerr.PendingRequests()
+	if err != nil {
+		s.svc.log.Error("seerr: failed to fetch pending requests", "error", err)
+		return
+	}
+
+	if len(pending) == 0 {
+		return
+	}
+
+	approved := 0
+	for _, r := range pending {
+		if err := s.seerr.Approve(r.ID); err != nil {
+			s.svc.log.Error("seerr: failed to approve request", "id", r.ID, "error", err)
+			continue
+		}
+		approved++
+	}
+
+	s.svc.log.Info("seerr: approved requests", "count", approved)
 }
