@@ -84,6 +84,8 @@ udl movie remove <tmdb-id>   # remove from monitoring
 udl tv search "Title"        # search TMDB for series
 udl tv add <tmdb-id>         # add by TMDB ID
 udl tv list                  # list series (shows TMDB IDs)
+udl tv releases <tmdb-id> -s 1 -e 1  # search indexers for episode releases
+udl tv grab <tmdb-id> -s 1 -e 1 <#>  # grab release # for an episode
 udl tv remove <tmdb-id>      # remove from monitoring
 udl tv delete <title-or-id>  # delete files for a series, season, or episode
 udl tv monitor <tmdb-id>     # show/change season monitoring
@@ -259,6 +261,10 @@ apikey = "key"
 [plex]
 token = "your-plex-token"  # optional, enables friend library checking + cleanup
 
+[seerr]
+url = "https://requests.example.com"  # optional, Overseerr/Jellyseerr URL
+apikey = "your-seerr-api-key"         # auto-approves requests and adds to UDL
+
 [web]
 port = 9876          # optional, enables web dashboard
 bind = "127.0.0.1"   # default: localhost only
@@ -310,7 +316,7 @@ No configurable naming templates. This is the way.
 ## Download Pipeline
 
 ```
-Search indexers → Score & filter releases → Fetch NZB
+Search indexers → Score & filter releases (or LLM pick) → Fetch NZB
   → NNTP segment download (connection pooling, retry, backoff)
   → yEnc decode → PAR2 verify/repair → RAR extract
   → Magic byte detection (handles obfuscated filenames)
@@ -335,7 +341,10 @@ go test ./internal/daemon/ -run TestLibrary -v    # library management tests
 - **CLI ↔ Daemon** via `net/rpc` over Unix socket
 - **Scheduler** runs air-date-driven episode search (every 2m) and movie search sweeps (every 6h)
 - **Plex integration** checks friend libraries before downloading (optional)
+- **Seerr integration** auto-approves Overseerr/Jellyseerr requests and adds them to the library
+- **LLM-assisted release selection** — when `codex` or `claude` CLI is in PATH, asks the LLM to pick the best release instead of pure score-ordering. Falls back to scoring when unavailable or on error
 - **Quality profiles:** 720p, 1080p (default), 4k, remux — each with min/preferred/upgrade tiers
+- **Original language tracking** — stores TMDB original language for movies and series, displayed in CLI and web UI
 
 ## Design Principles
 
