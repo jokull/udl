@@ -353,7 +353,7 @@ func (db *DB) WantedEpisodes() ([]Episode, error) {
 		 JOIN series s ON s.id = e.series_id
 		 WHERE e.status = 'wanted'
 		   AND e.monitored = 1
-		   AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
+		   AND e.air_date IS NOT NULL AND e.air_date != '' AND e.air_date <= date('now')
 		 ORDER BY s.title, e.season, e.episode`,
 	)
 	if err != nil {
@@ -441,7 +441,8 @@ func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
 //   - Aired today: eligible every 30 minutes
 //   - Aired 1-7 days ago: eligible every 2 hours
 //   - Aired 8-30 days ago: eligible every 6 hours
-//   - Aired 31+ days ago (or no air_date): eligible every 24 hours
+//   - Aired 31+ days ago: eligible every 24 hours
+//   - No air_date: excluded (unannounced episodes are not searched)
 //
 // Results are ordered by air_date DESC (most recently aired first) and limited.
 // Includes the series' tvdb_id in the join.
@@ -456,7 +457,7 @@ func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
 		JOIN series s ON s.id = e.series_id
 		WHERE e.status = 'wanted'
 		  AND e.monitored = 1
-		  AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
+		  AND e.air_date IS NOT NULL AND e.air_date != '' AND e.air_date <= date('now')
 		  AND (
 		    e.last_searched_at IS NULL
 		    OR (
@@ -466,12 +467,12 @@ func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
 		      OR (e.air_date >= date('now', '-7 days') AND e.air_date < date('now') AND e.last_searched_at < datetime('now', '-2 hours'))
 		      -- Aired 8-30 days ago: every 6 hours
 		      OR (e.air_date >= date('now', '-30 days') AND e.air_date < date('now', '-7 days') AND e.last_searched_at < datetime('now', '-6 hours'))
-		      -- Aired 31+ days ago or no air_date: every 24 hours
-		      OR ((e.air_date < date('now', '-30 days') OR e.air_date IS NULL OR e.air_date = '') AND e.last_searched_at < datetime('now', '-24 hours'))
+		      -- Aired 31+ days ago: every 24 hours
+		      OR (e.air_date < date('now', '-30 days') AND e.last_searched_at < datetime('now', '-24 hours'))
 		    )
 		  )
 		ORDER BY
-		  CASE WHEN e.air_date IS NULL OR e.air_date = '' THEN '1970-01-01' ELSE e.air_date END DESC
+		  e.air_date DESC
 		LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -1556,7 +1557,7 @@ func (db *DB) WantedItems() ([]WantedItem, error) {
 		JOIN series s ON s.id = e.series_id
 		WHERE e.status = 'wanted'
 		  AND e.monitored = 1
-		  AND (e.air_date IS NULL OR e.air_date = '' OR e.air_date <= date('now'))
+		  AND e.air_date IS NOT NULL AND e.air_date != '' AND e.air_date <= date('now')
 		ORDER BY 6 DESC`)
 	if err != nil {
 		return nil, err

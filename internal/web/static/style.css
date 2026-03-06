@@ -284,6 +284,24 @@ dd {
   margin-bottom: 0.3em;
 }
 
+/* ── Failed table ── */
+
+.failed-table { table-layout: fixed; }
+
+.error-truncate {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  cursor: pointer;
+  word-break: break-word;
+}
+
+.error-truncate.expanded {
+  -webkit-line-clamp: unset;
+  overflow: visible;
+}
+
 /* ── Status flip (hover to reveal action) ── */
 
 .status-flip {

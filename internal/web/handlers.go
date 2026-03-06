@@ -2,8 +2,10 @@ package web
 
 import (
 	"bytes"
+	"html/template"
 	"net/http"
 	"strconv"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -258,7 +260,7 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 
 	// Group by air date
 	type DayGroup struct {
-		Date     string
+		Date     template.HTML
 		Episodes []database.Episode
 	}
 	var days []DayGroup
@@ -266,15 +268,21 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	var dayOrder []string
 
 	for _, ep := range episodes {
-		date := "Unknown"
+		key := "Unknown"
+		var label template.HTML = "Unknown"
 		if ep.AirDate.Valid {
-			date = ep.AirDate.String
+			key = ep.AirDate.String
+			if t, err := time.Parse("2006-01-02", ep.AirDate.String); err == nil {
+				label = timeTag(t, fmtFriendlyDate(t))
+			} else {
+				label = template.HTML(template.HTMLEscapeString(ep.AirDate.String))
+			}
 		}
-		dg, ok := dayMap[date]
+		dg, ok := dayMap[key]
 		if !ok {
-			dg = &DayGroup{Date: date}
-			dayMap[date] = dg
-			dayOrder = append(dayOrder, date)
+			dg = &DayGroup{Date: label}
+			dayMap[key] = dg
+			dayOrder = append(dayOrder, key)
 		}
 		dg.Episodes = append(dg.Episodes, ep)
 	}

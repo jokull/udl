@@ -17,7 +17,7 @@
   <tr{{if not .Monitored}} class="unmonitored"{{end}}>
     <td>{{seasonEp .Season .Episode}}</td>
     <td>{{nullable .Title}}</td>
-    <td class="small">{{nullable .AirDate}}</td>
+    <td class="small">{{fmtDate .AirDate}}</td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td>{{nullable .Quality}}</td>
   </tr>

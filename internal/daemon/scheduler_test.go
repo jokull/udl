@@ -148,6 +148,32 @@ func TestSearchableEpisodes_FutureEpisode(t *testing.T) {
 	}
 }
 
+// TestSearchableEpisodes_NoAirDate verifies that episodes without air dates are excluded.
+func TestSearchableEpisodes_NoAirDate(t *testing.T) {
+	db, err := database.Open(":memory:")
+	if err != nil {
+		t.Fatalf("database.Open(:memory:): %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	seriesID, err := db.AddSeries(1, 100, "", "Unannounced Show", 2026, "")
+	if err != nil {
+		t.Fatalf("AddSeries: %v", err)
+	}
+	// Episode with no air date (announced but unaired).
+	if err := db.AddEpisode(seriesID, 2, 1, "TBA", ""); err != nil {
+		t.Fatalf("AddEpisode: %v", err)
+	}
+
+	episodes, err := db.SearchableEpisodes(10)
+	if err != nil {
+		t.Fatalf("SearchableEpisodes: %v", err)
+	}
+	if len(episodes) != 0 {
+		t.Errorf("expected 0 searchable episodes (no air_date excluded), got %d", len(episodes))
+	}
+}
+
 // TestSearchableEpisodes_OrderByAirDateDesc verifies results are ordered most recent first.
 func TestSearchableEpisodes_OrderByAirDateDesc(t *testing.T) {
 	s := newTestScheduler(t)

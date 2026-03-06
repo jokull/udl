@@ -113,6 +113,8 @@ func (s *Server) loadTemplates() error {
 		"fmtTime":         tplFmtTime,
 		"fmtNullTime":     tplFmtNullTime,
 		"fmtNullTimeStr":  tplFmtNullTimeStr,
+		"fmtDate":         tplFmtDate,
+		"fmtFriendlyDate": fmtFriendlyDate,
 		"fmtProgress":     tplFmtProgress,
 		"statusClass":     tplStatusClass,
 		"seasonEp":        tplSeasonEp,
@@ -278,29 +280,82 @@ func tplFmtNullBytes(nb sql.NullInt64) string {
 	return tplFmtBytes(nb.Int64)
 }
 
-func tplFmtTime(t time.Time) string {
+func timeTag(t time.Time, display string) template.HTML {
+	return template.HTML(fmt.Sprintf(`<time datetime="%s">%s</time>`, t.Format(time.RFC3339), template.HTMLEscapeString(display)))
+}
+
+func tplFmtTime(t time.Time) template.HTML {
 	if t.IsZero() {
 		return "—"
 	}
-	return humanize.Time(t)
+	return timeTag(t, humanize.Time(t))
 }
 
-func tplFmtNullTime(nt sql.NullTime) string {
+func tplFmtNullTime(nt sql.NullTime) template.HTML {
 	if !nt.Valid {
 		return "—"
 	}
 	return tplFmtTime(nt.Time)
 }
 
-func tplFmtNullTimeStr(ns sql.NullString) string {
+func parseTimeStr(s string) (time.Time, bool) {
+	for _, layout := range []string{
+		"2006-01-02 15:04:05",
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func tplFmtNullTimeStr(ns sql.NullString) template.HTML {
 	if !ns.Valid || ns.String == "" {
 		return "—"
 	}
-	t, err := time.Parse("2006-01-02 15:04:05", ns.String)
-	if err != nil {
-		return ns.String
+	t, ok := parseTimeStr(ns.String)
+	if !ok {
+		return template.HTML(template.HTMLEscapeString(ns.String))
 	}
-	return humanize.Time(t)
+	return timeTag(t, humanize.Time(t))
+}
+
+func tplFmtDate(ns sql.NullString) template.HTML {
+	if !ns.Valid || ns.String == "" {
+		return "—"
+	}
+	t, ok := parseTimeStr(ns.String)
+	if !ok {
+		return template.HTML(template.HTMLEscapeString(ns.String))
+	}
+	return timeTag(t, fmtFriendlyDate(t))
+}
+
+func fmtFriendlyDate(t time.Time) string {
+	now := time.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	d := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
+	diff := int(d.Sub(today).Hours() / 24)
+	switch {
+	case diff == 0:
+		return "Today"
+	case diff == 1:
+		return "Tomorrow"
+	case diff == -1:
+		return "Yesterday"
+	case diff > 1 && diff <= 6:
+		return d.Weekday().String()
+	case diff >= -6 && diff < -1:
+		return fmt.Sprintf("Last %s", d.Weekday())
+	default:
+		if d.Year() == now.Year() {
+			return d.Format("Jan 2")
+		}
+		return d.Format("Jan 2, 2006")
+	}
 }
 
 func tplFmtProgress(p float64) string {

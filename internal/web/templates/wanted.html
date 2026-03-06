@@ -21,7 +21,7 @@
       {{if eq .Category "movie"}}<a href="/movies#movie-{{.MediaID}}">{{.Title}}</a>{{else}}<a href="/series/{{.SeriesID}}">{{.Title}}</a>{{end}}
       {{if (tmdbURL .Category .TmdbID)}}<a class="ext" href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
     </td>
-    <td class="small">{{nullable .AirDate}}</td>
+    <td class="small">{{fmtDate .AirDate}}</td>
     <td class="small">{{fmtNullTimeStr .LastSearchedAt}}</td>
     <td>
       <button class="btn-sm" hx-post="/wanted/search/{{.Category}}/{{.MediaID}}" hx-target="closest td" hx-swap="innerHTML">search</button>

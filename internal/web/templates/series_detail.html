@@ -11,12 +11,13 @@
 
 <p><span class="status {{statusClass .Series.Status}}">{{.Series.Status}}</span> · Added {{fmtNullTimeStr .Series.AddedAt}}</p>
 
+<div class="episodes-container">
 {{range .Seasons}}
 <div class="season-header">
   <h3>Season {{.Season}}</h3>
   <button class="btn btn-sm {{if .Monitored}}btn-active{{end}}"
     hx-post="/series/{{.SeriesID}}/season/{{.Season}}/toggle"
-    hx-target="body"
+    hx-target=".episodes-container"
     hx-swap="outerHTML"
     title="{{if .Monitored}}Unmonitor season{{else}}Monitor season{{end}}">
     {{if .Monitored}}Monitored{{else}}Unmonitored{{end}}
@@ -28,11 +29,12 @@
   <tr{{if not .Monitored}} class="unmonitored"{{end}}>
     <td>{{seasonEp .Season .Episode}}</td>
     <td>{{nullable .Title}}</td>
-    <td class="small">{{nullable .AirDate}}</td>
+    <td class="small">{{fmtDate .AirDate}}</td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td>{{nullable .Quality}}</td>
   </tr>
   {{end}}
 </table>
 {{end}}
+</div>
 {{end}}
