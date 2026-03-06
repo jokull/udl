@@ -867,6 +867,11 @@ func (d *Downloader) completeDownload(item database.QueueItem, q quality.Quality
 	}
 
 	d.svc.log.Info("download completed", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "path", dstPath)
+
+	if d.svc.plex != nil {
+		go d.svc.plex.ScanLibrary(item.Category)
+	}
+
 	return nil
 }
 

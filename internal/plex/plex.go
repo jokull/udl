@@ -466,6 +466,42 @@ func (c *Client) GetDownloadInfo(match MediaMatch) (*DownloadInfo, error) {
 	}, nil
 }
 
+// ScanLibrary triggers a library scan on the owned Plex server for the given
+// media type ("movie" or "episode"/"tv"). This notifies Plex to pick up newly
+// imported files. Uses a partial scan when possible.
+func (c *Client) ScanLibrary(category string) {
+	srv, err := c.DiscoverOwnedServer()
+	if err != nil {
+		return
+	}
+	sections, err := c.LibrarySections(*srv)
+	if err != nil {
+		return
+	}
+
+	wantType := "movie"
+	if category == "episode" || category == "tv" {
+		wantType = "show"
+	}
+
+	for _, sec := range sections {
+		if sec.Type == wantType {
+			scanURL := fmt.Sprintf("%s/library/sections/%s/refresh", srv.URI, sec.Key)
+			req, err := http.NewRequest("GET", scanURL, nil)
+			if err != nil {
+				return
+			}
+			c.setServerHeaders(req, srv.AccessToken)
+			resp, err := c.httpClient.Do(req)
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+			return
+		}
+	}
+}
+
 // ClearEpisodeCache clears the episode cache. Called between search sweeps.
 func (c *Client) ClearEpisodeCache() {
 	c.mu.Lock()
