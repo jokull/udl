@@ -83,6 +83,7 @@ type Episode struct {
 type QueueItem struct {
 	MediaID         int64
 	TmdbID          int            // TMDB ID: movie tmdb_id or series tmdb_id (for episodes)
+	SeriesID        int64          // series_id for episodes, 0 for movies
 	Category        string         // "movie" or "episode"
 	Title           string         // display title (computed in query)
 	Season          int            // episode season (0 for movies)
@@ -119,9 +120,10 @@ type History struct {
 	Quality  sql.NullString
 	CreatedAt sql.NullString
 	// Populated by joins — not stored in history table.
-	TmdbID     int // movie tmdb_id or series tmdb_id (for episodes)
-	Season     int // episode season (0 for movies)
-	EpisodeNum int // episode number (0 for movies)
+	TmdbID     int   // movie tmdb_id or series tmdb_id (for episodes)
+	SeriesID   int64 // series_id for episodes, 0 for movies
+	Season     int   // episode season (0 for movies)
+	EpisodeNum int   // episode number (0 for movies)
 }
 
 // WantedItem is a unified view of a wanted movie or episode.

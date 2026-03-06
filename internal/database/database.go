@@ -673,6 +673,7 @@ func (db *DB) ListHistory(limit int) ([]History, error) {
 	rows, err := db.Query(`
 		SELECT h.id, h.media_type, h.media_id, h.title, h.event, h.source, h.quality, h.created_at,
 		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
+		       COALESCE(e.series_id, 0),
 		       COALESCE(e.season, 0),
 		       COALESCE(e.episode, 0)
 		FROM history h
@@ -691,7 +692,7 @@ func (db *DB) ListHistory(limit int) ([]History, error) {
 		var h History
 		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
 			&h.Source, &h.Quality, &h.CreatedAt,
-			&h.TmdbID, &h.Season, &h.EpisodeNum); err != nil {
+			&h.TmdbID, &h.SeriesID, &h.Season, &h.EpisodeNum); err != nil {
 			return nil, err
 		}
 		events = append(events, h)
@@ -708,6 +709,7 @@ func (db *DB) ListHistoryFiltered(mediaType, event string, limit int) ([]History
 	query := `
 		SELECT h.id, h.media_type, h.media_id, h.title, h.event, h.source, h.quality, h.created_at,
 		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
+		       COALESCE(e.series_id, 0),
 		       COALESCE(e.season, 0),
 		       COALESCE(e.episode, 0)
 		FROM history h
@@ -742,7 +744,7 @@ func (db *DB) ListHistoryFiltered(mediaType, event string, limit int) ([]History
 		var h History
 		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
 			&h.Source, &h.Quality, &h.CreatedAt,
-			&h.TmdbID, &h.Season, &h.EpisodeNum); err != nil {
+			&h.TmdbID, &h.SeriesID, &h.Season, &h.EpisodeNum); err != nil {
 			return nil, err
 		}
 		events = append(events, h)
@@ -758,6 +760,7 @@ func (db *DB) ListHistoryForMedia(mediaType string, mediaID int64, limit int) ([
 	rows, err := db.Query(`
 		SELECT h.id, h.media_type, h.media_id, h.title, h.event, h.source, h.quality, h.created_at,
 		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
+		       COALESCE(e.series_id, 0),
 		       COALESCE(e.season, 0),
 		       COALESCE(e.episode, 0)
 		FROM history h
@@ -776,7 +779,7 @@ func (db *DB) ListHistoryForMedia(mediaType string, mediaID int64, limit int) ([
 		var h History
 		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
 			&h.Source, &h.Quality, &h.CreatedAt,
-			&h.TmdbID, &h.Season, &h.EpisodeNum); err != nil {
+			&h.TmdbID, &h.SeriesID, &h.Season, &h.EpisodeNum); err != nil {
 			return nil, err
 		}
 		events = append(events, h)
@@ -792,6 +795,7 @@ func (db *DB) ListHistoryForSeries(seriesID int64, limit int) ([]History, error)
 	rows, err := db.Query(`
 		SELECT h.id, h.media_type, h.media_id, h.title, h.event, h.source, h.quality, h.created_at,
 		       COALESCE(s.tmdb_id, 0),
+		       COALESCE(e.series_id, 0),
 		       COALESCE(e.season, 0),
 		       COALESCE(e.episode, 0)
 		FROM history h
@@ -809,7 +813,7 @@ func (db *DB) ListHistoryForSeries(seriesID int64, limit int) ([]History, error)
 		var h History
 		if err := rows.Scan(&h.ID, &h.MediaType, &h.MediaID, &h.Title, &h.Event,
 			&h.Source, &h.Quality, &h.CreatedAt,
-			&h.TmdbID, &h.Season, &h.EpisodeNum); err != nil {
+			&h.TmdbID, &h.SeriesID, &h.Season, &h.EpisodeNum); err != nil {
 			return nil, err
 		}
 		events = append(events, h)
@@ -1304,7 +1308,7 @@ func (db *DB) EnqueueDownload(category string, mediaID int64, nzbURL, nzbName st
 // Results are ordered: post_processing first, then downloading, then queued.
 func (db *DB) PendingMedia() ([]QueueItem, error) {
 	rows, err := db.Query(`
-		SELECT m.id, m.tmdb_id, 'movie' as category,
+		SELECT m.id, m.tmdb_id, 0, 'movie' as category,
 		       m.title || ' (' || m.year || ')' as display_title,
 		       0, 0,
 		       m.status, m.nzb_url, m.nzb_name, m.download_progress,
@@ -1312,7 +1316,7 @@ func (db *DB) PendingMedia() ([]QueueItem, error) {
 		       m.download_source, m.download_started_at, m.added_at
 		FROM movies m WHERE m.status IN ('queued','downloading','post_processing')
 		UNION ALL
-		SELECT e.id, s.tmdb_id, 'episode',
+		SELECT e.id, s.tmdb_id, e.series_id, 'episode',
 		       s.title || ' S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode),
 		       e.season, e.episode,
 		       e.status, e.nzb_url, e.nzb_name, e.download_progress,
@@ -1328,7 +1332,7 @@ func (db *DB) PendingMedia() ([]QueueItem, error) {
 	var items []QueueItem
 	for rows.Next() {
 		var qi QueueItem
-		if err := rows.Scan(&qi.MediaID, &qi.TmdbID, &qi.Category, &qi.Title,
+		if err := rows.Scan(&qi.MediaID, &qi.TmdbID, &qi.SeriesID, &qi.Category, &qi.Title,
 			&qi.Season, &qi.EpisodeNum,
 			&qi.Status, &qi.NzbURL, &qi.NzbName, &qi.Progress, &qi.SizeBytes,
 			&qi.DownloadedBytes, &qi.ErrorMsg, &qi.Source, &qi.StartedAt,
@@ -1361,7 +1365,7 @@ func (db *DB) QueueItems(limit int) ([]QueueItem, error) {
 		limit = 100
 	}
 	rows, err := db.Query(`
-		SELECT m.id, m.tmdb_id, 'movie' as category,
+		SELECT m.id, m.tmdb_id, 0, 'movie' as category,
 		       m.title || ' (' || m.year || ')' as display_title,
 		       0, 0,
 		       m.status, m.nzb_url, m.nzb_name, m.download_progress,
@@ -1369,7 +1373,7 @@ func (db *DB) QueueItems(limit int) ([]QueueItem, error) {
 		       m.download_source, m.download_started_at, m.added_at
 		FROM movies m WHERE m.status IN ('queued','downloading','post_processing','failed')
 		UNION ALL
-		SELECT e.id, s.tmdb_id, 'episode',
+		SELECT e.id, s.tmdb_id, e.series_id, 'episode',
 		       s.title || ' S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode),
 		       e.season, e.episode,
 		       e.status, e.nzb_url, e.nzb_name, e.download_progress,
@@ -1385,7 +1389,7 @@ func (db *DB) QueueItems(limit int) ([]QueueItem, error) {
 	var items []QueueItem
 	for rows.Next() {
 		var qi QueueItem
-		if err := rows.Scan(&qi.MediaID, &qi.TmdbID, &qi.Category, &qi.Title,
+		if err := rows.Scan(&qi.MediaID, &qi.TmdbID, &qi.SeriesID, &qi.Category, &qi.Title,
 			&qi.Season, &qi.EpisodeNum,
 			&qi.Status, &qi.NzbURL, &qi.NzbName, &qi.Progress, &qi.SizeBytes,
 			&qi.DownloadedBytes, &qi.ErrorMsg, &qi.Source, &qi.StartedAt,
@@ -1662,7 +1666,7 @@ func (db *DB) CompleteDownloadTx(category string, mediaID int64, title, nzbName,
 // FailedMediaItems returns category + media_id pairs for all failed media items.
 func (db *DB) FailedMediaItems() ([]QueueItem, error) {
 	rows, err := db.Query(`
-		SELECT m.id, m.tmdb_id, 'movie' as category,
+		SELECT m.id, m.tmdb_id, 0, 'movie' as category,
 		       m.title || ' (' || m.year || ')' as display_title,
 		       0, 0,
 		       m.status, m.nzb_url, m.nzb_name, m.download_progress,
@@ -1670,7 +1674,7 @@ func (db *DB) FailedMediaItems() ([]QueueItem, error) {
 		       m.download_source, m.download_started_at, m.added_at
 		FROM movies m WHERE m.status = 'failed'
 		UNION ALL
-		SELECT e.id, s.tmdb_id, 'episode',
+		SELECT e.id, s.tmdb_id, e.series_id, 'episode',
 		       s.title || ' S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode),
 		       e.season, e.episode,
 		       e.status, e.nzb_url, e.nzb_name, e.download_progress,
@@ -1686,7 +1690,7 @@ func (db *DB) FailedMediaItems() ([]QueueItem, error) {
 	var items []QueueItem
 	for rows.Next() {
 		var qi QueueItem
-		if err := rows.Scan(&qi.MediaID, &qi.TmdbID, &qi.Category, &qi.Title,
+		if err := rows.Scan(&qi.MediaID, &qi.TmdbID, &qi.SeriesID, &qi.Category, &qi.Title,
 			&qi.Season, &qi.EpisodeNum,
 			&qi.Status, &qi.NzbURL, &qi.NzbName, &qi.Progress, &qi.SizeBytes,
 			&qi.DownloadedBytes, &qi.ErrorMsg, &qi.Source, &qi.StartedAt,

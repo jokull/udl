@@ -14,7 +14,8 @@
     {{range .Episodes}}
     <tr>
       <td>
-        {{if .SeriesTmdbID}}<a href="{{tmdbURL "tv" .SeriesTmdbID}}" target="_blank" rel="noopener">{{.SeriesTitle}}</a>{{else}}{{.SeriesTitle}}{{end}}
+        <a href="/series/{{.SeriesID}}">{{.SeriesTitle}}</a>
+        {{if .SeriesTmdbID}}<a class="ext" href="{{tmdbURL "tv" .SeriesTmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
       </td>
       <td>{{seasonEp .Season .Episode}}</td>
       <td>{{nullable .Title}}</td>

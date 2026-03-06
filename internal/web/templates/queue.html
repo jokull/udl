@@ -25,8 +25,8 @@
   {{range .Queue}}
   <tr>
     <td>
-      {{if .TmdbID}}<a href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
-      <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
+      {{$url := mediaURL .Category .MediaID .SeriesID}}{{if $url}}<a href="{{$url}}">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+      {{if .TmdbID}}<a class="ext" href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
     </td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td class="small">{{fmtSource .Source .NzbName .NzbURL}}</td>
@@ -55,8 +55,8 @@
   {{range .Failed}}
   <tr>
     <td>
-      {{if .TmdbID}}<a href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
-      <a class="ext" href="{{if eq .Category "movie"}}/movies{{else}}/series{{end}}">{{.Category}}</a>
+      {{$url := mediaURL .Category .MediaID .SeriesID}}{{if $url}}<a href="{{$url}}">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+      {{if .TmdbID}}<a class="ext" href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
     </td>
     <td class="small"><span class="error-truncate" onclick="this.classList.toggle('expanded')">{{nullable .ErrorMsg}}</span></td>
     <td class="small">{{fmtNullTimeStr .AddedAt}}</td>

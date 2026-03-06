@@ -13,7 +13,8 @@
     <td class="small">{{fmtNullTimeStr .CreatedAt}}</td>
     <td>{{.MediaType}}</td>
     <td>
-      {{if .TmdbID}}<a href="{{tmdbURL .MediaType .TmdbID}}" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+      {{$url := mediaURL .MediaType .MediaID .SeriesID}}{{if $url}}<a href="{{$url}}">{{.Title}}</a>{{else}}{{.Title}}{{end}}
+      {{if .TmdbID}}<a class="ext" href="{{tmdbURL .MediaType .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
     </td>
     <td><span class="status {{statusClass .Event}}">{{.Event}}</span></td>
     <td>{{nullable .Quality}}</td>

@@ -143,6 +143,15 @@ func (s *Server) loadTemplates() error {
 			}
 			return fmt.Sprintf("https://www.themoviedb.org/tv/%d", tmdbID)
 		},
+		"mediaURL": func(category string, mediaID int64, seriesID int64) string {
+			if category == "movie" {
+				return fmt.Sprintf("/movies#movie-%d", mediaID)
+			}
+			if seriesID > 0 {
+				return fmt.Sprintf("/series/%d", seriesID)
+			}
+			return ""
+		},
 	}
 
 	layoutBytes, err := templateFS.ReadFile("templates/layout.html")
