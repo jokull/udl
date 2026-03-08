@@ -454,7 +454,7 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 	}
 	nzbURL := item.NzbURL.String
 
-	nzbData, err := d.fetchNZB(nzbURL)
+	nzbData, err := d.fetchNZB(ctx, nzbURL)
 	if err != nil {
 		return d.failAndRetry(item, fmt.Sprintf("fetch NZB: %v", err))
 	}
@@ -708,7 +708,7 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 	}
 	nzbURL := item.NzbURL.String
 
-	nzbData, err := d.fetchNZB(nzbURL)
+	nzbData, err := d.fetchNZB(ctx, nzbURL)
 	if err != nil {
 		return d.failAndRetry(item, fmt.Sprintf("fetch NZB: %v", err))
 	}
@@ -1108,8 +1108,16 @@ func (d *Downloader) failAndRetry(item database.QueueItem, msg string, cleanupDi
 	grabbed, searchErr := d.retrySearch(item)
 	if searchErr != nil {
 		d.svc.log.Error("failAndRetry: re-search failed", "title", item.Title, "error", searchErr)
+		if isRetryable(searchErr) {
+			// Transient indexer/network issue: don't consume retry budget.
+			d.retryMu.Lock()
+			if d.retryCount[key] > 0 {
+				d.retryCount[key]--
+			}
+			d.retryMu.Unlock()
+		}
 		_ = d.svc.db.SetMediaDownloadError(item.Category, item.MediaID,
-			fmt.Sprintf("re-search failed: %v", searchErr))
+			formatClassifiedError("re-search failed", searchErr))
 		return failErr
 	}
 
@@ -1193,7 +1201,10 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 	// b) Indexers — lightweight caps check with 5s timeout.
 	for _, idx := range d.indexers {
 		name := "indexer:" + idx.Name
-		if err := idx.Caps(); err != nil {
+		capsCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := idx.CapsContext(capsCtx)
+		cancel()
+		if err != nil {
 			checks = append(checks, HealthCheck{
 				Name:    name,
 				Status:  "error",
@@ -1309,11 +1320,15 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 	return checks
 }
 
-// fetchNZB downloads the NZB file from the given URL.
+// fetchNZB downloads the NZB file from the given URL with context cancellation.
 // Uses a 30s timeout and limits response to 50MB to prevent resource exhaustion.
-func (d *Downloader) fetchNZB(nzbURL string) ([]byte, error) {
+func (d *Downloader) fetchNZB(ctx context.Context, nzbURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nzbURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build NZB request: %w", err)
+	}
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(nzbURL)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch NZB: %w", err)
 	}

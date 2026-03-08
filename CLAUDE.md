@@ -9,6 +9,7 @@ UDL (Usenet Download Layer) — a single Go binary replacing Sonarr + Radarr + N
 ```bash
 go build -o udl ./cmd/udl     # build
 go test ./... -count=1         # all tests
+go test -race ./... -count=1   # race detector
 ./udl daemon                   # start daemon (foreground)
 ./udl status                   # check daemon
 ./udl movie add "Title"        # add movie

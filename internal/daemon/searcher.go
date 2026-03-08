@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"fmt"
 	"net/mail"
 	"regexp"
@@ -51,13 +52,19 @@ type ScoredRelease struct {
 // Returns scored results sorted best-first.
 func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear int) ([]ScoredRelease, error) {
 	var all []ScoredRelease
+	var anySearchSucceeded bool
+	var lastErr error
 	err := s.withSearchPermit("SearchMovieReleases", func() error {
 		for _, client := range s.indexers {
-			releases, err := client.SearchMovie(imdbID)
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			releases, err := client.SearchMovieContext(ctx, imdbID)
+			cancel()
 			if err != nil {
 				s.log.Warn("search movie failed", "indexer", client.Name, "imdb", imdbID, "error", err)
+				lastErr = err
 				continue
 			}
+			anySearchSucceeded = true
 			s.log.Info("search movie results", "indexer", client.Name, "imdb", imdbID, "count", len(releases))
 
 			// Fall back to text search if IMDB search returned nothing.
@@ -75,11 +82,15 @@ func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear
 				if expectedYear > 0 {
 					query = fmt.Sprintf("%s %d", query, expectedYear)
 				}
-				releases, err = client.SearchMovieText(query)
+				ctx, cancel = context.WithTimeout(context.Background(), 12*time.Second)
+				releases, err = client.SearchMovieTextContext(ctx, query)
+				cancel()
 				if err != nil {
 					s.log.Warn("text search fallback failed", "indexer", client.Name, "query", query, "error", err)
+					lastErr = err
 					continue
 				}
+				anySearchSucceeded = true
 				s.log.Info("text search fallback results", "indexer", client.Name, "query", query, "count", len(releases))
 			}
 
@@ -109,6 +120,9 @@ func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear
 	if err != nil {
 		return nil, err
 	}
+	if !anySearchSucceeded && lastErr != nil {
+		return nil, wrapRetryClass(errorClass(lastErr), "search movie indexers", lastErr)
+	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Score > all[j].Score })
 	return all, nil
 }
@@ -117,14 +131,20 @@ func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear
 // Returns scored results sorted best-first.
 func (s *Service) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredRelease, error) {
 	var all []ScoredRelease
+	var anySearchSucceeded bool
+	var lastErr error
 	err := s.withSearchPermit("SearchEpisodeReleases", func() error {
 		for _, client := range s.indexers {
-			releases, err := client.SearchTV(tvdbID, season, episode)
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			releases, err := client.SearchTVContext(ctx, tvdbID, season, episode)
+			cancel()
 			if err != nil {
 				s.log.Warn("search episode failed", "indexer", client.Name,
 					"tvdb", tvdbID, "season", season, "episode", episode, "error", err)
+				lastErr = err
 				continue
 			}
+			anySearchSucceeded = true
 			s.log.Info("search episode results", "indexer", client.Name,
 				"tvdb", tvdbID, "season", season, "episode", episode, "count", len(releases))
 			for _, rel := range releases {
@@ -140,6 +160,9 @@ func (s *Service) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredRe
 	})
 	if err != nil {
 		return nil, err
+	}
+	if !anySearchSucceeded && lastErr != nil {
+		return nil, wrapRetryClass(errorClass(lastErr), "search episode indexers", lastErr)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Score > all[j].Score })
 	return all, nil
@@ -532,15 +555,24 @@ func (s *Service) SearchWantedMovies() error {
 		return fmt.Errorf("wanted movies: %w", err)
 	}
 
+	var firstErr error
 	for i := range movies {
 		grabbed, err := s.SearchAndGrabMovie(&movies[i])
 		if err != nil {
-			s.log.Error("search movie failed", "title", movies[i].Title, "error", err)
+			if isRetryable(err) {
+				s.log.Warn("search movie transient failure", "title", movies[i].Title, "error", err)
+			} else {
+				s.log.Error("search movie failed", "title", movies[i].Title, "error", err)
+			}
+			firstErr = err
 			continue
 		}
 		if grabbed {
 			s.log.Info("grabbed movie", "title", movies[i].Title)
 		}
+	}
+	if firstErr != nil {
+		return wrapRetryClass(errorClass(firstErr), "search wanted movies", firstErr)
 	}
 	return nil
 }

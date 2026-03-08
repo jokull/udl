@@ -593,7 +593,7 @@ func (s *Service) withSearchPermit(op string, fn func() error) error {
 		defer func() { <-s.searchSem }()
 		return fn()
 	case <-timer.C:
-		return fmt.Errorf("%s: search busy (concurrency limit %d)", op, cap(s.searchSem))
+		return wrapRetryable(op, fmt.Errorf("search busy (concurrency limit %d)", cap(s.searchSem)))
 	}
 }
 
@@ -1508,7 +1508,11 @@ func (s *Service) retryMedia(category string, mediaID int64) {
 		movie, err := s.db.GetMovie(mediaID)
 		if err == nil && movie != nil && movie.Status == "wanted" {
 			if _, err := s.SearchAndGrabMovie(movie); err != nil {
-				s.log.Error("retry: search movie failed", "title", movie.Title, "error", err)
+				if isRetryable(err) {
+					s.log.Warn("retry: transient movie search failure", "title", movie.Title, "error", err)
+				} else {
+					s.log.Error("retry: search movie failed", "title", movie.Title, "error", err)
+				}
 			}
 		}
 	case "episode":
@@ -1521,8 +1525,13 @@ func (s *Service) retryMedia(category string, mediaID int64) {
 					tvdbID = int(series.TvdbID.Int64)
 				}
 				if _, err := s.SearchAndGrabEpisode(ep, tvdbID); err != nil {
-					s.log.Error("retry: search episode failed",
-						"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
+					if isRetryable(err) {
+						s.log.Warn("retry: transient episode search failure",
+							"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
+					} else {
+						s.log.Error("retry: search episode failed",
+							"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
+					}
 				}
 			}
 		}

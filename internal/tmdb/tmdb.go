@@ -4,7 +4,9 @@ package tmdb
 
 import (
 	"fmt"
+	"net/http"
 	"strconv"
+	"time"
 
 	tmdblib "github.com/cyruzin/golang-tmdb"
 )
@@ -20,6 +22,7 @@ func New(apiKey string) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	api.SetClientConfig(http.Client{Timeout: 15 * time.Second})
 	return &Client{api: api}, nil
 }
 

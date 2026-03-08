@@ -103,16 +103,21 @@ func (s *Scheduler) runEpisodeSearch() {
 
 		ok, searchErr := s.svc.SearchAndGrabEpisode(&ep, tvdbID)
 		if searchErr != nil {
-			s.svc.log.Error("episode search: search failed",
-				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", searchErr)
+			if isRetryable(searchErr) {
+				s.svc.log.Warn("episode search: transient search failure",
+					"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", searchErr)
+			} else {
+				s.svc.log.Error("episode search: search failed",
+					"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", searchErr)
+			}
 		}
 		if ok {
 			grabbed++
 		}
 
-		// Only update searched_at when search completed without error,
-		// so the episode is retried sooner on failures.
-		if searchErr == nil {
+		// Update searched_at on success and non-retryable errors so we avoid
+		// immediate hammering for deterministic failures.
+		if searchErr == nil || !isRetryable(searchErr) {
 			if err := s.svc.db.UpdateEpisodeSearchedAt(ep.ID); err != nil {
 				s.svc.log.Error("episode search: update searched_at failed", "episode_id", ep.ID, "error", err)
 			}
@@ -151,6 +156,10 @@ func (s *Scheduler) runMovieSearchSweep() {
 		s.svc.plex.ClearEpisodeCache()
 	}
 	if err := s.svc.SearchWantedMovies(); err != nil {
+		if isRetryable(err) {
+			s.svc.log.Warn("movie search sweep: transient failure", "error", err)
+			return
+		}
 		s.svc.log.Error("movie search sweep: failed", "error", err)
 	}
 }

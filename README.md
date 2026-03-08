@@ -329,7 +329,10 @@ Stuck downloads (>2h) are auto-reset. Disk space is checked before starting (2x 
 ## Testing
 
 ```bash
+make test                                         # all tests
+make test-race                                    # race detector pass
 go test ./... -count=1                            # all tests
+go test -race ./... -count=1                      # race detector pass
 go test ./internal/parser/ -v                     # parser edge cases
 go test ./internal/daemon/ -run TestPipeline -v   # integration tests
 go test ./internal/daemon/ -run TestLibrary -v    # library management tests
