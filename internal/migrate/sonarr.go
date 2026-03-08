@@ -127,7 +127,7 @@ func RunSonarr(db *database.DB, tmdbClient *tmdb.Client, baseURL, apiKey string,
 
 		var seriesID int64
 		if execute {
-			seriesID, err = db.AddSeries(tmdbSeries.TMDBID, s.TvdbID, tmdbSeries.IMDBID, s.Title, s.Year, "")
+			seriesID, err = db.AddSeries(tmdbSeries.TMDBID, s.TvdbID, tmdbSeries.IMDBID, s.Title, s.Year, "", "")
 			if err != nil {
 				res.Errors = append(res.Errors, fmt.Sprintf("%s: add series: %v", s.Title, err))
 				continue

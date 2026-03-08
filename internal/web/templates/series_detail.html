@@ -9,7 +9,16 @@
   {{if .Series.ImdbID.Valid}}<a class="ext" href="https://www.imdb.com/title/{{.Series.ImdbID.String}}/" target="_blank" rel="noopener">imdb</a>{{end}}
 </h1>
 
-<p><span class="status {{statusClass .Series.Status}}">{{.Series.Status}}</span> · Added {{fmtNullTimeStr .Series.AddedAt}}</p>
+<p>
+  <span class="status {{statusClass .Series.Status}}">{{.Series.Status}}</span> · Added {{fmtNullTimeStr .Series.AddedAt}}
+  <button class="btn-sm" hx-post="/series/{{.Series.ID}}/remove" hx-confirm="Remove {{.Series.Title}} from monitoring?" hx-swap="none">remove series</button>
+  <button class="btn-sm" hx-post="/series/refresh" hx-swap="none">refresh metadata</button>
+  <span class="filter-tabs" style="display:inline-flex;margin-left:1em">
+    <button class="btn-sm" hx-post="/series/{{.Series.ID}}/monitor/all" hx-target=".episodes-container" hx-swap="outerHTML">Monitor All</button>
+    <button class="btn-sm" hx-post="/series/{{.Series.ID}}/monitor/latest" hx-target=".episodes-container" hx-swap="outerHTML">Latest Only</button>
+    <button class="btn-sm" hx-post="/series/{{.Series.ID}}/monitor/none" hx-target=".episodes-container" hx-swap="outerHTML">Unmonitor All</button>
+  </span>
+</p>
 
 <div class="episodes-container">
 {{range .Seasons}}
@@ -24,7 +33,7 @@
   </button>
 </div>
 <table>
-  <tr><th>Episode</th><th>Title</th><th>Air Date</th><th>Status</th><th>Quality</th></tr>
+  <tr><th>Episode</th><th>Title</th><th>Air Date</th><th>Status</th><th>Quality</th><th></th></tr>
   {{range .Episodes}}
   <tr{{if not .Monitored}} class="unmonitored"{{end}}>
     <td>{{seasonEp .Season .Episode}}</td>
@@ -32,6 +41,10 @@
     <td class="small">{{fmtDate .AirDate}}</td>
     <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td>{{nullable .Quality}}</td>
+    <td>
+      <a class="btn-sm" href="/releases/episode/{{.ID}}">releases</a>
+      {{if eq .Status "downloaded"}}<button class="btn-sm" hx-post="/episodes/{{.ID}}/delete" hx-target="closest td" hx-swap="innerHTML" hx-confirm="Delete file and reset to wanted?">delete file</button>{{end}}
+    </td>
   </tr>
   {{end}}
 </table>

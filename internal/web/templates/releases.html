@@ -1,0 +1,14 @@
+{{template "layout" .}}
+
+{{define "title"}} — Releases{{end}}
+
+{{define "content"}}
+<h1>Releases: {{.Title}} {{if .Year}}({{.Year}}){{end}}</h1>
+
+<div id="releases-content"
+     hx-get="/releases/{{.Category}}/{{.MediaID}}/search"
+     hx-trigger="load"
+     hx-swap="innerHTML">
+  <p class="muted">Searching indexers...</p>
+</div>
+{{end}}

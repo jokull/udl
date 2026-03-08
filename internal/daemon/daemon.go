@@ -10,6 +10,7 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,11 +30,22 @@ type Service struct {
 	cfg      *config.Config
 	db       *database.DB
 	tmdb     *tmdb.Client
-	plex     *plex.Client          // nil if Plex integration is disabled
+	plex     *plex.Client // nil if Plex integration is disabled
 	indexers []*newznab.Client
 	dl       *Downloader // nil until downloader starts; used for health checks
 	llmCLI   string      // path to codex or claude CLI, empty if unavailable
 	log      *slog.Logger
+
+	batchSearchMu      sync.Mutex
+	batchSearchRunning bool
+
+	// Test hooks for backpressure/concurrency integration tests.
+	searchWantedMoviesFn func() error
+	searchEpisodeFn      func(ep *database.Episode, tvdbID int) (bool, error)
+
+	searchSem            chan struct{}
+	searchAcquireTimeout time.Duration
+	searchSemOnce        sync.Once
 }
 
 // Empty is used for RPC methods with no meaningful args or reply.
@@ -205,7 +217,7 @@ type AddSeriesReply struct {
 	Year          int
 	TmdbID        int
 	EpisodeCount  int
-	Grabbed       int    // number of episodes immediately enqueued
+	Grabbed       int // number of episodes immediately enqueued
 	AlreadyExists bool
 	Status        string
 }
@@ -399,12 +411,12 @@ type MovieInfoReply struct {
 	CanSearch bool
 	AddedAt   string
 	// Download fields (when in queue).
-	NzbName    string
-	Progress   float64
-	SizeBytes  int64
-	Error      string
-	Source     string
-	StartedAt  string
+	NzbName   string
+	Progress  float64
+	SizeBytes int64
+	Error     string
+	Source    string
+	StartedAt string
 	// Related data.
 	History   []database.History
 	Blocklist []database.BlocklistEntry
@@ -418,13 +430,13 @@ type SeriesInfoArgs struct {
 
 // SeriesInfoReply contains full series details for investigation.
 type SeriesInfoReply struct {
-	TmdbID     int
-	TvdbID     int
-	Title      string
-	Year       int
-	Status     string
-	CanSearch  bool
-	AddedAt    string
+	TmdbID    int
+	TvdbID    int
+	Title     string
+	Year      int
+	Status    string
+	CanSearch bool
+	AddedAt   string
 	// Episode summary.
 	EpisodeTotal  int
 	EpisodeWanted int
@@ -497,6 +509,94 @@ func (s *Service) resolveSeries(tmdbID int, title string) (*database.Series, err
 	return nil, fmt.Errorf("TMDB ID or title is required")
 }
 
+func canonicalPath(p string) (string, error) {
+	if p == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	abs, err := filepath.Abs(filepath.Clean(p))
+	if err != nil {
+		return "", err
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return real, nil
+	}
+	if os.IsNotExist(err) {
+		return abs, nil
+	}
+	return "", err
+}
+
+func isWithinPath(root, target string) (bool, error) {
+	r, err := canonicalPath(root)
+	if err != nil {
+		return false, err
+	}
+	t, err := canonicalPath(target)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(r, t)
+	if err != nil {
+		return false, err
+	}
+	if rel == "." {
+		return true, nil
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// ensureLibraryPath validates that a file or directory path is within one of
+// the configured library roots.
+func (s *Service) ensureLibraryPath(path string) error {
+	roots := []string{s.cfg.Library.Movies, s.cfg.Library.TV}
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		ok, err := isWithinPath(root, path)
+		if err != nil {
+			continue
+		}
+		if ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("path %q is outside configured library roots", path)
+}
+
+func (s *Service) initSearchLimiter() {
+	s.searchSemOnce.Do(func() {
+		concurrency := 3
+		if s.cfg != nil && s.cfg.Daemon.SearchConcurrency > 0 {
+			concurrency = s.cfg.Daemon.SearchConcurrency
+		}
+		if s.searchSem == nil {
+			s.searchSem = make(chan struct{}, concurrency)
+		}
+		if s.searchAcquireTimeout <= 0 {
+			s.searchAcquireTimeout = 2 * time.Second
+		}
+	})
+}
+
+func (s *Service) withSearchPermit(op string, fn func() error) error {
+	s.initSearchLimiter()
+	timer := time.NewTimer(s.searchAcquireTimeout)
+	defer timer.Stop()
+
+	select {
+	case s.searchSem <- struct{}{}:
+		defer func() { <-s.searchSem }()
+		return fn()
+	case <-timer.C:
+		return fmt.Errorf("%s: search busy (concurrency limit %d)", op, cap(s.searchSem))
+	}
+}
+
 // --- RPC methods ---
 
 // TMDBSearchMovie searches TMDB for movies and returns results for the user to pick from.
@@ -560,7 +660,7 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 		return fmt.Errorf("AddMovie: %w", err)
 	}
 
-	id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year, movie.OriginalLanguage)
+	id, err := s.db.AddMovie(movie.TMDBID, movie.IMDBID, movie.Title, movie.Year, movie.OriginalLanguage, movie.PosterPath)
 	if err != nil {
 		// Check if it already exists.
 		existing, findErr := s.db.FindMovieByTmdbID(movie.TMDBID)
@@ -643,19 +743,7 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 		return fmt.Errorf("SearchMovie: %w", err)
 	}
 
-	// Annotate releases with blocklist/history status.
-	for i := range releases {
-		if releases[i].Rejected {
-			continue
-		}
-		if blocked, _ := s.db.IsBlocklisted("movie", movie.ID, releases[i].Release.Title); blocked {
-			releases[i].Rejected = true
-			releases[i].RejectionReason = "blocklisted"
-		} else if imported, _ := s.db.IsCompletedInHistory("movie", movie.ID, releases[i].Release.Title); imported {
-			releases[i].Rejected = true
-			releases[i].RejectionReason = "already completed"
-		}
-	}
+	annotateRejections(s.db, "movie", movie.ID, releases)
 
 	existing := existingQualityFromDB(s.db, "movie", movie.ID)
 	if existing != quality.Unknown {
@@ -665,7 +753,6 @@ func (s *Service) SearchMovie(args *SearchMovieArgs, reply *SearchMovieReply) er
 	reply.Results = releases
 	return nil
 }
-
 
 // GrabMovieRelease searches indexers for a movie in the DB and grabs the release
 // at the given 1-based index. The movie must already exist in the database.
@@ -762,18 +849,7 @@ func (s *Service) SearchEpisode(args *SearchEpisodeArgs, reply *SearchEpisodeRep
 	// Look up the specific episode for annotations.
 	ep, _ := s.db.FindEpisode(series.ID, args.Season, args.Episode)
 	if ep != nil {
-		for i := range releases {
-			if releases[i].Rejected {
-				continue
-			}
-			if blocked, _ := s.db.IsBlocklisted("episode", ep.ID, releases[i].Release.Title); blocked {
-				releases[i].Rejected = true
-				releases[i].RejectionReason = "blocklisted"
-			} else if imported, _ := s.db.IsCompletedInHistory("episode", ep.ID, releases[i].Release.Title); imported {
-				releases[i].Rejected = true
-				releases[i].RejectionReason = "already completed"
-			}
-		}
+		annotateRejections(s.db, "episode", ep.ID, releases)
 		existing := existingQualityFromDB(s.db, "episode", ep.ID)
 		if existing != quality.Unknown {
 			reply.ExistingQuality = existing.String()
@@ -914,6 +990,9 @@ func (s *Service) MovieDelete(args *MovieDeleteArgs, reply *MovieDeleteReply) er
 
 	if args.Execute {
 		movieDir := filepath.Dir(movie.FilePath.String)
+		if err := s.ensureLibraryPath(movieDir); err != nil {
+			return fmt.Errorf("MovieDelete: refusing unsafe delete: %w", err)
+		}
 		if err := os.RemoveAll(movieDir); err != nil {
 			return fmt.Errorf("MovieDelete: failed to delete %s: %w", movieDir, err)
 		}
@@ -967,7 +1046,7 @@ func (s *Service) AddSeries(args *AddSeriesArgs, reply *AddSeriesReply) error {
 		return fmt.Errorf("AddSeries: %w", err)
 	}
 
-	id, err := s.db.AddSeries(series.TMDBID, series.TVDBID, series.IMDBID, series.Title, series.Year, series.OriginalLanguage)
+	id, err := s.db.AddSeries(series.TMDBID, series.TVDBID, series.IMDBID, series.Title, series.Year, series.OriginalLanguage, series.PosterPath)
 	if err != nil {
 		existing, findErr := s.db.FindSeriesByTmdbID(series.TMDBID)
 		if findErr != nil || existing == nil {
@@ -1096,14 +1175,22 @@ func (s *Service) ClearQueue(args *ClearQueueArgs, reply *ClearQueueReply) error
 }
 
 // PauseAll pauses all active downloads.
-// Currently a no-op stub.
 func (s *Service) PauseAll(args *Empty, reply *Empty) error {
+	if s.dl == nil {
+		return fmt.Errorf("PauseAll: downloader not initialized")
+	}
+	s.dl.Pause()
+	s.log.Info("downloads paused")
 	return nil
 }
 
 // ResumeAll resumes all paused downloads.
-// Currently a no-op stub.
 func (s *Service) ResumeAll(args *Empty, reply *Empty) error {
+	if s.dl == nil {
+		return fmt.Errorf("ResumeAll: downloader not initialized")
+	}
+	s.dl.Resume()
+	s.log.Info("downloads resumed")
 	return nil
 }
 
@@ -1268,7 +1355,9 @@ func (s *Service) RemoveMovie(args *RemoveMovieArgs, reply *RemoveMovieReply) er
 	// Delete movie folder from disk if file exists.
 	if !args.KeepFiles && movie.FilePath.Valid && movie.FilePath.String != "" {
 		movieDir := filepath.Dir(movie.FilePath.String)
-		if err := os.RemoveAll(movieDir); err != nil {
+		if err := s.ensureLibraryPath(movieDir); err != nil {
+			s.log.Warn("RemoveMovie: refusing unsafe delete", "path", movieDir, "error", err)
+		} else if err := os.RemoveAll(movieDir); err != nil {
 			s.log.Warn("RemoveMovie: failed to delete movie folder", "path", movieDir, "error", err)
 		} else {
 			s.log.Info("RemoveMovie: deleted movie folder", "path", movieDir)
@@ -1492,11 +1581,11 @@ type PlexCleanupArgs struct {
 
 // PlexCleanupItem describes a single media item considered for cleanup.
 type PlexCleanupItem struct {
-	MediaType     string   // "movie" or "season"
+	MediaType     string // "movie" or "season"
 	Title         string
 	Year          int
-	Season        int      // season number (0 for movies)
-	EpisodeCount  int      // number of episodes in this season group
+	Season        int // season number (0 for movies)
+	EpisodeCount  int // number of episodes in this season group
 	Quality       string
 	AddedDays     int      // days since added to Plex
 	SizeBytes     int64    // total size of files to delete
@@ -1706,8 +1795,8 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 	plexFiles := make(map[string]*plexFileInfo)
 
 	// Watch history maps: ratingKey → latest viewedAt, ratingKey → set of watcher names.
-	watchedByMap := make(map[string]map[string]bool)   // ratingKey → set of names
-	lastWatchedMap := make(map[string]int64)            // ratingKey → latest viewedAt
+	watchedByMap := make(map[string]map[string]bool) // ratingKey → set of names
+	lastWatchedMap := make(map[string]int64)         // ratingKey → latest viewedAt
 
 	for _, sec := range sections {
 		// Fetch watch history for this section.
@@ -2280,6 +2369,8 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 
 	// Start RPC server — created before downloader so it can be passed to NewDownloader.
 	svc := &Service{cfg: cfg, db: db, tmdb: tc, plex: plexClient, indexers: indexers, llmCLI: llmCLI, log: log}
+	svc.initSearchLimiter()
+	log.Info("search limiter configured", "concurrency", cap(svc.searchSem), "acquire_timeout", svc.searchAcquireTimeout)
 	dl := NewDownloader(svc, log)
 	svc.dl = dl
 	server := rpc.NewServer()
@@ -2308,7 +2399,9 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 			if category == "movie" {
 				if movie, err := db.GetMovie(mediaID); err == nil && movie.FilePath.Valid && movie.FilePath.String != "" {
 					movieDir := filepath.Dir(movie.FilePath.String)
-					if err := os.RemoveAll(movieDir); err != nil {
+					if err := svc.ensureLibraryPath(movieDir); err != nil {
+						log.Warn("evict: refusing unsafe delete", "path", movieDir, "error", err)
+					} else if err := os.RemoveAll(movieDir); err != nil {
 						log.Warn("evict: failed to delete movie folder", "path", movieDir, "error", err)
 					} else {
 						log.Info("evict: deleted movie folder", "path", movieDir)
@@ -2327,7 +2420,380 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 				_ = db.ClearWantedEpisodeSearchTimers()
 			}()
 		}
-		ws, err := web.New(db, cfg, log, retryFn, pauseFn, isPausedFn, evictFn, searchFn, searchAllFn)
+		// TMDB search callback: search both movies and TV, merge results.
+		tmdbSearchFn := func(query string) ([]web.TMDBResult, error) {
+			var results []web.TMDBResult
+			// Search movies
+			var movieReply TMDBSearchMovieReply
+			if err := svc.TMDBSearchMovie(&TMDBSearchMovieArgs{Query: query}, &movieReply); err == nil {
+				for _, m := range movieReply.Results {
+					exists := false
+					if existing, _ := db.FindMovieByTmdbID(m.TMDBID); existing != nil {
+						exists = true
+					}
+					results = append(results, web.TMDBResult{
+						TMDBID: m.TMDBID, Title: m.Title, Year: m.Year,
+						Category: "movie", Exists: exists,
+					})
+				}
+			}
+			// Search TV
+			var tvReply TMDBSearchSeriesReply
+			if err := svc.TMDBSearchSeries(&TMDBSearchSeriesArgs{Query: query}, &tvReply); err == nil {
+				for _, s := range tvReply.Results {
+					exists := false
+					if existing, _ := db.FindSeriesByTmdbID(s.TMDBID); existing != nil {
+						exists = true
+					}
+					results = append(results, web.TMDBResult{
+						TMDBID: s.TMDBID, Title: s.Title, Year: s.Year,
+						Category: "tv", Exists: exists,
+					})
+				}
+			}
+			return results, nil
+		}
+
+		// Add media callback.
+		addMediaFn := func(category string, tmdbID int) (string, error) {
+			if category == "movie" {
+				var reply AddMovieReply
+				if err := svc.AddMovie(&AddMovieArgs{TMDBID: tmdbID}, &reply); err != nil {
+					return "", err
+				}
+				if reply.AlreadyExists {
+					return "already exists", nil
+				}
+				if reply.Grabbed {
+					return "added, searching...", nil
+				}
+				return "added", nil
+			}
+			var reply AddSeriesReply
+			if err := svc.AddSeries(&AddSeriesArgs{TMDBID: tmdbID}, &reply); err != nil {
+				return "", err
+			}
+			if reply.AlreadyExists {
+				return "already exists", nil
+			}
+			return fmt.Sprintf("added (%d episodes)", reply.EpisodeCount), nil
+		}
+
+		// Search releases callback.
+		searchReleasesFn := func(category string, mediaID int64) ([]web.ReleaseRow, string, int, string, *web.PlexHit, error) {
+			var releases []ScoredRelease
+			var existingQuality string
+			var title string
+			var year int
+
+			if category == "movie" {
+				movie, err := db.GetMovie(mediaID)
+				if err != nil {
+					return nil, "", 0, "", nil, err
+				}
+				title = movie.Title
+				year = movie.Year
+				var reply SearchMovieReply
+				if err := svc.SearchMovie(&SearchMovieArgs{TmdbID: movie.TmdbID}, &reply); err != nil {
+					return nil, title, year, "", nil, err
+				}
+				releases = reply.Results
+				existingQuality = reply.ExistingQuality
+			} else {
+				ep, err := db.GetEpisode(mediaID)
+				if err != nil {
+					return nil, "", 0, "", nil, err
+				}
+				series, err := db.GetSeries(ep.SeriesID)
+				if err != nil {
+					return nil, "", 0, "", nil, err
+				}
+				title = fmt.Sprintf("%s S%02dE%02d", series.Title, ep.Season, ep.Episode)
+				year = series.Year
+				var reply SearchEpisodeReply
+				if err := svc.SearchEpisode(&SearchEpisodeArgs{
+					TmdbID: series.TmdbID, Season: ep.Season, Episode: ep.Episode,
+				}, &reply); err != nil {
+					return nil, title, year, "", nil, err
+				}
+				releases = reply.Results
+				existingQuality = reply.ExistingQuality
+			}
+
+			// Convert to web rows
+			rows := make([]web.ReleaseRow, len(releases))
+			for i, sr := range releases {
+				rows[i] = web.ReleaseRow{
+					Index:           i + 1, // 1-based for display
+					Title:           sr.Release.Title,
+					Quality:         sr.Quality.String(),
+					Size:            sr.Release.Size,
+					Age:             releaseAge(sr.Release.PubDate),
+					Indexer:         sr.Indexer,
+					Score:           sr.Score,
+					Rejected:        sr.Rejected,
+					RejectionReason: sr.RejectionReason,
+					NzbURL:          sr.Release.Link,
+					NzbName:         sr.Release.Title,
+				}
+			}
+
+			// Check Plex availability
+			var plexHit *web.PlexHit
+			if svc.plex != nil && category == "movie" {
+				movie, _ := db.GetMovie(mediaID)
+				if movie != nil {
+					imdbID := ""
+					if movie.ImdbID.Valid {
+						imdbID = movie.ImdbID.String
+					}
+					if found, match, err := svc.plex.HasMovie(movie.Title, movie.Year, imdbID, movie.TmdbID, quality.Unknown); err == nil && found && match != nil {
+						plexHit = &web.PlexHit{
+							ServerName: match.ServerName,
+							Quality:    match.Quality.String(),
+						}
+					}
+				}
+			}
+
+			return rows, title, year, existingQuality, plexHit, nil
+		}
+
+		// Grab release callback.
+		grabReleaseFn := func(category string, mediaID int64, nzbURL, nzbName, qualityStr string, size int64) (string, error) {
+			enqueued, err := db.EnqueueDownload(category, mediaID, nzbURL, nzbName, size, "usenet")
+			if err != nil {
+				return "", fmt.Errorf("enqueue: %w", err)
+			}
+			if !enqueued {
+				return "", fmt.Errorf("could not enqueue (may already be active or not in wanted/failed state)")
+			}
+			if err := db.AddHistory(category, mediaID, nzbName, "grabbed", nzbName, qualityStr); err != nil {
+				svc.log.Error("failed to record grab history", "error", err)
+			}
+			svc.log.Info("manual grab", "category", category, "id", mediaID, "release", nzbName, "quality", qualityStr)
+			return nzbName, nil
+		}
+
+		// Plex grab callback.
+		var grabPlexFn web.GrabPlexFunc
+		if svc.plex != nil {
+			grabPlexFn = func(category string, mediaID int64) (string, error) {
+				var ctx GrabContext
+				if category == "movie" {
+					movie, err := db.GetMovie(mediaID)
+					if err != nil {
+						return "", err
+					}
+					imdbID := ""
+					if movie.ImdbID.Valid {
+						imdbID = movie.ImdbID.String
+					}
+					ctx = GrabContext{
+						Category: "movie", MediaID: movie.ID, Title: movie.Title,
+						Year: movie.Year, ImdbID: imdbID, TmdbID: movie.TmdbID,
+					}
+				} else {
+					ep, err := db.GetEpisode(mediaID)
+					if err != nil {
+						return "", err
+					}
+					series, err := db.GetSeries(ep.SeriesID)
+					if err != nil {
+						return "", err
+					}
+					ctx = GrabContext{
+						Category: "episode", MediaID: ep.ID, Title: series.Title,
+						Season: ep.Season, Episode: ep.Episode, TmdbID: series.TmdbID,
+					}
+				}
+				grabbed, err := svc.grabFromPlex(ctx)
+				if err != nil {
+					return "", err
+				}
+				if !grabbed {
+					return "", fmt.Errorf("could not grab from plex")
+				}
+				return "grabbing from plex", nil
+			}
+		}
+
+		// LLM pick callback (nil if no LLM CLI available).
+		var llmPickFn web.LLMPickFunc
+		if svc.llmCLI != "" {
+			llmPickFn = func(category string, mediaID int64) <-chan string {
+				ch := make(chan string, 1)
+				go func() {
+					defer close(ch)
+					// Re-search to get current releases
+					var releases []ScoredRelease
+					var grabCtx GrabContext
+
+					if category == "movie" {
+						movie, err := db.GetMovie(mediaID)
+						if err != nil {
+							svc.log.Error("LLM pick: get movie", "id", mediaID, "err", err)
+							ch <- "Error: could not load movie"
+							return
+						}
+						imdbID := ""
+						if movie.ImdbID.Valid {
+							imdbID = movie.ImdbID.String
+						}
+						results, err := svc.SearchMovieReleases(imdbID, movie.Title, movie.Year)
+						if err != nil {
+							svc.log.Error("LLM pick: search movie releases", "title", movie.Title, "err", err)
+							ch <- "Error: indexer search failed"
+							return
+						}
+						if len(results) == 0 {
+							ch <- "No releases found"
+							return
+						}
+						releases = results
+						annotateRejections(db, "movie", movie.ID, releases)
+						grabCtx = GrabContext{
+							Category: "movie", MediaID: movie.ID, Title: movie.Title,
+							Year: movie.Year, ImdbID: imdbID, TmdbID: movie.TmdbID,
+							Existing: existingQualityFromDB(db, "movie", movie.ID),
+						}
+					} else {
+						ep, err := db.GetEpisode(mediaID)
+						if err != nil {
+							svc.log.Error("LLM pick: get episode", "id", mediaID, "err", err)
+							ch <- "Error: could not load episode"
+							return
+						}
+						series, err := db.GetSeries(ep.SeriesID)
+						if err != nil {
+							svc.log.Error("LLM pick: get series", "id", ep.SeriesID, "err", err)
+							ch <- "Error: could not load series"
+							return
+						}
+						tvdbID := 0
+						if series.TvdbID.Valid {
+							tvdbID = int(series.TvdbID.Int64)
+						}
+						results, err := svc.SearchEpisodeReleases(tvdbID, ep.Season, ep.Episode)
+						if err != nil {
+							svc.log.Error("LLM pick: search episode releases", "series", series.Title, "season", ep.Season, "episode", ep.Episode, "err", err)
+							ch <- "Error: indexer search failed"
+							return
+						}
+						if len(results) == 0 {
+							ch <- "No releases found"
+							return
+						}
+						releases = results
+						annotateRejections(db, "episode", ep.ID, releases)
+						grabCtx = GrabContext{
+							Category: "episode", MediaID: ep.ID, Title: series.Title,
+							Season: ep.Season, Episode: ep.Episode, TmdbID: series.TmdbID,
+							Existing: existingQualityFromDB(db, "episode", ep.ID),
+						}
+					}
+
+					idx, err := svc.LLMPickRelease(releases, grabCtx)
+					if err != nil {
+						svc.log.Error("LLM pick failed", "category", category, "id", mediaID, "err", err)
+						ch <- fmt.Sprintf("Error: %s", err)
+						return
+					}
+					if idx < 0 {
+						ch <- "SKIP — no acceptable release found."
+						return
+					}
+					ch <- fmt.Sprintf("Pick #%d — %s", idx+1, releases[idx].Release.Title)
+				}()
+				return ch
+			}
+		}
+
+		// Status callback.
+		statusFn := func() (*web.StatusData, error) {
+			var reply StatusReply
+			if err := svc.Status(&Empty{}, &reply); err != nil {
+				return nil, err
+			}
+			sd := &web.StatusData{
+				Running:       reply.Running,
+				QueueSize:     reply.QueueSize,
+				Downloading:   reply.Downloading,
+				FailedCount:   reply.FailedCount,
+				BlockedCount:  reply.BlockedCount,
+				IndexerCount:  reply.IndexerCount,
+				MovieCount:    reply.MovieCount,
+				SeriesCount:   reply.SeriesCount,
+				LibraryMovies: reply.LibraryMovies,
+				LibraryTV:     reply.LibraryTV,
+			}
+			for _, c := range reply.Checks {
+				sd.Checks = append(sd.Checks, web.HealthCheckData{
+					Name: c.Name, Status: c.Status, Message: c.Message,
+				})
+			}
+			return sd, nil
+		}
+
+		refreshSeriesFn := func() error {
+			var reply RefreshSeriesReply
+			return svc.RefreshSeries(&Empty{}, &reply)
+		}
+
+		movieDeleteFn := func(movieID int64, search bool) (string, error) {
+			movie, err := db.GetMovie(movieID)
+			if err != nil {
+				return "", err
+			}
+			args := &MovieDeleteArgs{TmdbID: movie.TmdbID, Execute: true, Search: search}
+			var reply MovieDeleteReply
+			if err := svc.MovieDelete(args, &reply); err != nil {
+				return "", err
+			}
+			if reply.Deleted {
+				return fmt.Sprintf("deleted %s", reply.FilePath), nil
+			}
+			return "reset to wanted", nil
+		}
+
+		tvDeleteFn := func(episodeID int64, search bool) (string, error) {
+			ep, err := db.GetEpisode(episodeID)
+			if err != nil {
+				return "", err
+			}
+			series, err := db.GetSeries(ep.SeriesID)
+			if err != nil {
+				return "", err
+			}
+			args := &TVDeleteArgs{
+				TmdbID:  series.TmdbID,
+				Season:  ep.Season,
+				Episode: ep.Episode,
+				Execute: true,
+				Search:  search,
+			}
+			var reply TVDeleteReply
+			if err := svc.TVDelete(args, &reply); err != nil {
+				return "", err
+			}
+			if len(reply.Items) > 0 && reply.Items[0].Deleted {
+				return "deleted", nil
+			}
+			return "reset to wanted", nil
+		}
+
+		ws, err := web.New(db, cfg, log, retryFn, pauseFn, isPausedFn, evictFn, searchFn, searchAllFn, web.Options{
+			TMDBSearch:     tmdbSearchFn,
+			AddMedia:       addMediaFn,
+			SearchReleases: searchReleasesFn,
+			GrabRelease:    grabReleaseFn,
+			GrabPlex:       grabPlexFn,
+			LLMPick:        llmPickFn,
+			RefreshSeries:  refreshSeriesFn,
+			MovieDelete:    movieDeleteFn,
+			TVDelete:       tvDeleteFn,
+			Status:         statusFn,
+		})
 		if err != nil {
 			ln.Close()
 			return fmt.Errorf("daemon: create web server: %w", err)
@@ -2346,6 +2812,9 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 			log.Info("web server started", "addr", fmt.Sprintf("%s:%d", cfg.Web.Bind, cfg.Web.Port))
 		}
 	}
+
+	// Backfill poster_path for existing movies and series.
+	go svc.backfillPosters()
 
 	// Start scheduler (episode search + movie search sweep + TMDB refresh).
 	sched := NewScheduler(svc, tc, seerrClient)
@@ -2375,6 +2844,63 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	dl.Stop()
 	ln.Close()
 	return nil
+}
+
+// backfillPosters fetches poster_path from TMDB for movies and series that
+// don't have one yet. Runs once on startup, skips failures.
+func (svc *Service) backfillPosters() {
+	if svc.tmdb == nil {
+		return
+	}
+	movies, err := svc.db.MoviesWithoutPoster()
+	if err != nil {
+		svc.log.Warn("backfill: failed to query movies without poster", "error", err)
+		return
+	}
+	var movieCount int
+	for _, m := range movies {
+		info, err := svc.tmdb.GetMovie(m.TmdbID)
+		if err != nil {
+			svc.log.Warn("backfill: TMDB movie lookup failed", "tmdb_id", m.TmdbID, "error", err)
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+		if info.PosterPath != "" {
+			if err := svc.db.UpdateMoviePoster(m.ID, info.PosterPath); err != nil {
+				svc.log.Warn("backfill: failed to update movie poster", "id", m.ID, "error", err)
+			} else {
+				movieCount++
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	series, err := svc.db.SeriesWithoutPoster()
+	if err != nil {
+		svc.log.Warn("backfill: failed to query series without poster", "error", err)
+		return
+	}
+	var seriesCount int
+	for _, s := range series {
+		info, err := svc.tmdb.GetSeries(s.TmdbID)
+		if err != nil {
+			svc.log.Warn("backfill: TMDB series lookup failed", "tmdb_id", s.TmdbID, "error", err)
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
+		if info.PosterPath != "" {
+			if err := svc.db.UpdateSeriesPoster(s.ID, info.PosterPath); err != nil {
+				svc.log.Warn("backfill: failed to update series poster", "id", s.ID, "error", err)
+			} else {
+				seriesCount++
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	if movieCount > 0 || seriesCount > 0 {
+		svc.log.Info("backfill: poster paths updated", "movies", movieCount, "series", seriesCount)
+	}
 }
 
 // serve runs the RPC server on the given listener. Used by tests to skip
@@ -2512,14 +3038,27 @@ func (s *Service) SeriesInfo(args *SeriesInfoArgs, reply *SeriesInfoReply) error
 func (s *Service) ForceSearch(args *ForceSearchArgs, reply *ForceSearchReply) error {
 	// No specific item — search all wanted.
 	if args.TmdbID == 0 && args.Title == "" {
-		s.log.Info("force search: all wanted items")
-		if err := s.db.ClearWantedEpisodeSearchTimers(); err != nil {
-			s.log.Error("force search: clear timers", "error", err)
+		if !s.tryStartBatchSearch() {
+			s.log.Info("force search: batch already running")
+			reply.Count = 0
+			return nil
 		}
-		go s.SearchWantedMovies()
+
+		s.log.Info("force search: all wanted items (starting batch)")
 		movies, _ := s.db.WantedMovies()
 		episodes, _ := s.db.WantedEpisodes()
 		reply.Count = len(movies) + len(episodes)
+
+		go func() {
+			defer s.endBatchSearch()
+			if err := s.db.ClearWantedEpisodeSearchTimers(); err != nil {
+				s.log.Error("force search: clear timers", "error", err)
+			}
+			if err := s.runSearchWantedMovies(); err != nil {
+				s.log.Error("force search: movie sweep failed", "error", err)
+			}
+			s.log.Info("force search: batch complete")
+		}()
 		return nil
 	}
 
@@ -2563,7 +3102,7 @@ func (s *Service) ForceSearch(args *ForceSearchArgs, reply *ForceSearchReply) er
 			tvdbID = int(series.TvdbID.Int64)
 		}
 		s.log.Info("force search: episode", "series", series.Title, "season", args.Season, "episode", args.Episode)
-		go s.SearchAndGrabEpisode(ep, tvdbID)
+		go s.runSearchAndGrabEpisode(ep, tvdbID)
 		reply.Count = 1
 		return nil
 	}
@@ -2573,20 +3112,74 @@ func (s *Service) ForceSearch(args *ForceSearchArgs, reply *ForceSearchReply) er
 	if err != nil {
 		return fmt.Errorf("ForceSearch: %w", err)
 	}
-	count := 0
 	tvdbID := 0
 	if series.TvdbID.Valid {
 		tvdbID = int(series.TvdbID.Int64)
 	}
+	var wanted []database.Episode
 	for i := range episodes {
 		if episodes[i].SeriesID == series.ID {
-			count++
-			ep := episodes[i]
-			go s.SearchAndGrabEpisode(&ep, tvdbID)
+			wanted = append(wanted, episodes[i])
 		}
 	}
-	reply.Count = count
+	reply.Count = len(wanted)
+	go s.searchEpisodesBounded(wanted, tvdbID, 4)
 	return nil
+}
+
+func (s *Service) tryStartBatchSearch() bool {
+	s.batchSearchMu.Lock()
+	defer s.batchSearchMu.Unlock()
+	if s.batchSearchRunning {
+		return false
+	}
+	s.batchSearchRunning = true
+	return true
+}
+
+func (s *Service) endBatchSearch() {
+	s.batchSearchMu.Lock()
+	s.batchSearchRunning = false
+	s.batchSearchMu.Unlock()
+}
+
+func (s *Service) searchEpisodesBounded(episodes []database.Episode, tvdbID int, workers int) {
+	if workers <= 0 {
+		workers = 1
+	}
+	jobs := make(chan database.Episode)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ep := range jobs {
+				if _, err := s.runSearchAndGrabEpisode(&ep, tvdbID); err != nil {
+					s.log.Error("force search: episode failed",
+						"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "error", err)
+				}
+			}
+		}()
+	}
+	for _, ep := range episodes {
+		jobs <- ep
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func (s *Service) runSearchWantedMovies() error {
+	if s.searchWantedMoviesFn != nil {
+		return s.searchWantedMoviesFn()
+	}
+	return s.SearchWantedMovies()
+}
+
+func (s *Service) runSearchAndGrabEpisode(ep *database.Episode, tvdbID int) (bool, error) {
+	if s.searchEpisodeFn != nil {
+		return s.searchEpisodeFn(ep, tvdbID)
+	}
+	return s.SearchAndGrabEpisode(ep, tvdbID)
 }
 
 // Dial connects to the daemon's Unix socket and returns an RPC client.

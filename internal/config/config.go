@@ -12,16 +12,17 @@ import (
 
 // Config is the top-level configuration structure.
 type Config struct {
-	Library  Library          `toml:"library"`
-	Paths    Paths            `toml:"paths"`
-	Quality  QualityConfig    `toml:"quality"`
-	Usenet   Usenet           `toml:"usenet"`
-	Indexers []Indexer        `toml:"indexers"`
-	TMDB     TMDBConfig       `toml:"tmdb"`
-	Plex     PlexConfig       `toml:"plex"`
-	Seerr    SeerrConfig      `toml:"seerr"`
-	Web      WebConfig        `toml:"web"`
-	Prefs    quality.Prefs    `toml:"-"` // populated after parsing from Quality strings
+	Library  Library       `toml:"library"`
+	Paths    Paths         `toml:"paths"`
+	Quality  QualityConfig `toml:"quality"`
+	Usenet   Usenet        `toml:"usenet"`
+	Indexers []Indexer     `toml:"indexers"`
+	TMDB     TMDBConfig    `toml:"tmdb"`
+	Plex     PlexConfig    `toml:"plex"`
+	Seerr    SeerrConfig   `toml:"seerr"`
+	Web      WebConfig     `toml:"web"`
+	Daemon   DaemonConfig  `toml:"daemon"`
+	Prefs    quality.Prefs `toml:"-"` // populated after parsing from Quality strings
 }
 
 // TMDBConfig holds the TMDB API credentials.
@@ -52,7 +53,7 @@ type Paths struct {
 // set min/preferred/upgrade_until individually. Profile takes precedence
 // if set; individual values override profile fields when both are present.
 type QualityConfig struct {
-	Profile        string   `toml:"profile"`         // "720p", "1080p", "4k", "remux"
+	Profile        string   `toml:"profile"` // "720p", "1080p", "4k", "remux"
 	Min            string   `toml:"min"`
 	Preferred      string   `toml:"preferred"`
 	UpgradeUntil   string   `toml:"upgrade_until"`
@@ -97,6 +98,11 @@ type SeerrConfig struct {
 type WebConfig struct {
 	Port int    `toml:"port"` // 0 = disabled (default)
 	Bind string `toml:"bind"` // default "127.0.0.1"
+}
+
+// DaemonConfig holds daemon-level performance tuning.
+type DaemonConfig struct {
+	SearchConcurrency int `toml:"search_concurrency"` // default 3
 }
 
 const (
@@ -183,6 +189,9 @@ func LoadFrom(path string) (*Config, error) {
 	if cfg.Web.Bind == "" {
 		cfg.Web.Bind = "127.0.0.1"
 	}
+	if cfg.Daemon.SearchConcurrency <= 0 {
+		cfg.Daemon.SearchConcurrency = 3
+	}
 
 	return &cfg, nil
 }
@@ -246,6 +255,9 @@ func (c *Config) Validate() error {
 		if idx.APIKey == "" {
 			return fmt.Errorf("config: indexers[%d].apikey is required", i)
 		}
+	}
+	if c.Daemon.SearchConcurrency < 1 {
+		return fmt.Errorf("config: daemon.search_concurrency must be >= 1")
 	}
 
 	return nil

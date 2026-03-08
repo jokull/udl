@@ -1,0 +1,99 @@
+{{define "releases_results.html"}}
+{{if .PlexHit}}
+<div class="plex-hit">
+  Available on <strong>{{.PlexHit.ServerName}}</strong> in {{.PlexHit.Quality}}
+  <button class="btn-sm" hx-post="/releases/{{.Category}}/{{.MediaID}}/grab-plex"
+    hx-target="closest div" hx-swap="innerHTML"
+    hx-confirm="Grab from Plex?">grab from plex</button>
+</div>
+{{end}}
+
+{{if .ExistingQuality}}
+<p class="muted">Current quality: <span class="status downloaded">{{.ExistingQuality}}</span></p>
+{{end}}
+
+{{if .HasLLM}}
+<div id="llm-card">
+  <span class="llm-spinner">Analyzing releases</span>
+</div>
+<script>
+(function() {
+  var card = document.getElementById('llm-card');
+  var es = new EventSource('/releases/{{.Category}}/{{.MediaID}}/llm');
+  var first = true;
+  var fullText = '';
+
+  function setStatus(msg, cls) {
+    card.className = cls ? 'llm-card ' + cls : 'llm-card';
+    card.innerHTML = '<span>' + msg + '</span>';
+  }
+
+  es.addEventListener('token', function(e) {
+    if (first) {
+      card.innerHTML = '';
+      card.className = 'llm-card';
+      first = false;
+    }
+    var text = e.data;
+    fullText += text;
+    if (text.indexOf('Error:') === 0) {
+      setStatus(text.replace('Error: ', ''), 'llm-error');
+      return;
+    } else if (text === 'No releases found') {
+      setStatus(text, 'llm-warn');
+      return;
+    }
+    card.insertAdjacentText('beforeend', text);
+  });
+  es.addEventListener('done', function(e) {
+    es.close();
+    var spinner = card.querySelector('.llm-spinner');
+    if (spinner) spinner.remove();
+    var m = fullText.match(/Pick\s*#(\d+)/i);
+    if (m) {
+      var row = document.getElementById('release-' + m[1]);
+      if (row) row.classList.add('llm-pick');
+      card.classList.add('llm-success');
+    }
+  });
+  es.onerror = function() {
+    es.close();
+    var spinner = card.querySelector('.llm-spinner');
+    if (spinner) spinner.remove();
+    if (!fullText) setStatus('LLM unavailable', 'llm-error');
+  };
+})();
+</script>
+{{end}}
+
+{{if .Releases}}
+<table class="releases">
+  <tr><th>#</th><th>Release</th><th>Quality</th><th>Size</th><th>Age</th><th>Indexer</th><th>Score</th><th></th></tr>
+  {{range .Releases}}
+  <tr id="release-{{.Index}}" {{if .Rejected}}class="rejected"{{end}}>
+    <td>{{.Index}}</td>
+    <td class="release-title" title="{{.Title}}">{{.Title}}</td>
+    <td><span class="status {{statusClass .Quality}}">{{.Quality}}</span></td>
+    <td>{{fmtBytes .Size}}</td>
+    <td class="{{ageClass .Age}}">{{.Age}}d</td>
+    <td>{{.Indexer}}</td>
+    <td>{{.Score}}</td>
+    <td>
+      {{if .Rejected}}<span class="muted" title="{{.RejectionReason}}">rejected</span>
+      {{else}}<form style="display:inline" hx-post="/releases/{{$.Category}}/{{$.MediaID}}/grab"
+        hx-target="closest td" hx-swap="innerHTML"
+        hx-confirm="Grab this release?">
+        <input type="hidden" name="nzb_url" value="{{.NzbURL}}">
+        <input type="hidden" name="nzb_name" value="{{.NzbName}}">
+        <input type="hidden" name="quality" value="{{.Quality}}">
+        <input type="hidden" name="size" value="{{.Size}}">
+        <button class="btn-sm" type="submit">grab</button>
+      </form>{{end}}
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="muted">No releases found.</p>
+{{end}}
+{{end}}

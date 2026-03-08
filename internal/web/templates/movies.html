@@ -16,6 +16,7 @@
   {{range .Movies}}
   <tr id="movie-{{.ID}}">
     <td>
+      {{if posterURL .PosterPath}}<img class="poster-thumb" src="{{posterURL .PosterPath}}" alt="" loading="lazy">{{end}}
       {{if .ImdbID.Valid}}<a href="https://www.imdb.com/title/{{.ImdbID.String}}/" target="_blank" rel="noopener">{{.Title}}</a>{{else}}{{.Title}}{{end}}
       {{if .TmdbID}}<a class="ext" href="{{tmdbURL "movie" .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
     </td>
@@ -24,7 +25,11 @@
     <td>{{if eq .Status "failed"}}<span class="status-flip"><span class="flip-label status failed" title="{{nullable .DownloadError}}">failed</span><button class="flip-action btn-sm" hx-post="/queue/retry/movie/{{.ID}}" hx-target="closest td" hx-swap="innerHTML">re-search</button></span>{{else}}<span class="status {{statusClass .Status}}">{{.Status}}</span>{{end}}</td>
     <td>{{nullable .Quality}}</td>
     <td class="small">{{fmtNullTimeStr .AddedAt}}</td>
-    <td><button class="btn-sm" hx-post="/wanted/remove/movie/{{.ID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Delete movie?">remove</button></td>
+    <td>
+      <a class="btn-sm" href="/releases/movie/{{.ID}}">releases</a>
+      {{if eq .Status "downloaded"}}<button class="btn-sm" hx-post="/movies/{{.ID}}/delete" hx-target="closest td" hx-swap="innerHTML" hx-confirm="Delete file and mark wanted?">delete file</button>{{end}}
+      <button class="btn-sm" hx-post="/wanted/remove/movie/{{.ID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Remove movie entirely?">remove</button>
+    </td>
   </tr>
   {{end}}
 </table>

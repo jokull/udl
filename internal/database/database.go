@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -168,6 +169,16 @@ CREATE TABLE IF NOT EXISTS blocklist (
 		return fmt.Errorf("add series original_language column: %w", err)
 	}
 
+	// Add poster_path column to movies and series (idempotent).
+	_, err = db.Exec(`ALTER TABLE movies ADD COLUMN poster_path TEXT`)
+	if err != nil && !isAlterDuplicate(err) {
+		return fmt.Errorf("add movies poster_path column: %w", err)
+	}
+	_, err = db.Exec(`ALTER TABLE series ADD COLUMN poster_path TEXT`)
+	if err != nil && !isAlterDuplicate(err) {
+		return fmt.Errorf("add series poster_path column: %w", err)
+	}
+
 	return nil
 }
 
@@ -181,10 +192,10 @@ func isAlterDuplicate(err error) bool {
 // ---------------------------------------------------------------------------
 
 // AddMovie inserts a new movie with status 'wanted' and returns the new row ID.
-func (db *DB) AddMovie(tmdbID int, imdbID, title string, year int, originalLanguage string) (int64, error) {
+func (db *DB) AddMovie(tmdbID int, imdbID, title string, year int, originalLanguage, posterPath string) (int64, error) {
 	res, err := db.Exec(
-		`INSERT INTO movies (tmdb_id, imdb_id, title, year, original_language) VALUES (?, ?, ?, ?, ?)`,
-		tmdbID, nullString(imdbID), title, year, nullString(originalLanguage),
+		`INSERT INTO movies (tmdb_id, imdb_id, title, year, original_language, poster_path) VALUES (?, ?, ?, ?, ?, ?)`,
+		tmdbID, nullString(imdbID), title, year, nullString(originalLanguage), nullString(posterPath),
 	)
 	if err != nil {
 		return 0, err
@@ -195,7 +206,7 @@ func (db *DB) AddMovie(tmdbID int, imdbID, title string, year int, originalLangu
 // ListMovies returns all movies ordered by added_at descending.
 func (db *DB) ListMovies() ([]Movie, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, imdb_id, title, year, original_language, status, quality, file_path, added_at, download_error
+		`SELECT id, tmdb_id, imdb_id, title, year, original_language, poster_path, status, quality, file_path, added_at, download_error
 		 FROM movies ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -206,7 +217,7 @@ func (db *DB) ListMovies() ([]Movie, error) {
 	var movies []Movie
 	for rows.Next() {
 		var m Movie
-		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year, &m.OriginalLanguage,
+		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year, &m.OriginalLanguage, &m.PosterPath,
 			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt, &m.DownloadError); err != nil {
 			return nil, err
 		}
@@ -218,7 +229,7 @@ func (db *DB) ListMovies() ([]Movie, error) {
 // WantedMovies returns movies with status='wanted'.
 func (db *DB) WantedMovies() ([]Movie, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, imdb_id, title, year, original_language, status, quality, file_path, added_at
+		`SELECT id, tmdb_id, imdb_id, title, year, original_language, poster_path, status, quality, file_path, added_at
 		 FROM movies WHERE status = 'wanted' ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -229,7 +240,7 @@ func (db *DB) WantedMovies() ([]Movie, error) {
 	var movies []Movie
 	for rows.Next() {
 		var m Movie
-		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year, &m.OriginalLanguage,
+		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year, &m.OriginalLanguage, &m.PosterPath,
 			&m.Status, &m.Quality, &m.FilePath, &m.AddedAt); err != nil {
 			return nil, err
 		}
@@ -251,9 +262,74 @@ func tableFor(category string) string {
 	}
 }
 
+var allowedMediaTransitions = map[string]map[string]bool{
+	"wanted": {
+		"wanted":      true,
+		"queued":      true,
+		"downloading": true,
+		"downloaded":  true,
+		"failed":      true,
+	},
+	"queued": {
+		"queued":      true,
+		"downloading": true,
+		"downloaded":  true,
+		"failed":      true,
+		"wanted":      true,
+	},
+	"downloading": {
+		"downloading":     true,
+		"post_processing": true,
+		"downloaded":      true,
+		"failed":          true,
+		"queued":          true,
+	},
+	"post_processing": {
+		"post_processing": true,
+		"downloaded":      true,
+		"failed":          true,
+		"queued":          true,
+	},
+	"downloaded": {
+		"downloaded": true,
+		"wanted":     true,
+		"failed":     true,
+	},
+	"failed": {
+		"failed": true,
+		"wanted": true,
+		"queued": true,
+	},
+}
+
+func isAllowedMediaTransition(from, to string) bool {
+	next, ok := allowedMediaTransitions[from]
+	if !ok {
+		return false
+	}
+	return next[to]
+}
+
+func (db *DB) ensureMediaTransition(table string, id int64, toStatus string) error {
+	if _, ok := allowedMediaTransitions[toStatus]; !ok {
+		return fmt.Errorf("invalid target status %q", toStatus)
+	}
+	var current string
+	if err := db.QueryRow(fmt.Sprintf(`SELECT status FROM %s WHERE id = ?`, tableFor(table)), id).Scan(&current); err != nil {
+		return err
+	}
+	if !isAllowedMediaTransition(current, toStatus) {
+		return fmt.Errorf("invalid status transition %s -> %s", current, toStatus)
+	}
+	return nil
+}
+
 // UpdateMediaStatus updates the status, quality, and file_path of a media item.
 // table must be "movies" or "episodes".
 func (db *DB) UpdateMediaStatus(table string, id int64, status, quality, filePath string) error {
+	if err := db.ensureMediaTransition(table, id, status); err != nil {
+		return err
+	}
 	_, err := db.Exec(
 		fmt.Sprintf(`UPDATE %s SET status = ?, quality = ?, file_path = ? WHERE id = ?`, tableFor(table)),
 		status, nullString(quality), nullString(filePath), id,
@@ -271,10 +347,10 @@ func (db *DB) UpdateMovieStatus(id int64, status, quality, filePath string) erro
 // ---------------------------------------------------------------------------
 
 // AddSeries inserts a new series with status 'monitored' and returns the new row ID.
-func (db *DB) AddSeries(tmdbID, tvdbID int, imdbID, title string, year int, originalLanguage string) (int64, error) {
+func (db *DB) AddSeries(tmdbID, tvdbID int, imdbID, title string, year int, originalLanguage, posterPath string) (int64, error) {
 	res, err := db.Exec(
-		`INSERT INTO series (tmdb_id, tvdb_id, imdb_id, title, year, original_language) VALUES (?, ?, ?, ?, ?, ?)`,
-		tmdbID, nullInt(tvdbID), nullString(imdbID), title, year, nullString(originalLanguage),
+		`INSERT INTO series (tmdb_id, tvdb_id, imdb_id, title, year, original_language, poster_path) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		tmdbID, nullInt(tvdbID), nullString(imdbID), title, year, nullString(originalLanguage), nullString(posterPath),
 	)
 	if err != nil {
 		return 0, err
@@ -285,7 +361,7 @@ func (db *DB) AddSeries(tmdbID, tvdbID int, imdbID, title string, year int, orig
 // ListSeries returns all series ordered by added_at descending.
 func (db *DB) ListSeries() ([]Series, error) {
 	rows, err := db.Query(
-		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, original_language, status, added_at, last_refreshed_at
+		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, original_language, poster_path, status, added_at, last_refreshed_at
 		 FROM series ORDER BY added_at DESC`,
 	)
 	if err != nil {
@@ -296,7 +372,7 @@ func (db *DB) ListSeries() ([]Series, error) {
 	var list []Series
 	for rows.Next() {
 		var s Series
-		if err := rows.Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year, &s.OriginalLanguage,
+		if err := rows.Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year, &s.OriginalLanguage, &s.PosterPath,
 			&s.Status, &s.AddedAt, &s.LastRefreshedAt); err != nil {
 			return nil, err
 		}
@@ -594,9 +670,9 @@ func (db *DB) WithTx(fn func(tx *sql.Tx) error) error {
 func (db *DB) GetMovie(id int64) (*Movie, error) {
 	var m Movie
 	err := db.QueryRow(
-		`SELECT id, tmdb_id, imdb_id, title, year, status, quality, file_path, added_at
+		`SELECT id, tmdb_id, imdb_id, title, year, poster_path, status, quality, file_path, added_at
 		 FROM movies WHERE id = ?`, id,
-	).Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year,
+	).Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year, &m.PosterPath,
 		&m.Status, &m.Quality, &m.FilePath, &m.AddedAt)
 	if err != nil {
 		return nil, err
@@ -626,14 +702,62 @@ func (db *DB) GetEpisode(id int64) (*Episode, error) {
 func (db *DB) GetSeries(id int64) (*Series, error) {
 	var s Series
 	err := db.QueryRow(
-		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, status, added_at, last_refreshed_at
+		`SELECT id, tmdb_id, tvdb_id, imdb_id, title, year, poster_path, status, added_at, last_refreshed_at
 		 FROM series WHERE id = ?`, id,
-	).Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year,
+	).Scan(&s.ID, &s.TmdbID, &s.TvdbID, &s.ImdbID, &s.Title, &s.Year, &s.PosterPath,
 		&s.Status, &s.AddedAt, &s.LastRefreshedAt)
 	if err != nil {
 		return nil, err
 	}
 	return &s, nil
+}
+
+// MoviesWithoutPoster returns movies that have no poster_path set.
+func (db *DB) MoviesWithoutPoster() ([]Movie, error) {
+	rows, err := db.Query(`SELECT id, tmdb_id FROM movies WHERE poster_path IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []Movie
+	for rows.Next() {
+		var m Movie
+		if err := rows.Scan(&m.ID, &m.TmdbID); err != nil {
+			return nil, err
+		}
+		list = append(list, m)
+	}
+	return list, rows.Err()
+}
+
+// SeriesWithoutPoster returns series that have no poster_path set.
+func (db *DB) SeriesWithoutPoster() ([]Series, error) {
+	rows, err := db.Query(`SELECT id, tmdb_id FROM series WHERE poster_path IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var list []Series
+	for rows.Next() {
+		var s Series
+		if err := rows.Scan(&s.ID, &s.TmdbID); err != nil {
+			return nil, err
+		}
+		list = append(list, s)
+	}
+	return list, rows.Err()
+}
+
+// UpdateMoviePoster sets the poster_path for a movie.
+func (db *DB) UpdateMoviePoster(id int64, posterPath string) error {
+	_, err := db.Exec(`UPDATE movies SET poster_path = ? WHERE id = ?`, posterPath, id)
+	return err
+}
+
+// UpdateSeriesPoster sets the poster_path for a series.
+func (db *DB) UpdateSeriesPoster(id int64, posterPath string) error {
+	_, err := db.Exec(`UPDATE series SET poster_path = ? WHERE id = ?`, posterPath, id)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -1415,6 +1539,9 @@ func (db *DB) QueueItems(limit int) ([]QueueItem, error) {
 // Sets download_started_at when transitioning to "downloading".
 func (db *DB) UpdateMediaDownloadStatus(category string, id int64, status string) error {
 	table := tableFor(category)
+	if err := db.ensureMediaTransition(table, id, status); err != nil {
+		return err
+	}
 	if status == "downloading" {
 		_, err := db.Exec(fmt.Sprintf(`UPDATE %s SET status = ?, download_started_at = CURRENT_TIMESTAMP WHERE id = ?`, table), status, id)
 		return err
@@ -1447,6 +1574,9 @@ func (db *DB) UpdateMediaPhaseLabel(category string, id int64, phase string) err
 // SetMediaDownloadError marks a media item as failed with an error message.
 func (db *DB) SetMediaDownloadError(category string, id int64, errMsg string) error {
 	table := tableFor(category)
+	if err := db.ensureMediaTransition(table, id, "failed"); err != nil {
+		return err
+	}
 	_, err := db.Exec(
 		fmt.Sprintf(`UPDATE %s SET status = 'failed', download_error = ? WHERE id = ?`, table),
 		errMsg, id,
@@ -1470,6 +1600,35 @@ func (db *DB) ResetStuckMedia() (int64, error) {
 		total += n
 	}
 	return total, nil
+}
+
+// ResetFailedMedia resets movies that have been 'failed' for longer than `after`
+// back to 'wanted'. Used by the movie search sweep to re-try with new indexer results.
+func (db *DB) ResetFailedMedia(after time.Duration) (int64, error) {
+	return db.resetFailedTable("movies", after)
+}
+
+// ResetFailedEpisodes resets episodes that have been 'failed' for longer than `after`
+// back to 'wanted'. Used by the episode search loop to re-try with new indexer results.
+func (db *DB) ResetFailedEpisodes(after time.Duration) (int64, error) {
+	return db.resetFailedTable("episodes", after)
+}
+
+func (db *DB) resetFailedTable(table string, after time.Duration) (int64, error) {
+	threshold := time.Now().Add(-after).UTC().Format("2006-01-02 15:04:05")
+	res, err := db.Exec(fmt.Sprintf(`
+		UPDATE %s SET status = 'wanted',
+		nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+		download_size = NULL, download_bytes = 0, download_error = NULL,
+		download_source = NULL, download_started_at = NULL
+		WHERE status = 'failed'
+		  AND download_started_at IS NOT NULL
+		  AND download_started_at < ?`, table), threshold)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // ClearMediaQueue marks all queued/downloading/post_processing media as failed.

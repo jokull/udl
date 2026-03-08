@@ -2,6 +2,7 @@ package web
 
 import (
 	"bytes"
+	"fmt"
 	"html/template"
 	"net/http"
 	"strconv"
@@ -200,6 +201,82 @@ func (s *Server) handleToggleSeasonMonitor(w http.ResponseWriter, r *http.Reques
 	s.renderEpisodesPartial(w, seriesID)
 }
 
+func (s *Server) handleRemoveSeries(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid series id", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.db.RemoveSeries(id); err != nil {
+		s.serverError(w, "remove series", err)
+		return
+	}
+
+	w.Header().Set("HX-Redirect", "/series")
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleRefreshSeries(w http.ResponseWriter, r *http.Request) {
+	if s.refreshSeries != nil {
+		if err := s.refreshSeries(); err != nil {
+			s.serverError(w, "refresh series", err)
+			return
+		}
+	}
+	w.Header().Set("HX-Redirect", "/series")
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleMonitorBulk(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	seriesID, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid series id", http.StatusBadRequest)
+		return
+	}
+	mode := r.PathValue("mode")
+
+	switch mode {
+	case "all":
+		_, err = s.db.SetAllEpisodesMonitored(seriesID, true)
+	case "none":
+		_, err = s.db.SetAllEpisodesMonitored(seriesID, false)
+	case "latest":
+		var maxSeason int
+		maxSeason, err = s.db.MaxSeason(seriesID)
+		if err != nil {
+			s.serverError(w, "monitor bulk", err)
+			return
+		}
+		if maxSeason == 0 {
+			http.Error(w, "no seasons found", http.StatusBadRequest)
+			return
+		}
+		s.db.SetAllEpisodesMonitored(seriesID, false)
+		_, err = s.db.SetSeasonMonitored(seriesID, maxSeason, true)
+	default:
+		http.Error(w, "invalid mode", http.StatusBadRequest)
+		return
+	}
+	if err != nil {
+		s.serverError(w, "monitor bulk", err)
+		return
+	}
+
+	s.renderEpisodesPartial(w, seriesID)
+}
+
+func (s *Server) handleQueueClear(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.db.ClearMediaQueue(); err != nil {
+		s.serverError(w, "clear queue", err)
+		return
+	}
+	w.Header().Set("HX-Redirect", "/")
+	w.WriteHeader(http.StatusOK)
+}
+
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	items, err := s.db.QueueItems(100)
 	if err != nil {
@@ -302,18 +379,25 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
-	events, err := s.db.ListHistory(50)
+	mediaType := r.URL.Query().Get("type")
+	event := r.URL.Query().Get("event")
+
+	events, err := s.db.ListHistoryFiltered(mediaType, event, 50)
 	if err != nil {
 		s.serverError(w, "load history", err)
 		return
 	}
 
 	data := struct {
-		Events []database.History
-		Page   string
+		Events      []database.History
+		TypeFilter  string
+		EventFilter string
+		Page        string
 	}{
-		Events: events,
-		Page:   "history",
+		Events:      events,
+		TypeFilter:  mediaType,
+		EventFilter: event,
+		Page:        "history",
 	}
 
 	s.render(w, "history.html", data)
@@ -517,4 +601,419 @@ func (s *Server) renderPartial(w http.ResponseWriter, name string, data interfac
 func (s *Server) serverError(w http.ResponseWriter, context string, err error) {
 	s.log.Error("web: "+context, "error", err)
 	http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+}
+
+// --- Blocklist ---
+
+func (s *Server) handleBlocklist(w http.ResponseWriter, r *http.Request) {
+	entries, err := s.db.ListBlocklist()
+	if err != nil {
+		s.serverError(w, "load blocklist", err)
+		return
+	}
+
+	data := struct {
+		Entries []database.BlocklistEntry
+		Page    string
+	}{
+		Entries: entries,
+		Page:    "blocklist",
+	}
+
+	s.render(w, "blocklist.html", data)
+}
+
+func (s *Server) handleBlocklistRemove(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid blocklist id", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.db.RemoveBlocklist(id); err != nil {
+		s.serverError(w, "remove blocklist entry", err)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleBlocklistClear(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.db.ClearBlocklist(); err != nil {
+		s.serverError(w, "clear blocklist", err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<p class="muted">Blocklist cleared.</p>`))
+}
+
+// --- Add Media ---
+
+func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+
+	var results []TMDBResult
+	if q != "" && s.tmdbSearch != nil {
+		var err error
+		results, err = s.tmdbSearch(q)
+		if err != nil {
+			s.log.Error("web: tmdb search", "query", q, "error", err)
+		}
+	}
+
+	data := struct {
+		Query   string
+		Results []TMDBResult
+		Page    string
+	}{
+		Query:   q,
+		Results: results,
+		Page:    "add",
+	}
+
+	if r.Header.Get("HX-Request") == "true" {
+		s.renderPartial(w, "add_results.html", data)
+		return
+	}
+	s.render(w, "add.html", data)
+}
+
+func (s *Server) handleAddMedia(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	tmdbIDStr := r.PathValue("tmdbID")
+	tmdbID, err := strconv.Atoi(tmdbIDStr)
+	if err != nil {
+		http.Error(w, "invalid tmdb id", http.StatusBadRequest)
+		return
+	}
+	if category != "movie" && category != "tv" {
+		http.Error(w, "invalid category", http.StatusBadRequest)
+		return
+	}
+	if s.addMedia == nil {
+		http.Error(w, "add not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	msg, err := s.addMedia(category, tmdbID)
+	if err != nil {
+		s.log.Error("web: add media", "category", category, "tmdbID", tmdbID, "error", err)
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<span class="status failed">error</span>`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span class="status downloaded">` + template.HTMLEscapeString(msg) + `</span>`))
+}
+
+// --- Release Browser ---
+
+func (s *Server) handleReleases(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	if category != "movie" && category != "episode" {
+		http.Error(w, "invalid category", http.StatusBadRequest)
+		return
+	}
+
+	// Get title quickly from DB without searching indexers.
+	title, year := s.mediaTitle(category, id)
+
+	data := struct {
+		Category string
+		MediaID  int64
+		Title    string
+		Year     int
+		Page     string
+	}{
+		Category: category,
+		MediaID:  id,
+		Title:    title,
+		Year:     year,
+		Page:     "releases",
+	}
+
+	s.render(w, "releases.html", data)
+}
+
+func (s *Server) handleReleasesSearch(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	if s.searchReleases == nil {
+		http.Error(w, "release search not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	releases, _, _, existingQuality, plexHit, err := s.searchReleases(category, id)
+	if err != nil {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<p class="muted">Search failed: ` + template.HTMLEscapeString(err.Error()) + `</p>`))
+		return
+	}
+
+	hasLLM := s.llmPick != nil
+
+	data := struct {
+		Category        string
+		MediaID         int64
+		ExistingQuality string
+		PlexHit         *PlexHit
+		Releases        []ReleaseRow
+		HasLLM          bool
+	}{
+		Category:        category,
+		MediaID:         id,
+		ExistingQuality: existingQuality,
+		PlexHit:         plexHit,
+		Releases:        releases,
+		HasLLM:          hasLLM,
+	}
+
+	s.renderPartial(w, "releases_results.html", data)
+}
+
+// mediaTitle returns the display title and year for a media item from the DB.
+func (s *Server) mediaTitle(category string, id int64) (string, int) {
+	if category == "movie" {
+		if m, err := s.db.GetMovie(id); err == nil {
+			return m.Title, m.Year
+		}
+	} else {
+		if ep, err := s.db.GetEpisode(id); err == nil {
+			if series, err := s.db.GetSeries(ep.SeriesID); err == nil {
+				return fmt.Sprintf("%s S%02dE%02d", series.Title, ep.Season, ep.Episode), series.Year
+			}
+		}
+	}
+	return "Unknown", 0
+}
+
+func (s *Server) handleGrabRelease(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	if s.grabRelease == nil {
+		http.Error(w, "grab not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	nzbURL := r.FormValue("nzb_url")
+	nzbName := r.FormValue("nzb_name")
+	qualityStr := r.FormValue("quality")
+	sizeStr := r.FormValue("size")
+	if nzbURL == "" || nzbName == "" {
+		http.Error(w, "missing nzb_url or nzb_name", http.StatusBadRequest)
+		return
+	}
+	size, _ := strconv.ParseInt(sizeStr, 10, 64)
+
+	name, err := s.grabRelease(category, id, nzbURL, nzbName, qualityStr, size)
+	if err != nil {
+		s.log.Error("web: grab release", "category", category, "id", id, "release", nzbName, "error", err)
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<span class="status failed">` + template.HTMLEscapeString(err.Error()) + `</span>`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	_ = name
+	w.Write([]byte(`<span class="status downloading">grabbed</span>`))
+}
+
+func (s *Server) handleGrabPlex(w http.ResponseWriter, r *http.Request) {
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+	if s.grabPlex == nil {
+		http.Error(w, "plex grab not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	msg, err := s.grabPlex(category, id)
+	if err != nil {
+		s.log.Error("web: grab plex", "category", category, "id", id, "error", err)
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<span class="status failed">` + template.HTMLEscapeString(err.Error()) + `</span>`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span class="status downloading">` + template.HTMLEscapeString(msg) + `</span>`))
+}
+
+func (s *Server) handleLLMPick(w http.ResponseWriter, r *http.Request) {
+	if s.llmPick == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	category := r.PathValue("category")
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid id", http.StatusBadRequest)
+		return
+	}
+
+	ch := s.llmPick(category, id)
+	if ch == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	for token := range ch {
+		fmt.Fprintf(w, "event: token\ndata: %s\n\n", token)
+		flusher.Flush()
+	}
+
+	fmt.Fprintf(w, "event: done\ndata: {}\n\n")
+	flusher.Flush()
+}
+
+// --- Status Dashboard ---
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	var statusData *StatusData
+	if s.status != nil {
+		var err error
+		statusData, err = s.status()
+		if err != nil {
+			s.serverError(w, "load status", err)
+			return
+		}
+	}
+	if statusData == nil {
+		statusData = &StatusData{}
+	}
+
+	data := struct {
+		Status *StatusData
+		Config *statusConfig
+		Page   string
+	}{
+		Status: statusData,
+		Config: s.buildStatusConfig(),
+		Page:   "status",
+	}
+
+	s.render(w, "status.html", data)
+}
+
+type statusConfig struct {
+	Profile        string
+	MinQuality     string
+	Preferred      string
+	UpgradeUntil   string
+	MustNotContain []string
+	PreferredWords []string
+	RetentionDays  int
+	Indexers       []string
+	Providers      []string
+	IncompletePath string
+}
+
+func (s *Server) buildStatusConfig() *statusConfig {
+	if s.cfg == nil {
+		return &statusConfig{}
+	}
+	sc := &statusConfig{
+		Profile:        s.cfg.Quality.Profile,
+		MinQuality:     s.cfg.Prefs.Min.String(),
+		Preferred:      s.cfg.Prefs.Preferred.String(),
+		UpgradeUntil:   s.cfg.Prefs.UpgradeUntil.String(),
+		MustNotContain: s.cfg.Quality.MustNotContain,
+		PreferredWords: s.cfg.Quality.PreferredWords,
+		RetentionDays:  s.cfg.Usenet.RetentionDays,
+		IncompletePath: s.cfg.Paths.Incomplete,
+	}
+	for _, idx := range s.cfg.Indexers {
+		sc.Indexers = append(sc.Indexers, idx.Name)
+	}
+	for _, p := range s.cfg.Usenet.Providers {
+		sc.Providers = append(sc.Providers, p.Host)
+	}
+	return sc
+}
+
+// --- Media Delete ---
+
+func (s *Server) handleMovieDelete(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid movie id", http.StatusBadRequest)
+		return
+	}
+	if s.movieDelete == nil {
+		http.Error(w, "delete not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	search := r.URL.Query().Get("search") == "1"
+	msg, err := s.movieDelete(id, search)
+	if err != nil {
+		s.log.Error("web: movie delete", "id", id, "error", err)
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<span class="status failed">` + template.HTMLEscapeString(err.Error()) + `</span>`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span class="status wanted">` + template.HTMLEscapeString(msg) + `</span>`))
+}
+
+func (s *Server) handleEpisodeDelete(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("id")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, "invalid episode id", http.StatusBadRequest)
+		return
+	}
+	if s.tvDelete == nil {
+		http.Error(w, "delete not available", http.StatusServiceUnavailable)
+		return
+	}
+
+	search := r.URL.Query().Get("search") == "1"
+	msg, err := s.tvDelete(id, search)
+	if err != nil {
+		s.log.Error("web: episode delete", "id", id, "error", err)
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(`<span class="status failed">` + template.HTMLEscapeString(err.Error()) + `</span>`))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<span class="status wanted">` + template.HTMLEscapeString(msg) + `</span>`))
 }

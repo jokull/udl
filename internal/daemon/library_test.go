@@ -125,7 +125,7 @@ func TestLibraryCleanup_Orphans(t *testing.T) {
 	os.MkdirAll(tvDir, 0o755)
 
 	// Add a tracked movie to the DB and create its file.
-	movieID, err := db.AddMovie(12345, "tt1234567", "Test Movie", 2024, "")
+	movieID, err := db.AddMovie(12345, "tt1234567", "Test Movie", 2024, "", "")
 	if err != nil {
 		t.Fatalf("add movie: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestLibraryCleanup_Misnamed(t *testing.T) {
 	os.MkdirAll(tvDir, 0o755)
 
 	// Add a tracked movie.
-	movieID, err := db.AddMovie(99999, "tt9999999", "Die Hard", 1988, "")
+	movieID, err := db.AddMovie(99999, "tt9999999", "Die Hard", 1988, "", "")
 	if err != nil {
 		t.Fatalf("add movie: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestLibraryCleanup_RenameExecute(t *testing.T) {
 	os.MkdirAll(moviesDir, 0o755)
 	os.MkdirAll(tvDir, 0o755)
 
-	movieID, err := db.AddMovie(88888, "tt8888888", "The Matrix", 1999, "")
+	movieID, err := db.AddMovie(88888, "tt8888888", "The Matrix", 1999, "", "")
 	if err != nil {
 		t.Fatalf("add movie: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestCleanup_DetectsMissingFiles(t *testing.T) {
 	svc, db := testService(t)
 
 	// Add movie to DB as downloaded with a file_path that doesn't exist on disk.
-	movieID, _ := db.AddMovie(12345, "tt1234567", "Gone Movie", 2024, "")
+	movieID, _ := db.AddMovie(12345, "tt1234567", "Gone Movie", 2024, "", "")
 	missingPath := filepath.Join(svc.cfg.Library.Movies, "Gone Movie (2024)", "Gone.Movie.2024.WEBDL-1080p.mkv")
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", missingPath)
 
@@ -338,7 +338,7 @@ func TestCleanup_DetectsMissingFiles(t *testing.T) {
 func TestCleanup_DetectsMissingFiles_Execute(t *testing.T) {
 	svc, db := testService(t)
 
-	movieID, _ := db.AddMovie(12345, "tt1234567", "Gone Movie", 2024, "")
+	movieID, _ := db.AddMovie(12345, "tt1234567", "Gone Movie", 2024, "", "")
 	missingPath := filepath.Join(svc.cfg.Library.Movies, "Gone Movie (2024)", "Gone.Movie.2024.WEBDL-1080p.mkv")
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", missingPath)
 
@@ -364,7 +364,7 @@ func TestCleanup_DetectsMissingFiles_Execute(t *testing.T) {
 func TestCleanup_DetectsMissingEpisodes(t *testing.T) {
 	svc, db := testService(t)
 
-	seriesID, _ := db.AddSeries(11111, 22222, "tt1111111", "Test Show", 2024, "")
+	seriesID, _ := db.AddSeries(11111, 22222, "tt1111111", "Test Show", 2024, "", "")
 	db.AddEpisode(seriesID, 1, 1, "Pilot", "2024-01-01")
 	ep, _ := db.FindEpisode(seriesID, 1, 1)
 	missingPath := filepath.Join(svc.cfg.Library.TV, "Test Show (2024)", "Season 01", "Test.Show.S01E01.Pilot.WEBDL-1080p.mkv")
@@ -450,7 +450,7 @@ func TestCleanup_DryRunNoChanges(t *testing.T) {
 	orphanPath := filepath.Join(svc.cfg.Library.Movies, "Orphan (2024)", "Orphan.2024.WEBDL-1080p.mkv")
 	createFakeMedia(t, orphanPath)
 
-	movieID, _ := db.AddMovie(99999, "tt9999999", "Missing", 2024, "")
+	movieID, _ := db.AddMovie(99999, "tt9999999", "Missing", 2024, "", "")
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", "/nonexistent/path.mkv")
 
 	// Run dry-run (default).
@@ -493,7 +493,7 @@ func TestCleanup_OrphanAndMissingCombined(t *testing.T) {
 	createFakeMedia(t, orphanPath)
 
 	// Missing in DB (file doesn't exist).
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Missing", 2024, "")
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Missing", 2024, "", "")
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", "/nonexistent/path.mkv")
 
 	var reply LibraryCleanupReply
@@ -533,10 +533,10 @@ func TestPruneIncomplete_DetectsOrphans(t *testing.T) {
 	svc, db := testService(t)
 
 	// Create movies whose IDs we use for dir names.
-	movieID1, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024, "")
+	movieID1, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024, "", "")
 	db.UpdateMovieStatus(movieID1, "downloaded", "WEBDL-1080p", "/lib/movie1.mkv")
 
-	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024, "")
+	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024, "", "")
 	db.SetMediaDownloadError("movie", movieID2, "download failed")
 
 	// Dir names use new "{category}-{mediaID}" format.
@@ -584,10 +584,10 @@ func TestPruneIncomplete_DetectsOrphans(t *testing.T) {
 func TestPruneIncomplete_Execute(t *testing.T) {
 	svc, db := testService(t)
 
-	movieID1, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024, "")
+	movieID1, _ := db.AddMovie(10001, "tt1000100", "Movie One", 2024, "", "")
 	db.UpdateMovieStatus(movieID1, "downloaded", "WEBDL-1080p", "/lib/movie1.mkv")
 
-	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024, "")
+	movieID2, _ := db.AddMovie(10002, "tt1000200", "Movie Two", 2024, "", "")
 	db.SetMediaDownloadError("movie", movieID2, "download failed")
 
 	dir1 := fmt.Sprintf("movie-%d", movieID1)
@@ -618,7 +618,7 @@ func TestPruneIncomplete_Execute(t *testing.T) {
 func TestPruneIncomplete_SkipsActive(t *testing.T) {
 	svc, db := testService(t)
 
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Active Movie", 2024, "")
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Active Movie", 2024, "", "")
 	db.UpdateMediaDownloadStatus("movie", movieID, "downloading")
 
 	dirName := fmt.Sprintf("movie-%d", movieID)
@@ -643,7 +643,7 @@ func TestPruneIncomplete_SkipsActive(t *testing.T) {
 func TestPruneIncomplete_PlexDirs(t *testing.T) {
 	svc, db := testService(t)
 
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Plex Movie", 2024, "")
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Plex Movie", 2024, "", "")
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", "/lib/plex_movie.mkv")
 
 	dirName := fmt.Sprintf("movie-%d", movieID)
@@ -719,7 +719,7 @@ func TestVerify_CombinesAll(t *testing.T) {
 	svc, db := testService(t)
 
 	// One missing file.
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Missing Movie", 2024, "")
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Missing Movie", 2024, "", "")
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", "/nonexistent/missing.mkv")
 
 	// One orphan file.
@@ -727,7 +727,7 @@ func TestVerify_CombinesAll(t *testing.T) {
 	createFakeMedia(t, orphanPath)
 
 	// One misnamed file.
-	movieID2, _ := db.AddMovie(10002, "tt1000200", "Misnamed Movie", 2024, "")
+	movieID2, _ := db.AddMovie(10002, "tt1000200", "Misnamed Movie", 2024, "", "")
 	wrongPath := filepath.Join(svc.cfg.Library.Movies, "Misnamed Movie (2024)", "wrong_name.mkv")
 	createFakeMedia(t, wrongPath)
 	db.UpdateMovieStatus(movieID2, "downloaded", "WEBDL-1080p", wrongPath)
@@ -765,7 +765,7 @@ func TestVerify_CleanLibrary(t *testing.T) {
 	svc, db := testService(t)
 
 	// Add a movie with correct file path and create the file.
-	movieID, _ := db.AddMovie(10001, "tt1000100", "Good Movie", 2024, "")
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Good Movie", 2024, "", "")
 	correctPath := organize.MoviePath(svc.cfg.Library.Movies, "Good Movie", 2024, quality.WEBDL1080p, ".mkv")
 	createFakeMedia(t, correctPath)
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", correctPath)
@@ -795,8 +795,8 @@ func TestDownloadedMovies(t *testing.T) {
 	}
 	defer db.Close()
 
-	db.AddMovie(10001, "tt1000100", "Wanted", 2024, "")
-	id2, _ := db.AddMovie(10002, "tt1000200", "Downloaded", 2024, "")
+	db.AddMovie(10001, "tt1000100", "Wanted", 2024, "", "")
+	id2, _ := db.AddMovie(10002, "tt1000200", "Downloaded", 2024, "", "")
 	db.UpdateMovieStatus(id2, "downloaded", "WEBDL-1080p", "/some/path.mkv")
 
 	movies, err := db.DownloadedMovies()
@@ -818,7 +818,7 @@ func TestDownloadedEpisodes(t *testing.T) {
 	}
 	defer db.Close()
 
-	seriesID, _ := db.AddSeries(11111, 22222, "tt1111111", "Test Show", 2024, "")
+	seriesID, _ := db.AddSeries(11111, 22222, "tt1111111", "Test Show", 2024, "", "")
 	db.AddEpisode(seriesID, 1, 1, "Pilot", "2024-01-01")
 	db.AddEpisode(seriesID, 1, 2, "Second", "2024-01-08")
 

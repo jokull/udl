@@ -30,6 +30,7 @@ type Movie struct {
 	Title            string
 	Year             int
 	OriginalLanguage string // ISO 639-1 code (e.g. "en", "ja", "zh")
+	PosterPath       string // e.g. "/abc123.jpg" — use with image.tmdb.org
 }
 
 // MovieInfo contains extended metadata for LLM-assisted release selection.
@@ -48,6 +49,7 @@ type Series struct {
 	Year             int
 	Status           string // "Returning Series", "Ended", "Canceled", etc. from TMDB
 	OriginalLanguage string // ISO 639-1 code
+	PosterPath       string // e.g. "/abc123.jpg"
 }
 
 // Episode represents a TV episode.
@@ -165,6 +167,7 @@ func (c *Client) GetMovie(tmdbID int) (*Movie, error) {
 		Title:            details.Title,
 		Year:             parseYear(details.ReleaseDate),
 		OriginalLanguage: details.OriginalLanguage,
+		PosterPath:       details.PosterPath,
 	}, nil
 }
 
@@ -248,6 +251,7 @@ func (c *Client) GetSeries(tmdbID int) (*Series, error) {
 		Year:             parseYear(details.FirstAirDate),
 		Status:           details.Status,
 		OriginalLanguage: details.OriginalLanguage,
+		PosterPath:       details.PosterPath,
 	}, nil
 }
 

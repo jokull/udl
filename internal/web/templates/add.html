@@ -1,0 +1,38 @@
+{{template "layout" .}}
+
+{{define "title"}} — Add{{end}}
+
+{{define "add_results_inner"}}
+{{if .Results}}
+<table>
+  <tr><th>Type</th><th>Title</th><th>Year</th><th></th></tr>
+  {{range .Results}}
+  <tr>
+    <td><span class="badge">{{.Category}}</span></td>
+    <td>{{.Title}} <a class="ext" href="{{tmdbURL .Category .TMDBID}}" target="_blank" rel="noopener">tmdb</a></td>
+    <td>{{.Year}}</td>
+    <td>
+      {{if .Exists}}<span class="status downloaded">added</span>
+      {{else}}<button class="btn-sm" hx-post="/add/{{.Category}}/{{.TMDBID}}"
+        hx-target="closest td" hx-swap="innerHTML">+ Add</button>{{end}}
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{else if .Query}}
+<p class="muted">No results for "{{.Query}}".</p>
+{{end}}
+{{end}}
+
+{{define "content"}}
+<h1>Add Movie or Series</h1>
+
+<form hx-get="/add" hx-target="#results" hx-push-url="true" hx-swap="innerHTML">
+  <input type="search" name="q" placeholder="Search movies &amp; TV..." autofocus value="{{.Query}}" style="font-size:0.9em;padding:0.4em 0.8em;width:300px;border:1px solid #d0d0d0;border-radius:0.375rem;">
+  <button type="submit" class="btn-sm">Search</button>
+</form>
+
+<div id="results">
+{{template "add_results_inner" .}}
+</div>
+{{end}}

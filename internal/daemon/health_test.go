@@ -166,7 +166,7 @@ func TestHealthCheck_StuckDownloads(t *testing.T) {
 	}
 
 	// Create a stuck download on the movies table.
-	movieID, _ := db.AddMovie(99001, "tt9900100", "Stuck Movie", 2024, "")
+	movieID, _ := db.AddMovie(99001, "tt9900100", "Stuck Movie", 2024, "", "")
 	db.UpdateMediaDownloadStatus("movie", movieID, "downloading")
 	// Backdate the download_started_at to 3 hours ago.
 	db.Exec(`UPDATE movies SET download_started_at = datetime('now', '-3 hours') WHERE id = ?`, movieID)
@@ -203,7 +203,7 @@ func TestDBHealthStats(t *testing.T) {
 	}
 
 	// Add a recent failure via the movies table.
-	movieID1, _ := db.AddMovie(10001, "tt1000100", "Fail Movie", 2024, "")
+	movieID1, _ := db.AddMovie(10001, "tt1000100", "Fail Movie", 2024, "", "")
 	db.UpdateMediaDownloadStatus("movie", movieID1, "downloading")
 	db.SetMediaDownloadError("movie", movieID1, "test failure")
 
@@ -225,7 +225,7 @@ func TestDBHealthStats(t *testing.T) {
 	}
 
 	// Add a stuck download (downloading for >2h).
-	movieID2, _ := db.AddMovie(10002, "tt1000200", "Stuck Movie", 2024, "")
+	movieID2, _ := db.AddMovie(10002, "tt1000200", "Stuck Movie", 2024, "", "")
 	db.UpdateMediaDownloadStatus("movie", movieID2, "downloading")
 	db.Exec(`UPDATE movies SET download_started_at = datetime('now', '-3 hours') WHERE id = ?`, movieID2)
 

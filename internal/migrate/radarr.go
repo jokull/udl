@@ -93,7 +93,7 @@ func RunRadarr(db *database.DB, baseURL, apiKey string, execute bool, log *slog.
 		)
 
 		if execute {
-			id, err := db.AddMovie(m.TmdbID, m.ImdbID, m.Title, m.Year, "")
+			id, err := db.AddMovie(m.TmdbID, m.ImdbID, m.Title, m.Year, "", "")
 			if err != nil {
 				res.Errors = append(res.Errors, fmt.Sprintf("%s: add: %v", m.Title, err))
 				continue

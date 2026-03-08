@@ -331,3 +331,47 @@ dd {
   opacity: 1;
   pointer-events: auto;
 }
+
+/* ── Poster thumbnails ── */
+
+.poster-thumb { height: 28px; width: auto; border-radius: 2px; vertical-align: middle; margin-right: 0.4em; }
+
+/* ── Release browser ── */
+
+.releases td.release-title { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.releases tr.rejected { opacity: 0.4; }
+.releases tr.llm-pick { border-left: 3px solid #2563eb; background: #eff6ff; }
+
+/* ── Age indicators ── */
+
+.age-warning { color: #d97706; }
+.age-danger { color: #dc2626; font-weight: 600; }
+
+/* ── Plex hit banner ── */
+
+.plex-hit { background: #f0fdf4; border: 1px solid #86efac; border-radius: 4px; padding: 0.5em 1em; margin-bottom: 1em; }
+
+/* ── LLM card ── */
+
+#llm-card, .llm-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 0.75em 1em; margin-bottom: 1em; font-size: 0.9em; min-height: 2em; }
+#llm-card:empty, .llm-card:empty { display: none; }
+.llm-spinner { color: #94a3b8; }
+.llm-error { background: #fef2f2; border-color: #fecaca; color: #991b1b; }
+.llm-warn { background: #fffbeb; border-color: #fde68a; color: #92400e; }
+.llm-success { background: #f0fdf4; border-color: #bbf7d0; }
+
+/* ── Add page ── */
+
+.badge { font-size: 0.75em; padding: 0.15em 0.5em; border-radius: 3px; background: #e2e8f0; text-transform: uppercase; }
+
+/* ── Status grid ── */
+
+.status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1em; }
+.status-card { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px; padding: 1em; }
+.status-card h3 { margin: 0 0 0.5em; font-size: 0.9em; text-transform: uppercase; color: #6b7280; }
+
+/* ── Health check badges ── */
+
+.health-ok { color: #16a34a; }
+.health-warning { color: #d97706; }
+.health-error { color: #dc2626; }

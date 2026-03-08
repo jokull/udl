@@ -17,12 +17,11 @@ go test ./... -count=1         # all tests
 ./udl tv add "Title"           # add TV series
 ./udl queue                    # show download queue
 
-# Install to ~/bin and restart LaunchAgent:
-go build -o ~/bin/udl ./cmd/udl
-# HUMAN STEP: codesign must be run in a real terminal (Keychain prompt)
-# codesign --force --sign "UDL" ~/bin/udl
+# Deploy: Claude unloads + builds, human signs + loads
 launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist
-launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist
+go build -o ~/bin/udl ./cmd/udl
+# HUMAN STEP (Keychain prompt):
+codesign --force --sign "UDL" ~/bin/udl && launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist
 ```
 
 ## Architecture
@@ -84,11 +83,10 @@ The binary accesses `/Volumes/Plex` (removable volume) which requires macOS TCC 
 A self-signed "UDL" certificate in the login keychain provides a stable signing identity so
 TCC grants persist across rebuilds (ad-hoc `--sign -` pins to CDHash which changes every build).
 
-**Deploy flow — Claude builds, human signs:**
-1. Claude: `go build -o ~/bin/udl ./cmd/udl`
-2. Claude: `launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist`
-3. **Human runs in terminal:** `codesign --force --sign "UDL" ~/bin/udl`
-4. Claude: `launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist`
+**Deploy flow — Claude builds & unloads, human signs & loads:**
+1. Claude: `launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist`
+2. Claude: `go build -o ~/bin/udl ./cmd/udl`
+3. **Human runs in terminal:** `codesign --force --sign "UDL" ~/bin/udl && launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist`
 
 The codesign step requires Keychain access to the private key which triggers a macOS dialog —
 this cannot be automated from Claude Code's sandbox without storing the login password in

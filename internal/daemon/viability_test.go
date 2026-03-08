@@ -284,7 +284,7 @@ func TestGrabBest_SizeRejection(t *testing.T) {
 	defer db.Close()
 
 	// Add a movie so the download can be created.
-	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024, "")
+	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestGrabBest_RetentionRejection(t *testing.T) {
 	s, db := testSearcherService(t, cfg)
 	defer db.Close()
 
-	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024, "")
+	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -409,7 +409,7 @@ func TestGrabBest_AlreadyImported(t *testing.T) {
 	s, db := testSearcherService(t, cfg)
 	defer db.Close()
 
-	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024, "")
+	movieID, err := db.AddMovie(12345, "tt12345", "Test Movie", 2024, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

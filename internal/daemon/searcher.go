@@ -51,57 +51,63 @@ type ScoredRelease struct {
 // Returns scored results sorted best-first.
 func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear int) ([]ScoredRelease, error) {
 	var all []ScoredRelease
-	for _, client := range s.indexers {
-		releases, err := client.SearchMovie(imdbID)
-		if err != nil {
-			s.log.Warn("search movie failed", "indexer", client.Name, "imdb", imdbID, "error", err)
-			continue
-		}
-		s.log.Info("search movie results", "indexer", client.Name, "imdb", imdbID, "count", len(releases))
-
-		// Fall back to text search if IMDB search returned nothing.
-		if len(releases) == 0 && expectedTitle != "" {
-			// Clean the query: strip punctuation (colons etc. break some indexers)
-			// and remove leading articles.
-			query := punctuationRe.ReplaceAllString(expectedTitle, " ")
-			query = strings.Join(strings.Fields(query), " ") // collapse whitespace
-			for _, article := range []string{"The ", "A ", "An "} {
-				if strings.HasPrefix(query, article) {
-					query = query[len(article):]
-					break
-				}
-			}
-			if expectedYear > 0 {
-				query = fmt.Sprintf("%s %d", query, expectedYear)
-			}
-			releases, err = client.SearchMovieText(query)
+	err := s.withSearchPermit("SearchMovieReleases", func() error {
+		for _, client := range s.indexers {
+			releases, err := client.SearchMovie(imdbID)
 			if err != nil {
-				s.log.Warn("text search fallback failed", "indexer", client.Name, "query", query, "error", err)
+				s.log.Warn("search movie failed", "indexer", client.Name, "imdb", imdbID, "error", err)
 				continue
 			}
-			s.log.Info("text search fallback results", "indexer", client.Name, "query", query, "count", len(releases))
-		}
+			s.log.Info("search movie results", "indexer", client.Name, "imdb", imdbID, "count", len(releases))
 
-		for _, rel := range releases {
-			scored := scoreRelease(rel, s.cfg)
-			scored.Indexer = client.Name
-			if scored.Quality == quality.Unknown {
-				continue
+			// Fall back to text search if IMDB search returned nothing.
+			if len(releases) == 0 && expectedTitle != "" {
+				// Clean the query: strip punctuation (colons etc. break some indexers)
+				// and remove leading articles.
+				query := punctuationRe.ReplaceAllString(expectedTitle, " ")
+				query = strings.Join(strings.Fields(query), " ") // collapse whitespace
+				for _, article := range []string{"The ", "A ", "An "} {
+					if strings.HasPrefix(query, article) {
+						query = query[len(article):]
+						break
+					}
+				}
+				if expectedYear > 0 {
+					query = fmt.Sprintf("%s %d", query, expectedYear)
+				}
+				releases, err = client.SearchMovieText(query)
+				if err != nil {
+					s.log.Warn("text search fallback failed", "indexer", client.Name, "query", query, "error", err)
+					continue
+				}
+				s.log.Info("text search fallback results", "indexer", client.Name, "query", query, "count", len(releases))
 			}
-			// Verify the parsed title matches what we're looking for.
-			if expectedTitle != "" && !titleMatches(scored.Parsed.Title, expectedTitle) {
-				s.log.Debug("title mismatch, skipping",
-					"release", rel.Title, "parsed", scored.Parsed.Title, "expected", expectedTitle)
-				continue
+
+			for _, rel := range releases {
+				scored := scoreRelease(rel, s.cfg)
+				scored.Indexer = client.Name
+				if scored.Quality == quality.Unknown {
+					continue
+				}
+				// Verify the parsed title matches what we're looking for.
+				if expectedTitle != "" && !titleMatches(scored.Parsed.Title, expectedTitle) {
+					s.log.Debug("title mismatch, skipping",
+						"release", rel.Title, "parsed", scored.Parsed.Title, "expected", expectedTitle)
+					continue
+				}
+				// Verify the year matches if both sides have one.
+				if expectedYear > 0 && scored.Parsed.Year > 0 && scored.Parsed.Year != expectedYear {
+					s.log.Debug("year mismatch, skipping",
+						"release", rel.Title, "parsed_year", scored.Parsed.Year, "expected_year", expectedYear)
+					continue
+				}
+				all = append(all, scored)
 			}
-			// Verify the year matches if both sides have one.
-			if expectedYear > 0 && scored.Parsed.Year > 0 && scored.Parsed.Year != expectedYear {
-				s.log.Debug("year mismatch, skipping",
-					"release", rel.Title, "parsed_year", scored.Parsed.Year, "expected_year", expectedYear)
-				continue
-			}
-			all = append(all, scored)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Score > all[j].Score })
 	return all, nil
@@ -111,23 +117,29 @@ func (s *Service) SearchMovieReleases(imdbID, expectedTitle string, expectedYear
 // Returns scored results sorted best-first.
 func (s *Service) SearchEpisodeReleases(tvdbID, season, episode int) ([]ScoredRelease, error) {
 	var all []ScoredRelease
-	for _, client := range s.indexers {
-		releases, err := client.SearchTV(tvdbID, season, episode)
-		if err != nil {
-			s.log.Warn("search episode failed", "indexer", client.Name,
-				"tvdb", tvdbID, "season", season, "episode", episode, "error", err)
-			continue
-		}
-		s.log.Info("search episode results", "indexer", client.Name,
-			"tvdb", tvdbID, "season", season, "episode", episode, "count", len(releases))
-		for _, rel := range releases {
-			scored := scoreRelease(rel, s.cfg)
-			scored.Indexer = client.Name
-			if scored.Quality == quality.Unknown {
+	err := s.withSearchPermit("SearchEpisodeReleases", func() error {
+		for _, client := range s.indexers {
+			releases, err := client.SearchTV(tvdbID, season, episode)
+			if err != nil {
+				s.log.Warn("search episode failed", "indexer", client.Name,
+					"tvdb", tvdbID, "season", season, "episode", episode, "error", err)
 				continue
 			}
-			all = append(all, scored)
+			s.log.Info("search episode results", "indexer", client.Name,
+				"tvdb", tvdbID, "season", season, "episode", episode, "count", len(releases))
+			for _, rel := range releases {
+				scored := scoreRelease(rel, s.cfg)
+				scored.Indexer = client.Name
+				if scored.Quality == quality.Unknown {
+					continue
+				}
+				all = append(all, scored)
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Score > all[j].Score })
 	return all, nil
@@ -359,14 +371,14 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 		// Instant dispatch via channel if downloader is available.
 		if s.dl != nil {
 			s.dl.Enqueue(database.QueueItem{
-				MediaID:  ctx.MediaID,
-				Category: ctx.Category,
-				Title:    sr.Parsed.Title,
-				Status:   "queued",
-				NzbURL:   database.NullStr(sr.Release.Link),
-				NzbName:  database.NullStr(sr.Release.Title),
+				MediaID:   ctx.MediaID,
+				Category:  ctx.Category,
+				Title:     sr.Parsed.Title,
+				Status:    "queued",
+				NzbURL:    database.NullStr(sr.Release.Link),
+				NzbName:   database.NullStr(sr.Release.Title),
 				SizeBytes: database.NullInt(sr.Release.Size),
-				Source:   database.NullStr("usenet"),
+				Source:    database.NullStr("usenet"),
 			})
 		}
 
@@ -432,14 +444,14 @@ func (s *Service) grabFromPlex(ctx GrabContext) (bool, error) {
 	// Instant dispatch via channel if downloader is available.
 	if s.dl != nil {
 		s.dl.Enqueue(database.QueueItem{
-			MediaID:  ctx.MediaID,
-			Category: ctx.Category,
-			Title:    ctx.Title,
-			Status:   "queued",
-			NzbURL:   database.NullStr(info.URL),
-			NzbName:  database.NullStr(sourceName),
+			MediaID:   ctx.MediaID,
+			Category:  ctx.Category,
+			Title:     ctx.Title,
+			Status:    "queued",
+			NzbURL:    database.NullStr(info.URL),
+			NzbName:   database.NullStr(sourceName),
 			SizeBytes: database.NullInt(info.Size),
-			Source:   database.NullStr("plex"),
+			Source:    database.NullStr("plex"),
 		})
 	}
 
@@ -507,6 +519,14 @@ func (s *Service) SearchAndGrabEpisode(ep *database.Episode, tvdbID int) (bool, 
 
 // SearchWantedMovies searches indexers for all wanted movies.
 func (s *Service) SearchWantedMovies() error {
+	// Reset movies that have been 'failed' for >6h back to 'wanted' so they
+	// get re-searched. New indexer results may have appeared since exhaustion.
+	if n, err := s.db.ResetFailedMedia(6 * time.Hour); err != nil {
+		s.log.Error("movie sweep: reset failed media", "error", err)
+	} else if n > 0 {
+		s.log.Info("movie sweep: reset stale failed movies to wanted", "count", n)
+	}
+
 	movies, err := s.db.WantedMovies()
 	if err != nil {
 		return fmt.Errorf("wanted movies: %w", err)
@@ -524,7 +544,6 @@ func (s *Service) SearchWantedMovies() error {
 	}
 	return nil
 }
-
 
 // punctuationRe matches any character that is not a letter, digit, or space.
 // Used by SearchMovieReleases for text search fallback query cleaning.
@@ -713,4 +732,20 @@ func existingQualityFromDB(db *database.DB, category string, mediaID int64) qual
 		return quality.Unknown
 	}
 	return quality.Parse(qualStr)
+}
+
+// annotateRejections marks releases as rejected if they are blocklisted or already completed.
+func annotateRejections(db *database.DB, category string, mediaID int64, releases []ScoredRelease) {
+	for i := range releases {
+		if releases[i].Rejected {
+			continue
+		}
+		if blocked, _ := db.IsBlocklisted(category, mediaID, releases[i].Release.Title); blocked {
+			releases[i].Rejected = true
+			releases[i].RejectionReason = "blocklisted"
+		} else if imported, _ := db.IsCompletedInHistory(category, mediaID, releases[i].Release.Title); imported {
+			releases[i].Rejected = true
+			releases[i].RejectionReason = "already completed"
+		}
+	}
 }

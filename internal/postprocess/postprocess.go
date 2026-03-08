@@ -1,7 +1,9 @@
 package postprocess
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -16,6 +18,22 @@ import (
 	"github.com/jokull/udl/internal/par2"
 	"github.com/nwaples/rardecode/v2"
 )
+
+// PermanentError wraps an error that cannot be resolved by retrying.
+// Examples: RAR bad checksum without PAR2, encrypted archive, irreparable PAR2 damage.
+// Callers should blocklist the release and search for alternatives.
+type PermanentError struct {
+	Err error
+}
+
+func (e *PermanentError) Error() string { return e.Err.Error() }
+func (e *PermanentError) Unwrap() error { return e.Err }
+
+// IsPermanent returns true if the error is a PermanentError (deterministic, not retryable).
+func IsPermanent(err error) bool {
+	var pe *PermanentError
+	return errors.As(err, &pe)
+}
 
 // Result holds the outcome of post-processing a download directory.
 type Result struct {
@@ -309,10 +327,41 @@ type Options struct {
 	FailedSegments int
 }
 
+// stageFile is the checkpoint file written to the download directory after each
+// major post-processing stage completes. On resume, completed stages are skipped.
+const stageFile = ".pp-stage"
+
+func readStage(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, stageFile))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+func writeStage(dir, stage string) {
+	p := filepath.Join(dir, stageFile)
+	f, err := os.Create(p)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(stage + "\n")
+	_ = f.Sync()
+	f.Close()
+}
+
+// stageOrder maps stage names to their ordinal position in the pipeline.
+var stageOrder = map[string]int{"": 0, "renamed": 1, "par2-done": 2, "extracted": 3}
+
+func stageAtLeast(current, target string) bool {
+	return stageOrder[current] >= stageOrder[target]
+}
+
 // Process runs the full post-processing pipeline on a download directory.
 // Stages: PAR2 rename -> magic rename -> AppleDouble cleanup -> PAR2 verify/repair -> RAR extract -> cleanup -> identify files
 // The context is checked between stages for prompt cancellation on shutdown.
 // If progressFn is non-nil, it is called at phase boundaries with a label and overall percentage.
+// Completed stages are checkpointed to a .pp-stage file so they can be skipped on resume.
 func Process(ctx context.Context, dir string, log *slog.Logger, progressFn ProgressFn, opts Options) (*Result, error) {
 	result := &Result{}
 
@@ -322,124 +371,157 @@ func Process(ctx context.Context, dir string, log *slog.Logger, progressFn Progr
 		}
 	}
 
-	// Stage 0: Rename obfuscated files using PAR2 manifest hash matching.
-	if n := renameByPAR2(dir, log); n > 0 {
-		log.Info("PAR2-based rename complete", "renamed", n)
+	stage := readStage(dir)
+	if stage != "" {
+		log.Info("resuming post-processing", "from_stage", stage)
 	}
 
-	// Stage 0.5: Rename remaining obfuscated files by magic bytes (fallback).
-	if err := renameByMagic(dir, log); err != nil {
-		log.Warn("rename by magic failed", "error", err)
+	// Stage 0: Rename + AppleDouble cleanup (fast, idempotent — always re-run)
+	if !stageAtLeast(stage, "renamed") {
+		if n := renameByPAR2(dir, log); n > 0 {
+			log.Info("PAR2-based rename complete", "renamed", n)
+		}
+
+		if err := renameByMagic(dir, log); err != nil {
+			log.Warn("rename by magic failed", "error", err)
+		}
+
+		removeAppleDoubleFiles(dir, log)
+		writeStage(dir, "renamed")
 	}
 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("post-processing canceled: %w", err)
 	}
 
-	// Stage 1: Delete macOS AppleDouble resource fork files before PAR2.
-	// par2cmdline scans the directory itself and picks up ._* files which
-	// contain no valid PAR2 packets and cause "Main packet not found" errors.
-	removeAppleDoubleFiles(dir, log)
+	// Stage 1: PAR2 verify + repair (behavior depends on segment health)
+	if !stageAtLeast(stage, "par2-done") {
+		report("par2 verify", 0)
+		par2File, err := findPAR2File(dir)
+		if err != nil {
+			// Don't checkpoint on lookup error — will retry PAR2 on resume.
+			log.Warn("error searching for PAR2 files, will retry on resume", "error", err)
+		} else {
+			if par2File != "" {
+				log.Info("found PAR2 index file", "file", par2File)
 
-	// Stage 2: PAR2 verify + repair (behavior depends on segment health)
-	report("par2 verify", 0)
-	par2File, err := findPAR2File(dir)
-	if err != nil {
-		log.Warn("error searching for PAR2 files", "error", err)
-	} else if par2File != "" {
-		log.Info("found PAR2 index file", "file", par2File)
-
-		if opts.FailedSegments == 0 {
-			// All segments downloaded successfully — skip PAR2 entirely.
-			// This is the NZBGet "quick verification" optimization: since we know
-			// every segment was received and decoded correctly, the files are intact.
-			log.Info("all segments OK, skipping PAR2 verify/repair")
-		} else if opts.FailedSegments > 0 {
-			// Some segments failed — skip verify, go straight to repair.
-			// par2 repair includes its own verification internally, so running
-			// par2 verify first would just read all files twice.
-			report("par2 repair", 5)
-			log.Info("segments failed, skipping verify — going straight to PAR2 repair",
-				"failed_segments", opts.FailedSegments)
-			if err := par2Repair(ctx, par2File, log); err != nil {
-				hasRAR, _ := findRARFiles(dir)
-				if len(hasRAR) > 0 {
-					log.Warn("PAR2 repair failed but RAR files exist, continuing to extraction", "error", err)
+				if opts.FailedSegments == 0 {
+					// All segments downloaded successfully — skip PAR2 entirely.
+					// This is the NZBGet "quick verification" optimization: since we know
+					// every segment was received and decoded correctly, the files are intact.
+					log.Info("all segments OK, skipping PAR2 verify/repair")
+				} else if opts.FailedSegments > 0 {
+					// Some segments failed — skip verify, go straight to repair.
+					// par2 repair includes its own verification internally, so running
+					// par2 verify first would just read all files twice.
+					report("par2 repair", 5)
+					log.Info("segments failed, skipping verify — going straight to PAR2 repair",
+						"failed_segments", opts.FailedSegments)
+					if err := par2Repair(ctx, par2File, log, progressFn); err != nil {
+						hasRAR, _ := findRARFiles(dir)
+						if len(hasRAR) > 0 {
+							log.Warn("PAR2 repair failed but RAR files exist, continuing to extraction", "error", err)
+						} else {
+							result.Success = false
+							result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
+							return result, fmt.Errorf("par2 repair failed: %w", err)
+						}
+					} else {
+						log.Info("PAR2 repair completed successfully")
+					}
 				} else {
-					result.Success = false
-					result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
-					return result, fmt.Errorf("par2 repair failed: %w", err)
+					// Unknown segment health (resume from crash) — full verify + repair.
+					needsRepair, err := par2Verify(ctx, par2File, log, progressFn)
+					if err != nil {
+						hasRAR, _ := findRARFiles(dir)
+						if len(hasRAR) > 0 {
+							log.Warn("PAR2 verify failed but RAR files exist, continuing to extraction", "error", err)
+						} else {
+							result.Success = false
+							result.Error = fmt.Sprintf("PAR2 verify failed: %v", err)
+							return result, fmt.Errorf("par2 verify failed: %w", err)
+						}
+					} else if needsRepair {
+						report("par2 repair", 15)
+						log.Info("PAR2 indicates repair needed, running repair")
+						if err := par2Repair(ctx, par2File, log, progressFn); err != nil {
+							result.Success = false
+							result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
+							return result, fmt.Errorf("par2 repair failed: %w", err)
+						}
+						log.Info("PAR2 repair completed successfully")
+					} else {
+						log.Info("PAR2 verify passed, no repair needed")
+					}
 				}
 			} else {
-				log.Info("PAR2 repair completed successfully")
+				log.Info("no PAR2 files found, skipping verify/repair")
+			}
+			report("par2", 40)
+			writeStage(dir, "par2-done")
+		}
+	} else {
+		log.Info("skipping PAR2 (already completed)")
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("post-processing canceled: %w", err)
+	}
+
+	// Stage 2: RAR extraction
+	if !stageAtLeast(stage, "extracted") {
+		report("extracting", 40)
+		rarFiles, err := findRARFiles(dir)
+		if err != nil {
+			log.Warn("error searching for RAR files", "error", err)
+		} else if len(rarFiles) > 0 {
+			// Estimate total size from download dir for byte-level progress.
+			totalDirSize := dirSize(dir)
+			for _, rarFile := range rarFiles {
+				log.Info("extracting RAR archive", "file", rarFile)
+				rarProgressFn := func(bytesWritten int64) {
+					if totalDirSize > 0 {
+						// Map extraction bytes to 40-90% range.
+						pct := 40 + 50*float64(bytesWritten)/float64(totalDirSize)
+						if pct > 90 {
+							pct = 90
+						}
+						report("extracting", pct)
+					}
+				}
+				extracted, err := extractRAR(rarFile, dir, opts.Password, log, rarProgressFn)
+				if err != nil {
+					result.Success = false
+					result.Error = fmt.Sprintf("RAR extraction failed: %v", err)
+					rarErr := fmt.Errorf("rar extraction failed for %s: %w", rarFile, err)
+					if isRARPermanent(err) {
+						return result, &PermanentError{Err: rarErr}
+					}
+					return result, rarErr
+				}
+				log.Info("extracted files from RAR", "count", len(extracted), "files", extracted)
 			}
 		} else {
-			// Unknown segment health (resume from crash) — full verify + repair.
-			needsRepair, err := par2Verify(ctx, par2File, log)
-			if err != nil {
-				hasRAR, _ := findRARFiles(dir)
-				if len(hasRAR) > 0 {
-					log.Warn("PAR2 verify failed but RAR files exist, continuing to extraction", "error", err)
-				} else {
-					result.Success = false
-					result.Error = fmt.Sprintf("PAR2 verify failed: %v", err)
-					return result, fmt.Errorf("par2 verify failed: %w", err)
-				}
-			} else if needsRepair {
-				report("par2 repair", 15)
-				log.Info("PAR2 indicates repair needed, running repair")
-				if err := par2Repair(ctx, par2File, log); err != nil {
-					result.Success = false
-					result.Error = fmt.Sprintf("PAR2 repair failed: %v", err)
-					return result, fmt.Errorf("par2 repair failed: %w", err)
-				}
-				log.Info("PAR2 repair completed successfully")
-			} else {
-				log.Info("PAR2 verify passed, no repair needed")
-			}
+			log.Info("no RAR archives found, skipping extraction")
 		}
+		report("extracting", 90)
+		writeStage(dir, "extracted")
 	} else {
-		log.Info("no PAR2 files found, skipping verify/repair")
+		log.Info("skipping RAR extraction (already completed)")
 	}
-	report("par2 verify", 15)
 
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("post-processing canceled: %w", err)
 	}
 
-	// Stage 3: RAR extraction
-	report("rar extract", 40)
-	rarFiles, err := findRARFiles(dir)
-	if err != nil {
-		log.Warn("error searching for RAR files", "error", err)
-	} else if len(rarFiles) > 0 {
-		for _, rarFile := range rarFiles {
-			log.Info("extracting RAR archive", "file", rarFile)
-			extracted, err := extractRAR(rarFile, dir, opts.Password, log)
-			if err != nil {
-				result.Success = false
-				result.Error = fmt.Sprintf("RAR extraction failed: %v", err)
-				return result, fmt.Errorf("rar extraction failed for %s: %w", rarFile, err)
-			}
-			log.Info("extracted files from RAR", "count", len(extracted), "files", extracted)
-		}
-	} else {
-		log.Info("no RAR archives found, skipping extraction")
-	}
-	report("rar extract", 90)
-
-	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("post-processing canceled: %w", err)
-	}
-
-	// Stage 4: Cleanup
+	// Stage 3: Cleanup + identify (fast, always run)
 	report("importing", 90)
 	if err := cleanup(dir, log); err != nil {
 		log.Warn("cleanup encountered errors", "error", err)
 		// Non-fatal: continue to identification
 	}
 
-	// Stage 5: Identify files
+	// Identify files
 	mediaFiles, subtitleFiles, err := identifyFiles(dir)
 	if err != nil {
 		result.Success = false
@@ -508,11 +590,11 @@ const par2Timeout = 30 * time.Minute
 // Exit code 2 means damage is irreparable (not enough recovery data).
 // The par2Timeout is applied as a child of the parent context, so both
 // the per-item timeout and the par2-specific timeout can cancel the command.
-func par2Verify(ctx context.Context, par2File string, log *slog.Logger) (needsRepair bool, err error) {
+func par2Verify(ctx context.Context, par2File string, log *slog.Logger, progressFn ProgressFn) (needsRepair bool, err error) {
 	ctx, cancel := context.WithTimeout(ctx, par2Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "par2", "verify", par2File)
-	output, err := cmd.CombinedOutput()
+	output, err := runPar2WithProgress(cmd, "par2 verify", progressFn, 0, 15)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			switch exitErr.ExitCode() {
@@ -520,7 +602,7 @@ func par2Verify(ctx context.Context, par2File string, log *slog.Logger) (needsRe
 				log.Info("par2 verify: files need repair", "output", string(output))
 				return true, nil
 			case 2:
-				return false, fmt.Errorf("par2 verify: damage is irreparable (insufficient recovery data): %s", string(output))
+				return false, &PermanentError{Err: fmt.Errorf("par2 verify: damage is irreparable (insufficient recovery data): %s", string(output))}
 			default:
 				return false, fmt.Errorf("par2 verify failed (exit code %d): %s", exitErr.ExitCode(), string(output))
 			}
@@ -531,16 +613,74 @@ func par2Verify(ctx context.Context, par2File string, log *slog.Logger) (needsRe
 }
 
 // par2Repair runs par2 repair on a PAR2 file.
-func par2Repair(ctx context.Context, par2File string, log *slog.Logger) error {
+func par2Repair(ctx context.Context, par2File string, log *slog.Logger, progressFn ProgressFn) error {
 	ctx, cancel := context.WithTimeout(ctx, par2Timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "par2", "repair", par2File)
-	output, err := cmd.CombinedOutput()
+	output, err := runPar2WithProgress(cmd, "par2 repair", progressFn, 15, 40)
 	if err != nil {
 		return fmt.Errorf("par2 repair failed: %s: %w", string(output), err)
 	}
 	log.Debug("par2 repair output", "output", string(output))
 	return nil
+}
+
+// runPar2WithProgress runs a par2 command, streaming stderr/stdout to parse
+// progress percentages. Returns combined output for error reporting.
+// pctMin/pctMax define the overall progress range mapped to 0-100% of par2's output.
+func runPar2WithProgress(cmd *exec.Cmd, phase string, progressFn ProgressFn, pctMin, pctMax float64) ([]byte, error) {
+	// Capture all output for error reporting.
+	var outputBuf bytes.Buffer
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stderr = cmd.Stdout // merge stderr into stdout pipe
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	// Read output in chunks, scanning for percentage patterns.
+	// par2cmdline uses \r to update progress in-place.
+	buf := make([]byte, 4096)
+	for {
+		n, readErr := stdout.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			outputBuf.Write(chunk)
+			if progressFn != nil {
+				if pct := parsePar2Percent(string(chunk)); pct >= 0 {
+					overall := pctMin + (pctMax-pctMin)*pct/100
+					progressFn(phase, overall)
+				}
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	err = cmd.Wait()
+	return outputBuf.Bytes(), err
+}
+
+// par2PercentRe matches par2cmdline progress output like "Scanning: ... : 45.2%"
+// or "Repairing: 78.3%" or "Verifying: 90.0%". Captures the percentage number.
+var par2PercentRe = regexp.MustCompile(`(\d+\.\d+)%`)
+
+// parsePar2Percent extracts the last percentage value from a par2cmdline output chunk.
+// Returns -1 if no percentage is found.
+func parsePar2Percent(chunk string) float64 {
+	matches := par2PercentRe.FindAllStringSubmatch(chunk, -1)
+	if len(matches) == 0 {
+		return -1
+	}
+	last := matches[len(matches)-1][1]
+	var pct float64
+	fmt.Sscanf(last, "%f", &pct)
+	return pct
 }
 
 // findRARFiles finds RAR archives in a directory.
@@ -596,10 +736,19 @@ func isFirstPart(filename string) bool {
 	return firstPartPattern.MatchString(filename)
 }
 
+// isRARPermanent returns true for RAR errors that cannot be fixed by retrying.
+func isRARPermanent(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "bad file checksum") ||
+		strings.Contains(msg, "password required") ||
+		strings.Contains(msg, "encrypted")
+}
+
 // extractRAR extracts a RAR archive to the output directory.
 // If password is non-empty, it is used to decrypt the archive.
+// progressFn is called periodically with bytes written so far.
 // Returns the list of extracted file paths.
-func extractRAR(rarFile, outputDir, password string, log *slog.Logger) ([]string, error) {
+func extractRAR(rarFile, outputDir, password string, log *slog.Logger, progressFn func(bytesWritten int64)) ([]string, error) {
 	var opts []rardecode.Option
 	if password != "" {
 		opts = append(opts, rardecode.Password(password))
@@ -612,6 +761,7 @@ func extractRAR(rarFile, outputDir, password string, log *slog.Logger) ([]string
 	defer rc.Close()
 
 	var extracted []string
+	var totalWritten int64
 
 	for {
 		header, err := rc.Next()
@@ -639,6 +789,19 @@ func extractRAR(rarFile, outputDir, password string, log *slog.Logger) ([]string
 			continue
 		}
 
+		// Skip files already fully extracted (resume after crash mid-extraction).
+		if !header.UnKnownSize {
+			if info, err := os.Stat(destPath); err == nil && info.Size() == header.UnPackedSize {
+				totalWritten += header.UnPackedSize
+				if progressFn != nil {
+					progressFn(totalWritten)
+				}
+				extracted = append(extracted, destPath)
+				log.Debug("skipping already extracted file", "path", destPath)
+				continue
+			}
+		}
+
 		// Ensure parent directory exists
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			return extracted, fmt.Errorf("create parent directory: %w", err)
@@ -649,17 +812,58 @@ func extractRAR(rarFile, outputDir, password string, log *slog.Logger) ([]string
 			return extracted, fmt.Errorf("create file %s: %w", destPath, err)
 		}
 
-		_, err = io.Copy(outFile, &rc.Reader)
+		written, copyErr := io.Copy(outFile, io.TeeReader(&rc.Reader, &progressWriter{
+			total:      &totalWritten,
+			progressFn: progressFn,
+		}))
 		outFile.Close()
-		if err != nil {
-			return extracted, fmt.Errorf("extract file %s: %w", destPath, err)
+		if copyErr != nil {
+			return extracted, fmt.Errorf("extract file %s: %w", destPath, copyErr)
 		}
+		_ = written
 
 		extracted = append(extracted, destPath)
 		log.Debug("extracted file", "path", destPath)
 	}
 
 	return extracted, nil
+}
+
+// dirSize returns the total size of all files in a directory (non-recursive).
+func dirSize(dir string) int64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		if !e.IsDir() {
+			if info, err := e.Info(); err == nil {
+				total += info.Size()
+			}
+		}
+	}
+	return total
+}
+
+// progressWriter wraps a running total and calls progressFn periodically.
+// Used with io.TeeReader to report byte-level extraction progress.
+type progressWriter struct {
+	total      *int64
+	progressFn func(bytesWritten int64)
+	pending    int64 // bytes since last callback
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	*pw.total += int64(n)
+	pw.pending += int64(n)
+	// Report every ~1MB to avoid callback overhead.
+	if pw.pending >= 1<<20 && pw.progressFn != nil {
+		pw.progressFn(*pw.total)
+		pw.pending = 0
+	}
+	return n, nil
 }
 
 // shouldCleanup returns true if a file should be deleted during cleanup.

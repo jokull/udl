@@ -44,36 +44,153 @@ type SearchFunc func(category string, mediaID int64) error
 // SearchAllFunc triggers a batch search for all wanted items.
 type SearchAllFunc func()
 
+// TMDBResult is a unified TMDB search result for movies and TV.
+type TMDBResult struct {
+	TMDBID   int
+	Title    string
+	Year     int
+	Category string // "movie" or "tv"
+	Exists   bool   // already in DB
+}
+
+// TMDBSearchFunc searches TMDB for movies and TV shows.
+type TMDBSearchFunc func(query string) ([]TMDBResult, error)
+
+// AddMediaFunc adds a movie or series by TMDB ID.
+type AddMediaFunc func(category string, tmdbID int) (string, error)
+
+// ReleaseRow is a single scored release for template rendering.
+type ReleaseRow struct {
+	Index           int
+	Title           string
+	Quality         string
+	Size            int64
+	Age             int // days
+	Indexer         string
+	Score           int
+	Rejected        bool
+	RejectionReason string
+	NzbURL          string
+	NzbName         string
+}
+
+// PlexHit indicates a media item is available on a friend's Plex server.
+type PlexHit struct {
+	ServerName string
+	Quality    string
+}
+
+// SearchReleasesFunc searches indexers for releases of a media item.
+// Returns: scored releases, media title, year, existing quality string, plex hit (nil if none).
+type SearchReleasesFunc func(category string, mediaID int64) ([]ReleaseRow, string, int, string, *PlexHit, error)
+
+// GrabReleaseFunc enqueues a specific release for download.
+type GrabReleaseFunc func(category string, mediaID int64, nzbURL, nzbName, qualityStr string, size int64) (string, error)
+
+// GrabPlexFunc grabs a media item from a Plex friend server.
+type GrabPlexFunc func(category string, mediaID int64) (string, error)
+
+// LLMPickFunc asks an LLM to pick the best release. Returns channel of tokens, closes when done.
+type LLMPickFunc func(category string, mediaID int64) <-chan string
+
+// StatusData contains daemon status for the web UI.
+type StatusData struct {
+	Running       bool
+	QueueSize     int
+	Downloading   int
+	FailedCount   int
+	BlockedCount  int
+	IndexerCount  int
+	MovieCount    int
+	SeriesCount   int
+	LibraryMovies string
+	LibraryTV     string
+	Checks        []HealthCheckData
+}
+
+// HealthCheckData is a health check result for template rendering.
+type HealthCheckData struct {
+	Name    string
+	Status  string // ok, warning, error
+	Message string
+}
+
+// RefreshSeriesFunc re-fetches episode metadata from TMDB for all monitored series.
+type RefreshSeriesFunc func() error
+
+// MovieDeleteFunc deletes a movie's file and resets to wanted. Returns message.
+type MovieDeleteFunc func(movieID int64, search bool) (string, error)
+
+// TVDeleteFunc deletes an episode's file and resets to wanted. Returns message.
+type TVDeleteFunc func(episodeID int64, search bool) (string, error)
+
+// StatusFunc returns daemon status.
+type StatusFunc func() (*StatusData, error)
+
 // Server is the embedded HTTP server.
 type Server struct {
-	db        *database.DB
-	cfg       *config.Config
-	log       *slog.Logger
-	retry     RetryFunc
-	pause     PauseFunc
-	isPaused  IsPausedFunc
-	evict     EvictFunc
-	search    SearchFunc
-	searchAll SearchAllFunc
-	mux       *http.ServeMux
-	pages     map[string]*template.Template // per-page templates (layout + page)
-	partials  *template.Template            // shared partials (no layout)
-	server    *http.Server
+	db             *database.DB
+	cfg            *config.Config
+	log            *slog.Logger
+	retry          RetryFunc
+	pause          PauseFunc
+	isPaused       IsPausedFunc
+	evict          EvictFunc
+	search         SearchFunc
+	searchAll      SearchAllFunc
+	tmdbSearch     TMDBSearchFunc
+	addMedia       AddMediaFunc
+	searchReleases SearchReleasesFunc
+	grabRelease    GrabReleaseFunc
+	grabPlex       GrabPlexFunc
+	llmPick        LLMPickFunc
+	refreshSeries  RefreshSeriesFunc
+	movieDelete    MovieDeleteFunc
+	tvDelete       TVDeleteFunc
+	status         StatusFunc
+	mux            *http.ServeMux
+	pages          map[string]*template.Template // per-page templates (layout + page)
+	partials       *template.Template            // shared partials (no layout)
+	server         *http.Server
+}
+
+// Options holds the optional callback functions for the web server.
+type Options struct {
+	TMDBSearch     TMDBSearchFunc
+	AddMedia       AddMediaFunc
+	SearchReleases SearchReleasesFunc
+	GrabRelease    GrabReleaseFunc
+	GrabPlex       GrabPlexFunc
+	LLMPick        LLMPickFunc
+	RefreshSeries  RefreshSeriesFunc
+	MovieDelete    MovieDeleteFunc
+	TVDelete       TVDeleteFunc
+	Status         StatusFunc
 }
 
 // New creates a new web server.
-func New(db *database.DB, cfg *config.Config, log *slog.Logger, retryFn RetryFunc, pauseFn PauseFunc, isPausedFn IsPausedFunc, evictFn EvictFunc, searchFn SearchFunc, searchAllFn SearchAllFunc) (*Server, error) {
+func New(db *database.DB, cfg *config.Config, log *slog.Logger, retryFn RetryFunc, pauseFn PauseFunc, isPausedFn IsPausedFunc, evictFn EvictFunc, searchFn SearchFunc, searchAllFn SearchAllFunc, opts Options) (*Server, error) {
 	s := &Server{
-		db:        db,
-		cfg:       cfg,
-		log:       log,
-		retry:     retryFn,
-		pause:     pauseFn,
-		isPaused:  isPausedFn,
-		evict:     evictFn,
-		search:    searchFn,
-		searchAll: searchAllFn,
-		mux:       http.NewServeMux(),
+		db:             db,
+		cfg:            cfg,
+		log:            log,
+		retry:          retryFn,
+		pause:          pauseFn,
+		isPaused:       isPausedFn,
+		evict:          evictFn,
+		search:         searchFn,
+		searchAll:      searchAllFn,
+		tmdbSearch:     opts.TMDBSearch,
+		addMedia:       opts.AddMedia,
+		searchReleases: opts.SearchReleases,
+		grabRelease:    opts.GrabRelease,
+		grabPlex:       opts.GrabPlex,
+		llmPick:        opts.LLMPick,
+		refreshSeries:  opts.RefreshSeries,
+		movieDelete:    opts.MovieDelete,
+		tvDelete:       opts.TVDelete,
+		status:         opts.Status,
+		mux:            http.NewServeMux(),
 	}
 
 	if err := s.loadTemplates(); err != nil {
@@ -86,7 +203,7 @@ func New(db *database.DB, cfg *config.Config, log *slog.Logger, retryFn RetryFun
 		Addr:         fmt.Sprintf("%s:%d", cfg.Web.Bind, cfg.Web.Port),
 		Handler:      s.logMiddleware(s.mux),
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
@@ -118,21 +235,68 @@ func (s *Server) loadTemplates() error {
 		"fmtProgress":     tplFmtProgress,
 		"statusClass":     tplStatusClass,
 		"seasonEp":        tplSeasonEp,
-		"fmtSource": func(source sql.NullString, nzbName sql.NullString, nzbURL sql.NullString) string {
+		"fmtSource": func(source sql.NullString, nzbName sql.NullString, nzbURL sql.NullString) template.HTML {
 			if !source.Valid || source.String == "" {
 				return "—"
 			}
 			if source.String == "plex" && nzbName.Valid {
-				// NzbName is "plex:ServerName" for plex downloads
 				if idx := len("plex:"); len(nzbName.String) > idx {
-					return "plex: " + nzbName.String[idx:]
+					return template.HTML("plex: " + template.HTMLEscapeString(nzbName.String[idx:]))
 				}
 				return "plex"
 			}
 			if source.String == "usenet" && nzbURL.Valid && nzbURL.String != "" {
-				return fmtIndexerName(nzbURL.String)
+				name := fmtIndexerName(nzbURL.String)
+				detailURL := indexerDetailURL(nzbURL.String)
+				titleAttr := ""
+				if nzbName.Valid && nzbName.String != "" {
+					titleAttr = template.HTMLEscapeString(nzbName.String)
+				}
+				if detailURL != "" {
+					return template.HTML(fmt.Sprintf(`<a href="%s" target="_blank" rel="noopener" title="%s">%s</a>`,
+						template.HTMLEscapeString(detailURL), titleAttr, template.HTMLEscapeString(name)))
+				}
+				if titleAttr != "" {
+					return template.HTML(fmt.Sprintf(`<span title="%s">%s</span>`, titleAttr, template.HTMLEscapeString(name)))
+				}
+				return template.HTML(template.HTMLEscapeString(name))
 			}
-			return source.String
+			return template.HTML(template.HTMLEscapeString(source.String))
+		},
+		"ageClass": func(days int) string {
+			switch {
+			case days >= 1200:
+				return "age-danger"
+			case days >= 800:
+				return "age-warning"
+			default:
+				return ""
+			}
+		},
+		"fmtSpeed": func(bps float64) string {
+			if bps <= 0 {
+				return ""
+			}
+			switch {
+			case bps >= 1<<20:
+				return fmt.Sprintf("%.1f MB/s", bps/(1<<20))
+			case bps >= 1<<10:
+				return fmt.Sprintf("%.0f KB/s", bps/(1<<10))
+			default:
+				return fmt.Sprintf("%.0f B/s", bps)
+			}
+		},
+		"speed": func(speeds map[string]float64, category string, mediaID int64) float64 {
+			if speeds == nil {
+				return 0
+			}
+			return speeds[fmt.Sprintf("%s:%d", category, mediaID)]
+		},
+		"posterURL": func(posterPath sql.NullString) string {
+			if !posterPath.Valid || posterPath.String == "" {
+				return ""
+			}
+			return "https://image.tmdb.org/t/p/w92" + posterPath.String
 		},
 		"tmdbURL": func(category string, tmdbID int) string {
 			if tmdbID == 0 {
@@ -169,6 +333,10 @@ func (s *Server) loadTemplates() error {
 		"wanted.html",
 		"schedule.html",
 		"history.html",
+		"blocklist.html",
+		"add.html",
+		"releases.html",
+		"status.html",
 	}
 	s.pages = make(map[string]*template.Template, len(pageFiles))
 	for _, name := range pageFiles {
@@ -190,6 +358,8 @@ func (s *Server) loadTemplates() error {
 	s.partials, err = template.New("").Funcs(funcMap).ParseFS(templateFS,
 		"templates/episodes_partial.html",
 		"templates/queue_rows.html",
+		"templates/add_results.html",
+		"templates/releases_results.html",
 	)
 	if err != nil {
 		return fmt.Errorf("parse partials: %w", err)
@@ -212,6 +382,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /wanted", s.handleWanted)
 	s.mux.HandleFunc("GET /schedule", s.handleSchedule)
 	s.mux.HandleFunc("GET /history", s.handleHistory)
+	s.mux.HandleFunc("GET /blocklist", s.handleBlocklist)
+	s.mux.HandleFunc("POST /blocklist/remove/{id}", s.handleBlocklistRemove)
+	s.mux.HandleFunc("POST /blocklist/clear", s.handleBlocklistClear)
+
+	// New pages
+	s.mux.HandleFunc("GET /add", s.handleAdd)
+	s.mux.HandleFunc("POST /add/{category}/{tmdbID}", s.handleAddMedia)
+	s.mux.HandleFunc("GET /releases/{category}/{id}", s.handleReleases)
+	s.mux.HandleFunc("GET /releases/{category}/{id}/search", s.handleReleasesSearch)
+	s.mux.HandleFunc("POST /releases/{category}/{id}/grab", s.handleGrabRelease)
+	s.mux.HandleFunc("POST /releases/{category}/{id}/grab-plex", s.handleGrabPlex)
+	s.mux.HandleFunc("GET /releases/{category}/{id}/llm", s.handleLLMPick)
+	s.mux.HandleFunc("GET /status", s.handleStatus)
 
 	// SSE
 	s.mux.HandleFunc("GET /sse/queue", s.handleSSEQueue)
@@ -227,6 +410,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /queue/resume", s.handleResume)
 	s.mux.HandleFunc("POST /queue/evict/{category}/{id}", s.handleEvict)
 	s.mux.HandleFunc("POST /series/{id}/season/{season}/toggle", s.handleToggleSeasonMonitor)
+	s.mux.HandleFunc("POST /series/{id}/remove", s.handleRemoveSeries)
+	s.mux.HandleFunc("POST /series/refresh", s.handleRefreshSeries)
+	s.mux.HandleFunc("POST /series/{id}/monitor/{mode}", s.handleMonitorBulk)
+	s.mux.HandleFunc("POST /queue/clear", s.handleQueueClear)
+	s.mux.HandleFunc("POST /movies/{id}/delete", s.handleMovieDelete)
+	s.mux.HandleFunc("POST /episodes/{id}/delete", s.handleEpisodeDelete)
 }
 
 // --- HTTP middleware ---
@@ -405,6 +594,31 @@ func tplSeasonEp(season, episode int) string {
 	return fmt.Sprintf("S%02dE%02d", season, episode)
 }
 
+// indexerDetailURL converts a Newznab API download URL to a web detail page URL.
+// Handles two common formats:
+//   - "https://api.dognzb.cr/api?t=get&id=abc123&apikey=..." → "https://api.dognzb.cr/details/abc123"
+//   - "https://api.nzb.su/getnzb/abc123.nzb&i=...&r=..." → "https://api.nzb.su/details/abc123"
+func indexerDetailURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	guid := u.Query().Get("id")
+	if guid == "" {
+		// Try /getnzb/GUID.nzb path format
+		p := strings.TrimPrefix(u.Path, "/getnzb/")
+		if p != u.Path && p != "" {
+			guid = strings.TrimSuffix(p, ".nzb")
+		}
+	}
+	if guid == "" {
+		return ""
+	}
+	u.Path = "/details/" + guid
+	u.RawQuery = ""
+	return u.String()
+}
+
 // fmtIndexerName extracts a short indexer name from an NZB URL.
 // e.g. "https://api.dognzb.cr/..." → "dognzb"
 func fmtIndexerName(rawURL string) string {
@@ -415,9 +629,13 @@ func fmtIndexerName(rawURL string) string {
 	host := u.Hostname()
 	// Strip "api." prefix
 	host = strings.TrimPrefix(host, "api.")
-	// Strip TLD: take everything before the last dot
+	// Strip TLD, but keep two-part names like "nzb.su" readable
 	if idx := strings.LastIndex(host, "."); idx > 0 {
-		host = host[:idx]
+		name := host[:idx]
+		if len(name) >= 4 {
+			host = name
+		}
+		// Short names like "nzb" keep full "nzb.su"
 	}
 	if host == "" {
 		return "usenet"

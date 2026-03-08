@@ -17,6 +17,9 @@
     <a href="/wanted" {{if eq .Page "wanted"}}class="active"{{end}}>Wanted</a>
     <a href="/schedule" {{if eq .Page "schedule"}}class="active"{{end}}>Schedule</a>
     <a href="/history" {{if eq .Page "history"}}class="active"{{end}}>History</a>
+    <a href="/blocklist" {{if eq .Page "blocklist"}}class="active"{{end}}>Blocklist</a>
+    <a href="/status" {{if eq .Page "status"}}class="active"{{end}}>Status</a>
+    <a href="/add" {{if eq .Page "add"}}class="active"{{end}}>+ Add</a>
   </nav>
   {{block "content" .}}{{end}}
 </body>

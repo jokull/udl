@@ -302,7 +302,7 @@ func TestPipeline_MovieUsenet(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, err := db.AddMovie(12345, "tt1234567", "Late Night with the Devil", 2024, "")
+	movieID, err := db.AddMovie(12345, "tt1234567", "Late Night with the Devil", 2024, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +373,7 @@ func TestPipeline_MoviePlex(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, err := db.AddMovie(67890, "tt7654321", "Dune Part Two", 2024, "")
+	movieID, err := db.AddMovie(67890, "tt7654321", "Dune Part Two", 2024, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +419,7 @@ func TestPipeline_PlexMP4ContentType(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(11111, "tt1111111", "Alien Romulus", 2024, "")
+	movieID, _ := db.AddMovie(11111, "tt1111111", "Alien Romulus", 2024, "", "")
 
 	// video/mp4 content-type should produce .mp4 extension, not .mkv.
 	mp4Magic := []byte{0x00, 0x00, 0x00, 0x20, 'f', 't', 'y', 'p'}
@@ -449,7 +449,7 @@ func TestPipeline_TVEpisodeUsenet(t *testing.T) {
 	}
 	defer db.Close()
 
-	seriesID, _ := db.AddSeries(11111, 22222, "tt1111111", "Severance", 2022, "")
+	seriesID, _ := db.AddSeries(11111, 22222, "tt1111111", "Severance", 2022, "", "")
 	db.AddEpisode(seriesID, 2, 1, "Hello Ms Cobel", "2025-01-17")
 	ep, _ := db.FindEpisode(seriesID, 2, 1)
 
@@ -486,7 +486,7 @@ func TestPipeline_TVEpisodePlex(t *testing.T) {
 	}
 	defer db.Close()
 
-	seriesID, _ := db.AddSeries(33333, 44444, "tt3333333", "The Bear", 2022, "")
+	seriesID, _ := db.AddSeries(33333, 44444, "tt3333333", "The Bear", 2022, "", "")
 	db.AddEpisode(seriesID, 1, 1, "System", "2022-06-23")
 	ep, _ := db.FindEpisode(seriesID, 1, 1)
 
@@ -520,7 +520,7 @@ func TestPipeline_TVEpisodeNoTitle(t *testing.T) {
 	}
 	defer db.Close()
 
-	seriesID, _ := db.AddSeries(55555, 66666, "tt5555555", "Slow Horses", 2022, "")
+	seriesID, _ := db.AddSeries(55555, 66666, "tt5555555", "Slow Horses", 2022, "", "")
 	db.AddEpisode(seriesID, 3, 5, "", "2024-11-27")
 	ep, _ := db.FindEpisode(seriesID, 3, 5)
 
@@ -547,7 +547,7 @@ func TestPipeline_MovieWithSubtitles(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(55555, "tt5555555", "Parasite", 2019, "")
+	movieID, _ := db.AddMovie(55555, "tt5555555", "Parasite", 2019, "", "")
 
 	srv := serveNZB(minimalNZBTwoFiles(
 		`Parasite 2019 "Parasite.2019.WEBDL-1080p.mkv" yEnc (1/1)`,
@@ -587,7 +587,7 @@ func TestPipeline_ObfuscatedFiles(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(99999, "tt9999999", "Oppenheimer", 2023, "")
+	movieID, _ := db.AddMovie(99999, "tt9999999", "Oppenheimer", 2023, "", "")
 
 	// Subject has no quoted filename -> engine writes "file_0" (no extension).
 	// renameByMagic() detects MKV from magic bytes and adds .mkv.
@@ -624,7 +624,7 @@ func TestPipeline_FailedNzbFetch(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(88888, "tt8888888", "Nosferatu", 2024, "")
+	movieID, _ := db.AddMovie(88888, "tt8888888", "Nosferatu", 2024, "", "")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 	}))
@@ -662,7 +662,7 @@ func TestPipeline_FailedPlexServer(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(44444, "tt4444444", "Conclave", 2024, "")
+	movieID, _ := db.AddMovie(44444, "tt4444444", "Conclave", 2024, "", "")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal server error", http.StatusInternalServerError)
 	}))
@@ -694,7 +694,7 @@ func TestPipeline_EmptyNzbURL(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(10006, "tt1000600", "Ghostbusters", 1984, "")
+	movieID, _ := db.AddMovie(10006, "tt1000600", "Ghostbusters", 1984, "", "")
 	item := enqueueItem(t, db, "movie", movieID, "", "Ghostbusters.1984.WEBDL-1080p", 1024, "usenet")
 	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
 	d.processItem(context.Background(), item)
@@ -714,7 +714,7 @@ func TestPipeline_EmptyPlexURL(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(10007, "tt1000700", "Ghostbusters", 1984, "")
+	movieID, _ := db.AddMovie(10007, "tt1000700", "Ghostbusters", 1984, "", "")
 	item := enqueueItem(t, db, "movie", movieID, "", "plex:FriendServer", 1024, "plex")
 	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
 	d.processItem(context.Background(), item)
@@ -738,7 +738,7 @@ func TestPipeline_PartialSegmentFailure(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20001, "tt2000100", "Blade Runner 2049", 2017, "")
+	movieID, _ := db.AddMovie(20001, "tt2000100", "Blade Runner 2049", 2017, "", "")
 	srv := serveNZB(minimalNZB(`BR2049 "Blade.Runner.2049.2017.Bluray-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
@@ -765,7 +765,7 @@ func TestPipeline_EmptyNZB(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20002, "tt2000200", "Empty Release", 2024, "")
+	movieID, _ := db.AddMovie(20002, "tt2000200", "Empty Release", 2024, "", "")
 	srv := serveNZB(emptyNZB())
 	defer srv.Close()
 
@@ -777,11 +777,15 @@ func TestPipeline_EmptyNZB(t *testing.T) {
 	if movie.Status != "failed" {
 		t.Errorf("movie.status = %q, want failed", movie.Status)
 	}
-	// Check download_error mentions "no media files".
+	// failAndRetry blocklists the bad NZB and re-searches. Since no indexers are
+	// configured in tests, re-search finds nothing and sets "all releases exhausted"
+	// or "re-search failed".
 	var errMsg sql.NullString
 	db.QueryRow(`SELECT download_error FROM movies WHERE id = ?`, movieID).Scan(&errMsg)
-	if !errMsg.Valid || !strings.Contains(errMsg.String, "no media files") {
-		t.Errorf("download_error = %v, should mention 'no media files'", errMsg)
+	if !errMsg.Valid || !(strings.Contains(errMsg.String, "no media files") ||
+		strings.Contains(errMsg.String, "exhausted") ||
+		strings.Contains(errMsg.String, "re-search")) {
+		t.Errorf("download_error = %v, should mention failure reason", errMsg)
 	}
 }
 
@@ -795,7 +799,7 @@ func TestPipeline_OrphanedMediaID(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20003, "tt2000300", "Deleted Movie", 2024, "")
+	movieID, _ := db.AddMovie(20003, "tt2000300", "Deleted Movie", 2024, "", "")
 
 	srv := serveNZB(minimalNZB(`Deleted Movie "Deleted.Movie.2024.WEBDL-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
@@ -821,7 +825,7 @@ func TestPipeline_UnknownQuality(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20004, "tt2000400", "Mystery Film", 2024, "")
+	movieID, _ := db.AddMovie(20004, "tt2000400", "Mystery Film", 2024, "", "")
 
 	srv := serveNZB(minimalNZB(`Mystery Film "mystery_film.mkv" yEnc (1/1)`))
 	defer srv.Close()
@@ -857,7 +861,7 @@ func TestPipeline_NestedExtraction(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20005, "tt2000500", "Interstellar", 2014, "")
+	movieID, _ := db.AddMovie(20005, "tt2000500", "Interstellar", 2014, "", "")
 	srv := serveNZB(minimalNZB(`Interstellar "Interstellar.2014.Bluray-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
@@ -884,7 +888,7 @@ func TestPipeline_SampleNotImportedAsMain(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20006, "tt2000600", "Arrival", 2016, "")
+	movieID, _ := db.AddMovie(20006, "tt2000600", "Arrival", 2016, "", "")
 	srv := serveNZB(minimalNZBTwoFiles(
 		`Arrival 2016 "Arrival.2016.WEBDL-1080p.mkv" yEnc (1/1)`,
 		`Arrival 2016 "Arrival.2016.WEBDL-1080p-sample.mkv" yEnc (1/1)`,
@@ -915,7 +919,7 @@ func TestPipeline_SpecialCharsInTitle(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20007, "tt2000700", "Mission: Impossible - Dead Reckoning", 2023, "")
+	movieID, _ := db.AddMovie(20007, "tt2000700", "Mission: Impossible - Dead Reckoning", 2023, "", "")
 	srv := serveNZB(minimalNZB(`MI "Mission.Impossible.Dead.Reckoning.2023.WEBDL-1080p.mkv" yEnc (1/1)`))
 	defer srv.Close()
 
@@ -946,7 +950,7 @@ func TestPipeline_FailedDownloadCleansUpIncompleteDir(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(20008, "tt2000800", "Bad Download", 2024, "")
+	movieID, _ := db.AddMovie(20008, "tt2000800", "Bad Download", 2024, "", "")
 
 	// Serve valid NZB so the download dir gets created, but the NZB
 	// has no files so postprocess will find nothing -> fails.
@@ -978,7 +982,7 @@ func TestPipeline_StuckDownloadReset(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(30001, "tt3000100", "Stuck Movie", 2024, "")
+	movieID, _ := db.AddMovie(30001, "tt3000100", "Stuck Movie", 2024, "", "")
 
 	// Set movie status to 'downloading' with download_started_at 3 hours ago.
 	db.Exec(`UPDATE movies SET status = 'downloading', download_started_at = datetime('now', '-3 hours') WHERE id = ?`, movieID)
@@ -1036,7 +1040,7 @@ func TestUpdateDownloadStatus_SetsStartedAt(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(30002, "tt3000200", "Started Movie", 2024, "")
+	movieID, _ := db.AddMovie(30002, "tt3000200", "Started Movie", 2024, "", "")
 
 	// Initially download_started_at should be NULL.
 	var startedAt sql.NullString
@@ -1065,8 +1069,8 @@ func TestStartPreservesPostProcessing(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID1, _ := db.AddMovie(40001, "tt4000100", "Downloading Movie", 2024, "")
-	movieID2, _ := db.AddMovie(40002, "tt4000200", "PostProcessing Movie", 2024, "")
+	movieID1, _ := db.AddMovie(40001, "tt4000100", "Downloading Movie", 2024, "", "")
+	movieID2, _ := db.AddMovie(40002, "tt4000200", "PostProcessing Movie", 2024, "", "")
 
 	// Set movie statuses to simulate previous daemon state.
 	db.Exec(`UPDATE movies SET status = 'downloading' WHERE id = ?`, movieID1)
@@ -1101,7 +1105,7 @@ func TestResumePostProcessing(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(40003, "tt4000300", "Resume Movie", 2024, "")
+	movieID, _ := db.AddMovie(40003, "tt4000300", "Resume Movie", 2024, "", "")
 
 	// Enqueue the download, then set status to post_processing.
 	enqueueItem(t, db, "movie", movieID, "http://example.com/3.nzb",
@@ -1152,7 +1156,7 @@ func TestResumePostProcessingMissingDir(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(40004, "tt4000400", "Missing Dir Movie", 2024, "")
+	movieID, _ := db.AddMovie(40004, "tt4000400", "Missing Dir Movie", 2024, "", "")
 
 	// Enqueue the download, then set status to post_processing.
 	enqueueItem(t, db, "movie", movieID, "http://example.com/4.nzb",
@@ -1196,7 +1200,7 @@ func TestResumeAlreadyImported(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(40005, "tt4000500", "Already Imported", 2024, "")
+	movieID, _ := db.AddMovie(40005, "tt4000500", "Already Imported", 2024, "", "")
 
 	// Enqueue the download, then set status to post_processing.
 	enqueueItem(t, db, "movie", movieID, "http://example.com/5.nzb",
@@ -1260,7 +1264,7 @@ func TestHasActiveDownloadIncludesPostProcessing(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(40006, "tt4000600", "Active PP Movie", 2024, "")
+	movieID, _ := db.AddMovie(40006, "tt4000600", "Active PP Movie", 2024, "", "")
 
 	// Enqueue a download.
 	ok, err := db.EnqueueDownload("movie", movieID, "http://example.com/6.nzb",
@@ -1292,7 +1296,7 @@ func TestPipeline_SavesNZBManifest(t *testing.T) {
 	}
 	defer db.Close()
 
-	movieID, _ := db.AddMovie(40007, "tt4000700", "Manifest Movie", 2024, "")
+	movieID, _ := db.AddMovie(40007, "tt4000700", "Manifest Movie", 2024, "", "")
 	nzbXML := minimalNZB(`Manifest Movie "Manifest.Movie.2024.WEBDL-1080p.mkv" yEnc (1/1)`)
 	srv := serveNZB(nzbXML)
 	defer srv.Close()

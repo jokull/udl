@@ -1,0 +1,76 @@
+{{template "layout" .}}
+
+{{define "title"}} — Status{{end}}
+
+{{define "content"}}
+<h1>Status</h1>
+
+<div class="status-grid">
+  <div class="status-card">
+    <h3>Library</h3>
+    <dl>
+      <dt>Movies</dt><dd>{{.Status.MovieCount}}</dd>
+      <dt>Series</dt><dd>{{.Status.SeriesCount}}</dd>
+      <dt>Movies path</dt><dd class="small">{{.Status.LibraryMovies}}</dd>
+      <dt>TV path</dt><dd class="small">{{.Status.LibraryTV}}</dd>
+    </dl>
+  </div>
+
+  <div class="status-card">
+    <h3>Queue</h3>
+    <dl>
+      <dt>Active</dt><dd>{{.Status.Downloading}}</dd>
+      <dt>Queued</dt><dd>{{.Status.QueueSize}}</dd>
+      <dt>Failed (24h)</dt><dd>{{.Status.FailedCount}}</dd>
+      <dt>Blocklisted</dt><dd>{{.Status.BlockedCount}}</dd>
+    </dl>
+  </div>
+
+  <div class="status-card">
+    <h3>Quality Profile</h3>
+    <dl>
+      <dt>Profile</dt><dd>{{.Config.Profile}}</dd>
+      <dt>Min</dt><dd>{{.Config.MinQuality}}</dd>
+      <dt>Preferred</dt><dd>{{.Config.Preferred}}</dd>
+      <dt>Upgrade until</dt><dd>{{.Config.UpgradeUntil}}</dd>
+      {{if .Config.MustNotContain}}<dt>Must not contain</dt><dd>{{range $i, $v := .Config.MustNotContain}}{{if $i}}, {{end}}{{$v}}{{end}}</dd>{{end}}
+      {{if .Config.PreferredWords}}<dt>Preferred words</dt><dd>{{range $i, $v := .Config.PreferredWords}}{{if $i}}, {{end}}{{$v}}{{end}}</dd>{{end}}
+      {{if .Config.RetentionDays}}<dt>Retention</dt><dd>{{.Config.RetentionDays}} days</dd>{{end}}
+    </dl>
+  </div>
+
+  <div class="status-card">
+    <h3>Indexers</h3>
+    <dl>
+      {{range .Config.Indexers}}
+      <dt>{{.}}</dt><dd><span class="health-ok">active</span></dd>
+      {{else}}
+      <dd class="muted">None configured</dd>
+      {{end}}
+    </dl>
+  </div>
+
+  <div class="status-card">
+    <h3>Providers</h3>
+    <dl>
+      {{range .Config.Providers}}
+      <dt>{{.}}</dt><dd><span class="health-ok">active</span></dd>
+      {{else}}
+      <dd class="muted">None configured</dd>
+      {{end}}
+    </dl>
+  </div>
+
+  {{if .Status.Checks}}
+  <div class="status-card">
+    <h3>Health Checks</h3>
+    <dl>
+      {{range .Status.Checks}}
+      <dt>{{.Name}}</dt>
+      <dd><span class="health-{{.Status}}">{{.Status}}</span> {{.Message}}</dd>
+      {{end}}
+    </dl>
+  </div>
+  {{end}}
+</div>
+{{end}}

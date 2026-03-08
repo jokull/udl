@@ -24,6 +24,7 @@
     <td class="small">{{fmtDate .AirDate}}</td>
     <td class="small">{{fmtNullTimeStr .LastSearchedAt}}</td>
     <td>
+      <a class="btn-sm" href="/releases/{{.Category}}/{{.MediaID}}">releases</a>
       <button class="btn-sm" hx-post="/wanted/search/{{.Category}}/{{.MediaID}}" hx-target="closest td" hx-swap="innerHTML">search</button>
       {{if eq .Category "movie"}}<button class="btn-sm" hx-post="/wanted/remove/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete"
         hx-confirm="Delete movie?">remove</button>{{else}}<button class="btn-sm" hx-post="/wanted/remove/{{.Category}}/{{.MediaID}}" hx-target="closest tr" hx-swap="delete"

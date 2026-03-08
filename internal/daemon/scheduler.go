@@ -75,6 +75,14 @@ func (s *Scheduler) runEpisodeSearch() {
 		s.svc.plex.ClearEpisodeCache()
 	}
 
+	// Reset episodes that have been 'failed' for >2h back to 'wanted'.
+	// Episodes are searched more frequently than movies, so use a shorter window.
+	if n, err := s.svc.db.ResetFailedEpisodes(2 * time.Hour); err != nil {
+		s.svc.log.Error("episode search: reset failed episodes", "error", err)
+	} else if n > 0 {
+		s.svc.log.Info("episode search: reset stale failed episodes to wanted", "count", n)
+	}
+
 	episodes, err := s.svc.db.SearchableEpisodes(5)
 	if err != nil {
 		s.svc.log.Error("episode search: query failed", "error", err)

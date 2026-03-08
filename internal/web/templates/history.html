@@ -5,6 +5,16 @@
 {{define "content"}}
 <h1>History</h1>
 
+<div class="filter-tabs">
+  <a href="/history" {{if and (eq .TypeFilter "") (eq .EventFilter "")}}class="active"{{end}}>All</a>
+  <a href="/history?type=movie{{if .EventFilter}}&event={{.EventFilter}}{{end}}" {{if eq .TypeFilter "movie"}}class="active"{{end}}>Movies</a>
+  <a href="/history?type=episode{{if .EventFilter}}&event={{.EventFilter}}{{end}}" {{if eq .TypeFilter "episode"}}class="active"{{end}}>Episodes</a>
+  <span class="muted">|</span>
+  <a href="/history?event=grabbed{{if .TypeFilter}}&type={{.TypeFilter}}{{end}}" {{if eq .EventFilter "grabbed"}}class="active"{{end}}>Grabbed</a>
+  <a href="/history?event=completed{{if .TypeFilter}}&type={{.TypeFilter}}{{end}}" {{if eq .EventFilter "completed"}}class="active"{{end}}>Completed</a>
+  <a href="/history?event=failed{{if .TypeFilter}}&type={{.TypeFilter}}{{end}}" {{if eq .EventFilter "failed"}}class="active"{{end}}>Failed</a>
+</div>
+
 {{if .Events}}
 <table>
   <tr><th>Time</th><th>Type</th><th>Title</th><th>Event</th><th>Quality</th><th>Source</th></tr>

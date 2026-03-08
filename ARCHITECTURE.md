@@ -1,5 +1,54 @@
 # Architecture
 
+## Pre-Beta Robustness Roadmap (2026-03)
+
+This section is authoritative for reliability hardening work in pre-beta.
+
+### Immediate priorities (in progress)
+
+1. Control-plane correctness
+   - Queue pause/resume must be real (no-op RPC removed).
+   - State-changing RPC/web operations must fail loudly on persistence errors.
+
+2. Safer destructive operations
+   - Any delete operation that touches media files must verify target paths are inside configured library roots.
+   - Refuse deletion on path escape, symlink surprises, or non-absolute paths.
+
+3. Backpressure and failure containment
+   - Reduce DB/UI polling pressure and add request-level throttling where needed.
+   - Prevent worker retry storms on transient post-processing failures.
+
+### Next priorities (pre-beta)
+
+1. Explicit media state machine
+   - Centralize all legal status transitions (`wanted -> queued -> downloading -> post_processing -> downloaded|failed`).
+   - Reject invalid transitions in one place.
+
+2. Durable execution state split
+   - Introduce a dedicated `downloads` execution table (attempts, lease owner, heartbeat, retry policy, phase timestamps).
+   - Keep `movies`/`episodes` as desired-state + current best-known media metadata.
+
+3. Migration discipline
+   - Move from ad-hoc `ALTER TABLE` checks to versioned, transactional migrations (`schema_migrations`).
+   - Enforce startup compatibility checks before daemon serves requests.
+
+### Candidate libraries / systems
+
+- River (Postgres jobs): https://github.com/riverqueue/river
+- Asynq (Redis jobs): https://github.com/hibiken/asynq
+- NATS JetStream (durable queue semantics): https://docs.nats.io/nats-concepts/jetstream
+- Retry/backoff primitives:
+  - https://github.com/cenkalti/backoff
+  - https://github.com/hashicorp/go-retryablehttp
+  - https://pkg.go.dev/golang.org/x/time/rate
+
+### Acceptance criteria for this phase
+
+- `queue pause` and `queue resume` visibly alter downloader behavior.
+- Completion path does not report success if DB transaction failed.
+- Deletes outside configured library roots are blocked and logged.
+- No behavior regressions in `go test ./...`.
+
 ## Config File
 
 Single TOML file at `~/.config/udl/config.toml` (or `$UDL_CONFIG`).

@@ -12,6 +12,7 @@ type Movie struct {
 	Title            string
 	Year             int
 	OriginalLanguage sql.NullString
+	PosterPath       sql.NullString
 	Status           string
 	Quality          sql.NullString
 	FilePath         sql.NullString
@@ -36,6 +37,7 @@ type Series struct {
 	Title            string
 	Year             int
 	OriginalLanguage sql.NullString
+	PosterPath       sql.NullString
 	Status           string
 	AddedAt          sql.NullString
 	LastRefreshedAt  sql.NullString

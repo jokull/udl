@@ -11,13 +11,21 @@ import (
 	"time"
 )
 
-// DetectLLMCLI checks PATH for codex or claude CLI. Returns the path to the
-// first found binary, or empty string if neither is available.
-func DetectLLMCLI() string {
+// DetectLLMCLIs checks PATH for codex and claude CLIs. Returns all found paths.
+func DetectLLMCLIs() []string {
+	var found []string
 	for _, name := range []string{"codex", "claude"} {
 		if p, err := exec.LookPath(name); err == nil {
-			return p
+			found = append(found, p)
 		}
+	}
+	return found
+}
+
+// DetectLLMCLI returns the first available LLM CLI (for backward compat).
+func DetectLLMCLI() string {
+	if clis := DetectLLMCLIs(); len(clis) > 0 {
+		return clis[0]
 	}
 	return ""
 }
@@ -26,23 +34,58 @@ func DetectLLMCLI() string {
 var llmPickRe = regexp.MustCompile(`(?m)^\s*#?(\d+)\b`)
 
 // LLMPickRelease asks an LLM CLI to pick the best release from the list.
+// Tries each available CLI in order, falling back on failure.
 // Returns the 0-based index into releases, -1 for SKIP, or error.
 func (s *Service) LLMPickRelease(releases []ScoredRelease, ctx GrabContext) (int, error) {
 	if s.llmCLI == "" {
 		return -1, fmt.Errorf("no LLM CLI available")
 	}
 
-	prompt := s.buildLLMPrompt(releases, ctx)
+	clis := DetectLLMCLIs()
+	if len(clis) == 0 {
+		return -1, fmt.Errorf("no LLM CLI available")
+	}
+
+	// Filter out rejected releases — no point sending them to the LLM.
+	var eligible []ScoredRelease
+	var originalIdx []int // maps eligible index → original releases index
+	for i, r := range releases {
+		if !r.Rejected {
+			eligible = append(eligible, r)
+			originalIdx = append(originalIdx, i)
+		}
+	}
+	if len(eligible) == 0 {
+		return -1, fmt.Errorf("all releases rejected")
+	}
+
+	prompt := s.buildLLMPrompt(eligible, ctx)
 	s.log.Debug("LLM prompt", "prompt", prompt)
 
+	var lastErr error
+	for _, cli := range clis {
+		name := cliBaseName(cli)
+		idx, err := s.runLLMCLI(cli, name, prompt, len(eligible))
+		if err == nil {
+			if idx < 0 {
+				return -1, nil // SKIP
+			}
+			return originalIdx[idx], nil
+		}
+		s.log.Warn("LLM CLI failed, trying next", "cli", name, "error", classifyLLMError(name, err.Error()))
+		lastErr = err
+	}
+
+	return -1, lastErr
+}
+
+// runLLMCLI executes a single LLM CLI and parses its response.
+func (s *Service) runLLMCLI(cliPath, cliName, prompt string, numReleases int) (int, error) {
 	cmdCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	var cmd *exec.Cmd
-	cliName := cliBaseName(s.llmCLI)
 	switch cliName {
 	case "codex":
-		// Use temp file for output; pass prompt via stdin ("-") to avoid ARG_MAX.
 		tmpFile, err := os.CreateTemp("", "udl-llm-*.txt")
 		if err != nil {
 			return -1, fmt.Errorf("create temp file: %w", err)
@@ -51,7 +94,7 @@ func (s *Service) LLMPickRelease(releases []ScoredRelease, ctx GrabContext) (int
 		tmpFile.Close()
 		defer os.Remove(tmpPath)
 
-		cmd = exec.CommandContext(cmdCtx, s.llmCLI, "exec",
+		cmd := exec.CommandContext(cmdCtx, cliPath, "exec",
 			"--sandbox", "read-only",
 			"--skip-git-repo-check",
 			"-o", tmpPath,
@@ -59,28 +102,62 @@ func (s *Service) LLMPickRelease(releases []ScoredRelease, ctx GrabContext) (int
 		cmd.Stdin = strings.NewReader(prompt)
 		combinedOut, err := cmd.CombinedOutput()
 		if err != nil {
-			return -1, fmt.Errorf("codex exec: %w (output: %s)", err, string(combinedOut))
+			return -1, fmt.Errorf("codex: %s", classifyLLMError("codex", string(combinedOut)))
 		}
 		output, err := os.ReadFile(tmpPath)
 		if err != nil {
 			return -1, fmt.Errorf("read codex output: %w", err)
 		}
-		s.log.Debug("LLM response", "output", string(output))
-		return parseLLMResponse(string(output), len(releases))
+		s.log.Debug("LLM response", "cli", "codex", "output", string(output))
+		return parseLLMResponse(string(output), numReleases)
 
 	case "claude":
-		cmd = exec.CommandContext(cmdCtx, s.llmCLI, "-p", prompt)
-		// Strip CLAUDECODE env var to prevent nesting guard
+		cmd := exec.CommandContext(cmdCtx, cliPath, "-p", prompt)
 		cmd.Env = filterEnv(os.Environ(), "CLAUDECODE")
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			return -1, fmt.Errorf("claude: %w (output: %s)", err, string(output))
+			return -1, fmt.Errorf("claude: %s", classifyLLMError("claude", string(output)))
 		}
-		s.log.Debug("LLM response", "output", string(output))
-		return parseLLMResponse(string(output), len(releases))
+		s.log.Debug("LLM response", "cli", "claude", "output", string(output))
+		return parseLLMResponse(string(output), numReleases)
 
 	default:
 		return -1, fmt.Errorf("unknown LLM CLI: %s", cliName)
+	}
+}
+
+// classifyLLMError extracts a human-readable reason from CLI error output.
+func classifyLLMError(cli, output string) string {
+	lower := strings.ToLower(output)
+	switch {
+	case strings.Contains(lower, "usage_limit_reached") || strings.Contains(lower, "usage limit"):
+		return cli + " usage limit reached"
+	case strings.Contains(lower, "rate_limit") || strings.Contains(lower, "rate limit") || strings.Contains(lower, "429"):
+		return cli + " rate limited"
+	case strings.Contains(lower, "unauthorized") || strings.Contains(lower, "401") || strings.Contains(lower, "invalid_api_key"):
+		return cli + " authentication failed"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "timed out"):
+		return cli + " timed out"
+	case strings.Contains(lower, "network") || strings.Contains(lower, "connection"):
+		return cli + " network error"
+	default:
+		// Return first meaningful line (skip version banners)
+		for _, line := range strings.Split(output, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "OpenAI") ||
+				strings.HasPrefix(line, "workdir:") || strings.HasPrefix(line, "model:") ||
+				strings.HasPrefix(line, "provider:") || strings.HasPrefix(line, "approval:") ||
+				strings.HasPrefix(line, "sandbox:") || strings.HasPrefix(line, "reasoning") ||
+				strings.HasPrefix(line, "session id:") || strings.HasPrefix(line, "user") ||
+				strings.HasPrefix(line, "mcp startup:") {
+				continue
+			}
+			if len(line) > 120 {
+				line = line[:120] + "..."
+			}
+			return cli + ": " + line
+		}
+		return cli + " failed"
 	}
 }
 
@@ -192,19 +269,14 @@ func (s *Service) buildLLMPrompt(releases []ScoredRelease, ctx GrabContext) stri
 
 	b.WriteString("- Larger size generally means higher bitrate within same quality tier\n")
 
-	// Blocklist context
-	blocklist, _ := s.db.ListBlocklistForMedia(ctx.Category, ctx.MediaID)
-	if len(blocklist) > 0 {
-		b.WriteString("\nPreviously failed releases (blocklisted):\n")
-		for _, bl := range blocklist {
-			fmt.Fprintf(&b, "- %s (%s)\n", bl.ReleaseTitle, bl.Reason)
-		}
-	}
+	b.WriteString("- All listed releases have already passed quality/size validation — they are all acceptable downloads\n")
+	b.WriteString("- Your job is to pick the BEST one, not to reject them. Only say SKIP if a release has wrong language or wrong content\n")
+	b.WriteString("- Age alone is NOT a reason to skip — old releases are fine if within retention\n")
 
 	b.WriteString("\nPick ONE release number, or say SKIP if none are acceptable.\n")
 	b.WriteString("Reply format: {number} — {one-line reason}\n\n")
 
-	// Release table
+	// Release table (only non-rejected releases reach here)
 	b.WriteString("Releases:\n")
 	for i, sr := range releases {
 		age := releaseAge(sr.Release.PubDate)
@@ -217,13 +289,8 @@ func (s *Service) buildLLMPrompt(releases []ScoredRelease, ctx GrabContext) stri
 			sizeStr = formatBytes(sr.Release.Size)
 		}
 
-		status := ""
-		if sr.Rejected {
-			status = fmt.Sprintf(" [REJECTED: %s]", sr.RejectionReason)
-		}
-
-		fmt.Fprintf(&b, "#%d  %s  |  %s  |  %s  |  %s  |  score:%d%s\n",
-			i+1, sr.Release.Title, sr.Quality, sizeStr, ageStr, sr.Score, status)
+		fmt.Fprintf(&b, "#%d  %s  |  %s  |  %s  |  %s  |  score:%d\n",
+			i+1, sr.Release.Title, sr.Quality, sizeStr, ageStr, sr.Score)
 	}
 
 	return b.String()

@@ -12,6 +12,8 @@
     <button hx-post="/queue/pause" hx-swap="outerHTML" hx-target="#pause-toggle">Pause</button>
     {{end}}
   </span>
+  <button hx-post="/queue/clear" hx-confirm="Clear all queued downloads?" hx-swap="none"
+    onclick="setTimeout(()=>location.reload(),500)">Clear</button>
   <span class="small muted">
     {{if .FreeDisk}}Free: {{fmtBytes .FreeDisk}}{{end}}
     {{if .QueueSize}} · Queued: {{fmtBytes .QueueSize}}{{end}}

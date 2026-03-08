@@ -49,6 +49,9 @@ type Downloader struct {
 	stop          chan struct{}
 	stopOnce      sync.Once
 	paused        atomic.Bool
+	ppRetryAfter  map[string]time.Time // category:mediaID → earliest retry time
+	retryCount    map[string]int       // category:mediaID → consecutive auto-retry count
+	retryMu       sync.Mutex           // protects retryCount
 }
 
 // Pause pauses the download queue processing.
@@ -87,10 +90,12 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 	return &Downloader{
 		svc:           svc,
 		engine:        engine,
-		indexers:       indexers,
+		indexers:      indexers,
 		downloadCh:    make(chan database.QueueItem, 32),
 		postProcessCh: make(chan database.QueueItem, 8),
 		stop:          make(chan struct{}),
+		ppRetryAfter:  make(map[string]time.Time),
+		retryCount:    make(map[string]int),
 	}
 }
 
@@ -103,6 +108,8 @@ func NewDownloaderWithEngine(svc *Service, engine DownloadEngine) *Downloader {
 		downloadCh:    make(chan database.QueueItem, 32),
 		postProcessCh: make(chan database.QueueItem, 8),
 		stop:          make(chan struct{}),
+		ppRetryAfter:  make(map[string]time.Time),
+		retryCount:    make(map[string]int),
 	}
 }
 
@@ -133,7 +140,6 @@ func (d *Downloader) Start(ctx context.Context) {
 			d.svc.log.Error("failed to reset stale downloads", "table", table, "error", err)
 		}
 	}
-
 
 	// Clean up stale .udl-tmp files from interrupted imports (runs in background
 	// because filepath.Walk on a large external library can take minutes).
@@ -199,6 +205,9 @@ func (d *Downloader) Stop() {
 }
 
 // watchdog resets stuck downloads and re-enqueues pending items that were missed.
+// Note: failed items are NOT auto-reset here. failAndRetry() handles immediate
+// re-search on failure. Items that exhaust all releases stay 'failed' until the
+// next scheduler sweep finds new indexer results.
 func (d *Downloader) watchdog() {
 	if n, err := d.svc.db.ResetStuckMedia(); err != nil {
 		d.svc.log.Error("watchdog: reset stuck failed", "error", err)
@@ -237,6 +246,14 @@ func (d *Downloader) processItem(ctx context.Context, item database.QueueItem) {
 		item.Status = currentStatus
 	default:
 		return // no longer active
+	}
+
+	// Back off on post_processing retries: if a transient error is set, wait 2 minutes.
+	if item.Status == "post_processing" && item.ErrorMsg.Valid && strings.Contains(item.ErrorMsg.String, "(retrying)") {
+		key := fmt.Sprintf("%s:%d", item.Category, item.MediaID)
+		if t, ok := d.ppRetryAfter[key]; ok && time.Now().Before(t) {
+			return
+		}
 	}
 
 	d.svc.log.Info("processing download", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "status", item.Status)
@@ -439,18 +456,22 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 
 	nzbData, err := d.fetchNZB(nzbURL)
 	if err != nil {
-		return d.fail(item, fmt.Sprintf("fetch NZB: %v", err))
+		return d.failAndRetry(item, fmt.Sprintf("fetch NZB: %v", err))
 	}
 
 	// 4. Parse NZB XML.
 	parsed, err := nzb.Parse(bytes.NewReader(nzbData))
 	if err != nil {
-		return d.fail(item, fmt.Sprintf("parse NZB: %v", err))
+		return d.failAndRetry(item, fmt.Sprintf("parse NZB: %v", err))
 	}
 	d.svc.log.Info("usenet: starting NNTP download", "title", item.Title, "files", len(parsed.Files))
 
 	// 5. Create download directory under incomplete.
 	dlDir := d.downloadDir(item)
+
+	// If the dir exists with a different release, clean it to avoid mixed files.
+	d.cleanStaleDownloadDir(dlDir, nzbData)
+
 	if err := os.MkdirAll(dlDir, 0o755); err != nil {
 		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
 	}
@@ -487,23 +508,25 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 
 	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
 	if healthAborted {
-		return d.fail(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
+		return d.failAndRetry(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
 	}
 	if err != nil {
 		if strings.Contains(err.Error(), "segments failed") {
 			d.svc.log.Warn("some segments failed, proceeding to PAR2 repair", "title", item.Title, "error", err)
 		} else {
-			return d.fail(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
+			return d.failAndRetry(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
 		}
 	}
 
 	// Save segment health for resume (post-process worker reads this).
 	saveSegmentHealth(dlDir, lastFailedSegments)
 
-	// 7. Update status to "post_processing" and hand off.
+	// 7. Update status to "post_processing" and reset progress for the new phase.
 	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "post_processing"); err != nil {
 		return fmt.Errorf("update status to post_processing: %w", err)
 	}
+	_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, 0, 0)
+	_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID, "queued")
 	item.Status = "post_processing"
 
 	// Non-blocking send to post-process worker; watchdog recovers if full.
@@ -519,6 +542,24 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 // downloadDir returns the path to the incomplete directory for this item.
 func (d *Downloader) downloadDir(item database.QueueItem) string {
 	return filepath.Join(d.svc.cfg.Paths.Incomplete, fmt.Sprintf("%s-%d", item.Category, item.MediaID))
+}
+
+// cleanStaleDownloadDir removes the download directory if it contains a manifest.nzb
+// from a different release than the current one. This prevents files from two different
+// releases mixing in the same directory (e.g. after a retry picks a different release).
+// If the manifest matches or doesn't exist, the directory is left intact for resume.
+func (d *Downloader) cleanStaleDownloadDir(dlDir string, currentNZB []byte) {
+	oldManifest, err := os.ReadFile(filepath.Join(dlDir, "manifest.nzb"))
+	if err != nil {
+		return // no existing manifest — fresh dir or already clean
+	}
+	if bytes.Equal(oldManifest, currentNZB) {
+		return // same release — safe to resume
+	}
+	d.svc.log.Info("download dir contains different release, cleaning", "dir", filepath.Base(dlDir))
+	if err := os.RemoveAll(dlDir); err != nil {
+		d.svc.log.Warn("failed to clean stale download dir", "dir", dlDir, "error", err)
+	}
 }
 
 // checkDiskSpace verifies that there's enough free space at path for the download.
@@ -669,18 +710,22 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 
 	nzbData, err := d.fetchNZB(nzbURL)
 	if err != nil {
-		return d.fail(item, fmt.Sprintf("fetch NZB: %v", err))
+		return d.failAndRetry(item, fmt.Sprintf("fetch NZB: %v", err))
 	}
 
 	// 3. Parse NZB XML.
 	parsed, err := nzb.Parse(bytes.NewReader(nzbData))
 	if err != nil {
-		return d.fail(item, fmt.Sprintf("parse NZB: %v", err))
+		return d.failAndRetry(item, fmt.Sprintf("parse NZB: %v", err))
 	}
 	d.svc.log.Info("usenet: starting NNTP download", "title", item.Title, "files", len(parsed.Files))
 
 	// 4. Create download directory under incomplete.
 	dlDir := d.downloadDir(item)
+
+	// If the dir exists with a different release, clean it to avoid mixed files.
+	d.cleanStaleDownloadDir(dlDir, nzbData)
+
 	if err := os.MkdirAll(dlDir, 0o755); err != nil {
 		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
 	}
@@ -717,14 +762,14 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 
 	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
 	if healthAborted {
-		return d.fail(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
+		return d.failAndRetry(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
 	}
 	if err != nil {
 		// Segment failures are expected — PAR2 can repair up to ~10-15% missing data.
 		if strings.Contains(err.Error(), "segments failed") {
 			d.svc.log.Warn("some segments failed, proceeding to PAR2 repair", "title", item.Title, "error", err)
 		} else {
-			return d.fail(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
+			return d.failAndRetry(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
 		}
 	}
 
@@ -759,13 +804,24 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 		FailedSegments: failedSegments,
 	})
 	if err != nil {
-		return d.fail(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
+		if postprocess.IsPermanent(err) {
+			// Permanent post-processing error (bad RAR, encrypted, etc.) — this NZB is
+			// definitively bad. Blocklist it and immediately try an alternative release.
+			return d.failAndRetry(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
+		}
+		// Transient error — leave in post_processing status for retry.
+		// Checkpoints ensure completed stages won't re-run.
+		key := fmt.Sprintf("%s:%d", item.Category, item.MediaID)
+		d.ppRetryAfter[key] = time.Now().Add(2 * time.Minute)
+		d.svc.log.Warn("post-processing failed (will retry in 2m)", "title", item.Title, "error", err)
+		_ = d.svc.db.SetMediaDownloadError(item.Category, item.MediaID, fmt.Sprintf("post-processing (retrying): %v", err))
+		return err
 	}
 	if !result.Success {
-		return d.fail(item, fmt.Sprintf("post-processing failed: %s", result.Error), downloadDir)
+		return d.failAndRetry(item, fmt.Sprintf("post-processing failed: %s", result.Error), downloadDir)
 	}
 	if len(result.MediaFiles) == 0 {
-		return d.fail(item, "no media files found after post-processing", downloadDir)
+		return d.failAndRetry(item, "no media files found after post-processing", downloadDir)
 	}
 
 	mainMedia := result.MediaFiles[0]
@@ -859,8 +915,14 @@ func (d *Downloader) completeDownload(item database.QueueItem, q quality.Quality
 
 	// Atomically clear download fields and record history in one transaction.
 	if err := d.svc.db.CompleteDownloadTx(item.Category, item.MediaID, item.Title, nzbName, q.String()); err != nil {
-		d.svc.log.Error("failed to complete download in DB", "title", item.Title, "error", err)
+		return fmt.Errorf("complete download transaction: %w", err)
 	}
+
+	// Clear retry counter on success.
+	key := fmt.Sprintf("%s:%d", item.Category, item.MediaID)
+	d.retryMu.Lock()
+	delete(d.retryCount, key)
+	d.retryMu.Unlock()
 
 	if err := os.RemoveAll(downloadDir); err != nil {
 		d.svc.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
@@ -969,8 +1031,14 @@ func failEvent(msg string) string {
 	}
 }
 
+// maxAutoRetries is the maximum number of times failAndRetry will automatically
+// re-search indexers after a download failure before giving up.
+const maxAutoRetries = 3
+
 // fail marks the media item as failed, records a history event, blocklists the release,
 // and returns an error. If cleanupDir is provided, the directory is removed.
+// This is the low-level failure handler — callers that want automatic retry should
+// use failAndRetry() instead.
 func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...string) error {
 	if err := d.svc.db.SetMediaDownloadError(item.Category, item.MediaID, msg); err != nil {
 		d.svc.log.Error("failed to set download error", "title", item.Title, "error", err)
@@ -999,6 +1067,94 @@ func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...str
 		}
 	}
 	return fmt.Errorf("%s %d (%s): %s", item.Category, item.MediaID, item.Title, msg)
+}
+
+// failAndRetry calls fail() to blocklist the release and clean up, then immediately
+// re-searches indexers for an alternative release. If a new release is found and
+// enqueued, it dispatches it to the download worker. If all releases are exhausted,
+// the item stays in 'failed' status.
+//
+// Tracks retry count per media item internally. Capped at maxAutoRetries to prevent
+// infinite loops within a single failure chain. The counter resets on successful download.
+func (d *Downloader) failAndRetry(item database.QueueItem, msg string, cleanupDir ...string) error {
+	failErr := d.fail(item, msg, cleanupDir...)
+
+	key := fmt.Sprintf("%s:%d", item.Category, item.MediaID)
+	d.retryMu.Lock()
+	retryNum := d.retryCount[key]
+	d.retryMu.Unlock()
+
+	if retryNum >= maxAutoRetries {
+		d.svc.log.Info("retry limit reached, staying failed",
+			"category", item.Category, "media_id", item.MediaID, "title", item.Title, "retries", retryNum)
+		// Clear retry counter so that if the scheduler resets this item to 'wanted'
+		// later (e.g., after 6h when new indexer results may exist), it gets fresh retries.
+		d.retryMu.Lock()
+		delete(d.retryCount, key)
+		d.retryMu.Unlock()
+		return failErr
+	}
+
+	// Reset to 'wanted' so EnqueueDownload can transition it back to 'queued'.
+	if err := d.svc.db.ResetMediaForRetry(item.Category, item.MediaID); err != nil {
+		d.svc.log.Error("failAndRetry: reset to wanted failed", "title", item.Title, "error", err)
+		return failErr
+	}
+
+	d.retryMu.Lock()
+	d.retryCount[key] = retryNum + 1
+	d.retryMu.Unlock()
+
+	grabbed, searchErr := d.retrySearch(item)
+	if searchErr != nil {
+		d.svc.log.Error("failAndRetry: re-search failed", "title", item.Title, "error", searchErr)
+		_ = d.svc.db.SetMediaDownloadError(item.Category, item.MediaID,
+			fmt.Sprintf("re-search failed: %v", searchErr))
+		return failErr
+	}
+
+	if !grabbed {
+		d.svc.log.Info("failAndRetry: all releases exhausted",
+			"category", item.Category, "media_id", item.MediaID, "title", item.Title)
+		_ = d.svc.db.SetMediaDownloadError(item.Category, item.MediaID,
+			fmt.Sprintf("all releases exhausted after %d retries", retryNum+1))
+		// Clear retry counter so scheduler-driven resets get fresh retries.
+		d.retryMu.Lock()
+		delete(d.retryCount, key)
+		d.retryMu.Unlock()
+		return failErr
+	}
+
+	d.svc.log.Info("failAndRetry: grabbed alternative release",
+		"category", item.Category, "media_id", item.MediaID, "title", item.Title, "retry", retryNum+1)
+	return nil
+}
+
+// retrySearch re-searches indexers for a media item and grabs the best available
+// release. Returns true if a new release was grabbed and enqueued.
+func (d *Downloader) retrySearch(item database.QueueItem) (bool, error) {
+	switch item.Category {
+	case "movie":
+		movie, err := d.svc.db.GetMovie(item.MediaID)
+		if err != nil {
+			return false, fmt.Errorf("get movie %d: %w", item.MediaID, err)
+		}
+		return d.svc.SearchAndGrabMovie(movie)
+
+	case "episode":
+		ep, err := d.svc.db.GetEpisode(item.MediaID)
+		if err != nil {
+			return false, fmt.Errorf("get episode %d: %w", item.MediaID, err)
+		}
+		tvdbID := 0
+		if ep.TvdbID.Valid {
+			tvdbID = int(ep.TvdbID.Int64)
+		}
+		return d.svc.SearchAndGrabEpisode(ep, tvdbID)
+
+	default:
+		return false, fmt.Errorf("unknown category: %s", item.Category)
+	}
 }
 
 // HealthChecks runs all diagnostic checks and returns the results.

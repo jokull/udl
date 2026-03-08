@@ -1,0 +1,28 @@
+{{template "layout" .}}
+
+{{define "title"}} — Blocklist{{end}}
+
+{{define "content"}}
+<h1>Blocklist</h1>
+
+{{if .Entries}}
+<p><button class="btn-sm" hx-post="/blocklist/clear" hx-confirm="Clear entire blocklist?" hx-target="#blocklist-table" hx-swap="innerHTML">Clear All</button></p>
+<table id="blocklist-table">
+  <tr><th>Release</th><th>Media</th><th>Reason</th><th>Date</th><th></th></tr>
+  {{range .Entries}}
+  <tr>
+    <td class="small">{{.ReleaseTitle}}</td>
+    <td>
+      {{if eq .MediaType "movie"}}movie{{else}}S{{printf "%02d" .Season}}E{{printf "%02d" .EpisodeNum}}{{end}}
+      {{if .TmdbID}}<a class="ext" href="{{tmdbURL .MediaType .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
+    </td>
+    <td>{{.Reason}}</td>
+    <td class="small">{{fmtNullTimeStr .CreatedAt}}</td>
+    <td><button class="btn-sm" hx-post="/blocklist/remove/{{.ID}}" hx-target="closest tr" hx-swap="delete" hx-confirm="Remove from blocklist?">remove</button></td>
+  </tr>
+  {{end}}
+</table>
+{{else}}
+<p class="muted">No blocklisted releases.</p>
+{{end}}
+{{end}}
