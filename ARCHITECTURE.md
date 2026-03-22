@@ -418,7 +418,7 @@ format reply for terminal output. All logic lives in the daemon.
 |----------|--------|
 | Metadata provider | TMDB only |
 | Daemon IPC | `net/rpc` + gob over Unix socket |
-| PAR2 | Shell out to `par2cmdline` (v1) |
+| PAR2 | Shell out to `par2` (v1) |
 | Multi-episode files | File under first episode |
 | Project name | `udl` |
 

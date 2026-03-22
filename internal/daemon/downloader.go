@@ -1240,13 +1240,13 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 		checks = append(checks, HealthCheck{
 			Name:    "par2",
 			Status:  "ok",
-			Message: "par2cmdline installed",
+			Message: "par2 installed",
 		})
 	} else {
 		checks = append(checks, HealthCheck{
 			Name:    "par2",
 			Status:  "warning",
-			Message: "par2cmdline not found — repair unavailable",
+			Message: "par2 not found — repair unavailable",
 		})
 	}
 

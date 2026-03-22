@@ -26,10 +26,10 @@ automation. CLI-first, daemon mode, opinionated defaults.
 go build -o udl ./cmd/udl
 ```
 
-Requires `par2cmdline` for PAR2 verify/repair:
+Requires `par2` for PAR2 verify/repair:
 
 ```bash
-brew install par2cmdline
+brew install par2
 ```
 
 ## Running on macOS

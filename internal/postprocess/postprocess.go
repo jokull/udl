@@ -83,7 +83,7 @@ func isAppleDouble(name string) bool {
 }
 
 // removeAppleDoubleFiles deletes all ._* files from a directory.
-// Must run before par2cmdline which scans the dir and loads ._*.par2 ghosts.
+// Must run before par2 which scans the dir and loads ._*.par2 ghosts.
 func removeAppleDoubleFiles(dir string, log *slog.Logger) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -107,7 +107,7 @@ var rNumberedPattern = regexp.MustCompile(`(?i)^\.r\d+$`)
 // Pattern matching .partNN.rar for multi-volume archives.
 var partRARPattern = regexp.MustCompile(`(?i)\.part\d+\.rar$`)
 
-// HasPar2 returns true if par2cmdline is available on the system.
+// HasPar2 returns true if par2 is available on the system.
 func HasPar2() bool {
 	_, err := exec.LookPath("par2")
 	return err == nil
@@ -582,7 +582,7 @@ func findPAR2File(dir string) (string, error) {
 	return allMatches[0], nil
 }
 
-// par2Timeout is the maximum time to wait for par2cmdline to complete.
+// par2Timeout is the maximum time to wait for par2 to complete.
 // 12GB of data takes ~90s to verify; 30 minutes is generous.
 const par2Timeout = 30 * time.Minute
 
@@ -654,7 +654,7 @@ func runPar2WithProgress(cmd *exec.Cmd, phase string, progressFn ProgressFn, pct
 	}
 
 	// Read output in chunks, scanning for percentage patterns.
-	// par2cmdline uses \r to update progress in-place.
+	// par2 uses \r to update progress in-place.
 	buf := make([]byte, 4096)
 	for {
 		n, readErr := stdout.Read(buf)
@@ -677,11 +677,11 @@ func runPar2WithProgress(cmd *exec.Cmd, phase string, progressFn ProgressFn, pct
 	return outputBuf.Bytes(), err
 }
 
-// par2PercentRe matches par2cmdline progress output like "Scanning: ... : 45.2%"
+// par2PercentRe matches par2 progress output like "Scanning: ... : 45.2%"
 // or "Repairing: 78.3%" or "Verifying: 90.0%". Captures the percentage number.
 var par2PercentRe = regexp.MustCompile(`(\d+\.\d+)%`)
 
-// parsePar2Percent extracts the last percentage value from a par2cmdline output chunk.
+// parsePar2Percent extracts the last percentage value from a par2 output chunk.
 // Returns -1 if no percentage is found.
 func parsePar2Percent(chunk string) float64 {
 	matches := par2PercentRe.FindAllStringSubmatch(chunk, -1)

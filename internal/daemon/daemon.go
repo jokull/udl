@@ -2831,7 +2831,7 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 
 	// Check for par2cmdline availability.
 	if !postprocess.HasPar2() {
-		log.Warn("par2cmdline not found -- PAR2 repair unavailable. Install: brew install par2cmdline")
+		log.Warn("par2 not found -- PAR2 repair unavailable. Install: brew install par2")
 	}
 
 	dl.Start(ctx)

@@ -43,7 +43,7 @@ The core of UDL — replacing NZBGet's download engine.
 │           → Mark download as failed                 │
 │     IF all segments succeeded:                      │
 │       → Skip (NZBGet's "QuickPar" optimization)     │
-│     Shell out to par2cmdline for v1                  │
+│     Shell out to par2 for v1                  │
 └──────────────────────┬──────────────────────────────┘
                        │
 ┌──────────────────────▼──────────────────────────────┐
@@ -139,7 +139,7 @@ missing data blocks.
 
 ### Our Approach (v1)
 
-Shell out to `par2cmdline`:
+Shell out to `par2`:
 
 ```go
 // Verify

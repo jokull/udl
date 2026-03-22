@@ -35,7 +35,7 @@
 
 | Need | External Tool | Rationale |
 |------|--------------|-----------|
-| PAR2 verify+repair | `par2cmdline` | Only battle-tested option; pure Go (gopar) is experimental |
+| PAR2 verify+repair | `par2` | Only battle-tested option; pure Go (gopar) is experimental |
 
 ### Stdlib
 
@@ -140,7 +140,7 @@ PAR2 uses Reed-Solomon error correction:
 - NZBGet optimization: knows exactly which segments failed during download,
   skips full verification and goes straight to targeted repair
 
-For v1: shell out to `par2cmdline`. It's available via `brew install par2cmdline`
+For v1: shell out to `par2`. It's available via `brew install par2`
 and handles all the complexity. Command interface:
 
 ```bash

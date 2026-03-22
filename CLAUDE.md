@@ -55,7 +55,7 @@ internal/
   quality/                Quality tier enum (SDTV→Remux-2160p), profiles, ShouldGrab()
   organize/               File renaming + import (hardcoded Plex-compatible naming)
   par2/                   PAR2 binary parser (FileDesc packets, hash16k matching)
-  postprocess/            PAR2 rename + verify (par2cmdline), RAR (rardecode), cleanup
+  postprocess/            PAR2 rename + verify (par2), RAR (rardecode), cleanup
   tmdb/                   TMDB API wrapper (movies, TV, TVDB/IMDB cross-refs)
   plex/                   Plex friend-server availability check
   migrate/                Sonarr/Radarr import commands
@@ -67,7 +67,7 @@ internal/
 
 - Go 1.24, `modernc.org/sqlite` (pure Go, no CGo), `spf13/cobra`, `cyruzin/golang-tmdb`
 - `nwaples/rardecode` v2 for RAR, `golang.org/x/text` for unicode normalization
-- External: `par2cmdline` (brew install) for PAR2 verify/repair
+- External: `par2` (brew install) for PAR2 verify/repair
 
 ## Production Environment
 
