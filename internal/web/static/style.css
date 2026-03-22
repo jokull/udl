@@ -245,11 +245,19 @@ tr:has(> td[id^="episodes-"]) { background: none !important; }
 
 tr.unmonitored { opacity: 0.45; }
 
-/* ── Schedule day groups ── */
+/* ── Schedule day headers ── */
 
-.day-group {
-  margin-bottom: 1.5em;
+tr.day-header td {
+  font-weight: 600;
+  font-size: 0.95em;
+  color: #333;
+  padding-top: 1.25em;
+  padding-bottom: 0.4em;
+  border-bottom: 2px solid #d0d0d0;
+  background: none;
 }
+
+tr.day-header:hover { background: none; }
 
 /* ── Links ── */
 

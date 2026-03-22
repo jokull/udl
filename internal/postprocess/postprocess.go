@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/jokull/udl/internal/par2"
@@ -631,6 +632,16 @@ func par2Repair(ctx context.Context, par2File string, log *slog.Logger, progress
 func runPar2WithProgress(cmd *exec.Cmd, phase string, progressFn ProgressFn, pctMin, pctMax float64) ([]byte, error) {
 	// Capture all output for error reporting.
 	var outputBuf bytes.Buffer
+
+	// Kill entire process group so OpenMP threads don't orphan.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Kill the process group, not just the leader.
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	// After context cancel + kill, force-close pipes after 5s
+	// so the read loop unblocks even if child threads linger.
+	cmd.WaitDelay = 5 * time.Second
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

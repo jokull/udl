@@ -32,6 +32,69 @@ Requires `par2cmdline` for PAR2 verify/repair:
 brew install par2cmdline
 ```
 
+## Running on macOS
+
+UDL runs as a LaunchAgent for always-on background operation. The binary needs code signing because it accesses removable volumes (e.g. `/Volumes/Plex`) which require macOS TCC permission — ad-hoc signing pins to CDHash which changes every build, so a self-signed certificate provides a stable identity.
+
+### Setup
+
+1. Create a self-signed certificate named "UDL" in Keychain Access (login keychain, Code Signing)
+2. Build and sign:
+   ```bash
+   go build -o ~/bin/udl ./cmd/udl
+   codesign --force --sign "UDL" ~/bin/udl
+   ```
+3. Install the LaunchAgent plist at `~/Library/LaunchAgents/com.udl.daemon.plist`:
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+       <key>Label</key>
+       <string>com.udl.daemon</string>
+       <key>ProgramArguments</key>
+       <array>
+           <string>/Users/you/bin/udl</string>
+           <string>daemon</string>
+       </array>
+       <key>RunAtLoad</key>
+       <true/>
+       <key>KeepAlive</key>
+       <true/>
+       <key>ProcessType</key>
+       <string>Interactive</string>
+       <key>StandardOutPath</key>
+       <string>/Users/you/Library/Logs/udl.log</string>
+       <key>StandardErrorPath</key>
+       <string>/Users/you/Library/Logs/udl.log</string>
+       <key>EnvironmentVariables</key>
+       <dict>
+           <key>HOME</key>
+           <string>/Users/you</string>
+           <key>PATH</key>
+           <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+       </dict>
+   </dict>
+   </plist>
+   ```
+   `ProcessType = Interactive` prevents macOS App Nap from throttling the daemon during idle periods — without it, the first web request after inactivity stalls for several seconds.
+4. Load:
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist
+   ```
+
+### Updating
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist
+go build -o ~/bin/udl ./cmd/udl
+codesign --force --sign "UDL" ~/bin/udl
+launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist
+```
+
+The `codesign` step prompts for Keychain access to the signing key.
+
 ## Agent-Optimized CLI
 
 The CLI is designed for deterministic, non-interactive use. Every command takes

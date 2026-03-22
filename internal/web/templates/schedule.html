@@ -6,11 +6,13 @@
 <h1>Schedule</h1>
 
 {{if .Days}}
-{{range .Days}}
-<div class="day-group">
-  <h2>{{.Date}}</h2>
-  <table>
+<table>
+  <thead>
     <tr><th>Series</th><th>Episode</th><th>Title</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+  {{range .Days}}
+    <tr class="day-header"><td colspan="4">{{.Date}}</td></tr>
     {{range .Episodes}}
     <tr>
       <td>
@@ -22,9 +24,9 @@
       <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     </tr>
     {{end}}
-  </table>
-</div>
-{{end}}
+  {{end}}
+  </tbody>
+</table>
 {{else}}
 <p class="muted">No upcoming episodes in the next 30 days.</p>
 {{end}}

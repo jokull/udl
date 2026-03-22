@@ -308,6 +308,17 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 		}
 	}
 
+	// Check Plex friends first — skip Usenet entirely if available there.
+	if s.plex != nil {
+		plexGrabbed, plexErr := s.grabFromPlex(ctx)
+		if plexErr != nil {
+			s.log.Debug("plex grab failed, falling through to usenet", "title", ctx.Title, "error", plexErr)
+		} else if plexGrabbed {
+			s.log.Info("release evaluation", "total", len(releases), "rejected", 0, "grabbed", true, "source", "plex")
+			return true, nil
+		}
+	}
+
 	rejCount := 0
 	grabbed := false
 
@@ -355,17 +366,6 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 			s.log.Debug("rejected as already imported", "title", sr.Release.Title)
 			rejCount++
 			continue
-		}
-
-		// Check if a Plex friend already has this — download from them instead.
-		if s.plex != nil {
-			plexGrabbed, plexErr := s.grabFromPlex(ctx)
-			if plexErr != nil {
-				s.log.Debug("plex grab failed, falling through to usenet", "title", ctx.Title, "error", plexErr)
-			} else if plexGrabbed {
-				grabbed = true
-				break
-			}
 		}
 
 		// Atomically enqueue the download — only succeeds if status is wanted/failed.

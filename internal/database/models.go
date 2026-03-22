@@ -139,6 +139,7 @@ type WantedItem struct {
 	AirDate        sql.NullString // episode air_date or movie year as "YYYY-01-01"
 	LastSearchedAt sql.NullString // episodes only, NULL for movies
 	CanSearch      bool           // true if the item has the IDs needed for indexer search
+	Status         string         // "wanted" or "failed"
 }
 
 // BlocklistEntry represents a release that should not be downloaded again.

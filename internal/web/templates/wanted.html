@@ -14,13 +14,14 @@
 
 {{if .Items}}
 <table>
-  <tr><th>Title</th><th>Aired</th><th>Searched</th><th></th></tr>
+  <tr><th>Title</th><th>Status</th><th>Aired</th><th>Searched</th><th></th></tr>
   {{range .Items}}
   <tr>
     <td>
       {{if eq .Category "movie"}}<a href="/movies#movie-{{.MediaID}}">{{.Title}}</a>{{else}}<a href="/series/{{.SeriesID}}">{{.Title}}</a>{{end}}
       {{if (tmdbURL .Category .TmdbID)}}<a class="ext" href="{{tmdbURL .Category .TmdbID}}" target="_blank" rel="noopener">tmdb</a>{{end}}
     </td>
+    <td><span class="status {{statusClass .Status}}">{{.Status}}</span></td>
     <td class="small">{{fmtDate .AirDate}}</td>
     <td class="small">{{fmtNullTimeStr .LastSearchedAt}}</td>
     <td>

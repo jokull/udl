@@ -1386,6 +1386,19 @@ func (db *DB) BlocklistCount() (int, error) {
 	return count, err
 }
 
+// RecentBlocklistCountForMedia returns the number of blocklist entries for a
+// specific media item created within the given duration. Used by failAndRetry
+// to determine retry budget without in-memory state.
+func (db *DB) RecentBlocklistCountForMedia(mediaType string, mediaID int64, since time.Duration) (int, error) {
+	threshold := time.Now().Add(-since).UTC().Format("2006-01-02 15:04:05")
+	var count int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM blocklist WHERE media_type = ? AND media_id = ? AND created_at > ?`,
+		mediaType, mediaID, threshold,
+	).Scan(&count)
+	return count, err
+}
+
 // ---------------------------------------------------------------------------
 // Queue methods (media-based, replaces downloads table)
 // ---------------------------------------------------------------------------
@@ -1578,7 +1591,9 @@ func (db *DB) SetMediaDownloadError(category string, id int64, errMsg string) er
 		return err
 	}
 	_, err := db.Exec(
-		fmt.Sprintf(`UPDATE %s SET status = 'failed', download_error = ? WHERE id = ?`, table),
+		fmt.Sprintf(`UPDATE %s SET status = 'failed', download_error = ?,
+		download_started_at = COALESCE(download_started_at, CURRENT_TIMESTAMP)
+		WHERE id = ?`, table),
 		errMsg, id,
 	)
 	return err
@@ -1708,17 +1723,19 @@ func (db *DB) WantedItems() ([]WantedItem, error) {
 		       title || ' (' || year || ')',
 		       year || '-01-01',
 		       NULL,
-		       (imdb_id IS NOT NULL AND imdb_id != '')
-		FROM movies WHERE status = 'wanted'
+		       (imdb_id IS NOT NULL AND imdb_id != ''),
+		       status
+		FROM movies WHERE status IN ('wanted', 'failed')
 		UNION ALL
 		SELECT 'episode', e.id, s.tmdb_id, e.series_id,
 		       s.title || ' · S' || printf('%02d', e.season) || 'E' || printf('%02d', e.episode) || ' ' || COALESCE(e.title, ''),
 		       e.air_date,
 		       e.last_searched_at,
-		       (s.tvdb_id IS NOT NULL AND s.tvdb_id != 0)
+		       (s.tvdb_id IS NOT NULL AND s.tvdb_id != 0),
+		       e.status
 		FROM episodes e
 		JOIN series s ON s.id = e.series_id
-		WHERE e.status = 'wanted'
+		WHERE e.status IN ('wanted', 'failed')
 		  AND e.monitored = 1
 		  AND e.air_date IS NOT NULL AND e.air_date != '' AND e.air_date <= date('now')
 		ORDER BY 6 DESC`)
@@ -1731,7 +1748,7 @@ func (db *DB) WantedItems() ([]WantedItem, error) {
 	for rows.Next() {
 		var wi WantedItem
 		if err := rows.Scan(&wi.Category, &wi.MediaID, &wi.TmdbID, &wi.SeriesID,
-			&wi.Title, &wi.AirDate, &wi.LastSearchedAt, &wi.CanSearch); err != nil {
+			&wi.Title, &wi.AirDate, &wi.LastSearchedAt, &wi.CanSearch, &wi.Status); err != nil {
 			return nil, err
 		}
 		items = append(items, wi)

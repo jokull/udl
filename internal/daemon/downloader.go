@@ -49,9 +49,7 @@ type Downloader struct {
 	stop          chan struct{}
 	stopOnce      sync.Once
 	paused        atomic.Bool
-	ppRetryAfter  map[string]time.Time // category:mediaID → earliest retry time
-	retryCount    map[string]int       // category:mediaID → consecutive auto-retry count
-	retryMu       sync.Mutex           // protects retryCount
+	ppRetryAfter map[string]time.Time // category:mediaID → earliest retry time
 }
 
 // Pause pauses the download queue processing.
@@ -95,7 +93,6 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 		postProcessCh: make(chan database.QueueItem, 8),
 		stop:          make(chan struct{}),
 		ppRetryAfter:  make(map[string]time.Time),
-		retryCount:    make(map[string]int),
 	}
 }
 
@@ -109,7 +106,6 @@ func NewDownloaderWithEngine(svc *Service, engine DownloadEngine) *Downloader {
 		postProcessCh: make(chan database.QueueItem, 8),
 		stop:          make(chan struct{}),
 		ppRetryAfter:  make(map[string]time.Time),
-		retryCount:    make(map[string]int),
 	}
 }
 
@@ -918,12 +914,6 @@ func (d *Downloader) completeDownload(item database.QueueItem, q quality.Quality
 		return fmt.Errorf("complete download transaction: %w", err)
 	}
 
-	// Clear retry counter on success.
-	key := fmt.Sprintf("%s:%d", item.Category, item.MediaID)
-	d.retryMu.Lock()
-	delete(d.retryCount, key)
-	d.retryMu.Unlock()
-
 	if err := os.RemoveAll(downloadDir); err != nil {
 		d.svc.log.Warn("failed to remove download directory", "dir", downloadDir, "error", err)
 	}
@@ -1031,9 +1021,11 @@ func failEvent(msg string) string {
 	}
 }
 
-// maxAutoRetries is the maximum number of times failAndRetry will automatically
-// re-search indexers after a download failure before giving up.
-const maxAutoRetries = 3
+// maxAutoRetries is the maximum number of immediate retries failAndRetry will
+// attempt within a single failure chain (1-hour window). After this, the item
+// stays failed until the scheduler resets it (2h episodes, 6h movies), at which
+// point the retry budget resets and the next batch of releases is tried.
+const maxAutoRetries = 5
 
 // fail marks the media item as failed, records a history event, blocklists the release,
 // and returns an error. If cleanupDir is provided, the directory is removed.
@@ -1074,24 +1066,18 @@ func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...str
 // enqueued, it dispatches it to the download worker. If all releases are exhausted,
 // the item stays in 'failed' status.
 //
-// Tracks retry count per media item internally. Capped at maxAutoRetries to prevent
-// infinite loops within a single failure chain. The counter resets on successful download.
+// Uses the blocklist count (within the last hour) as a persistent retry budget
+// instead of in-memory state, so it survives daemon restarts. After the scheduler
+// resets an item to 'wanted' (2h episodes, 6h movies), the 1-hour window means
+// the retry budget is fresh for the next failure chain.
 func (d *Downloader) failAndRetry(item database.QueueItem, msg string, cleanupDir ...string) error {
 	failErr := d.fail(item, msg, cleanupDir...)
 
-	key := fmt.Sprintf("%s:%d", item.Category, item.MediaID)
-	d.retryMu.Lock()
-	retryNum := d.retryCount[key]
-	d.retryMu.Unlock()
-
-	if retryNum >= maxAutoRetries {
+	// Use recent blocklist entries as a persistent retry budget.
+	tried, _ := d.svc.db.RecentBlocklistCountForMedia(item.Category, item.MediaID, 1*time.Hour)
+	if tried >= maxAutoRetries {
 		d.svc.log.Info("retry limit reached, staying failed",
-			"category", item.Category, "media_id", item.MediaID, "title", item.Title, "retries", retryNum)
-		// Clear retry counter so that if the scheduler resets this item to 'wanted'
-		// later (e.g., after 6h when new indexer results may exist), it gets fresh retries.
-		d.retryMu.Lock()
-		delete(d.retryCount, key)
-		d.retryMu.Unlock()
+			"category", item.Category, "media_id", item.MediaID, "title", item.Title, "tried", tried)
 		return failErr
 	}
 
@@ -1101,21 +1087,9 @@ func (d *Downloader) failAndRetry(item database.QueueItem, msg string, cleanupDi
 		return failErr
 	}
 
-	d.retryMu.Lock()
-	d.retryCount[key] = retryNum + 1
-	d.retryMu.Unlock()
-
 	grabbed, searchErr := d.retrySearch(item)
 	if searchErr != nil {
 		d.svc.log.Error("failAndRetry: re-search failed", "title", item.Title, "error", searchErr)
-		if isRetryable(searchErr) {
-			// Transient indexer/network issue: don't consume retry budget.
-			d.retryMu.Lock()
-			if d.retryCount[key] > 0 {
-				d.retryCount[key]--
-			}
-			d.retryMu.Unlock()
-		}
 		_ = d.svc.db.SetMediaDownloadError(item.Category, item.MediaID,
 			formatClassifiedError("re-search failed", searchErr))
 		return failErr
@@ -1123,18 +1097,14 @@ func (d *Downloader) failAndRetry(item database.QueueItem, msg string, cleanupDi
 
 	if !grabbed {
 		d.svc.log.Info("failAndRetry: all releases exhausted",
-			"category", item.Category, "media_id", item.MediaID, "title", item.Title)
+			"category", item.Category, "media_id", item.MediaID, "title", item.Title, "tried", tried)
 		_ = d.svc.db.SetMediaDownloadError(item.Category, item.MediaID,
-			fmt.Sprintf("all releases exhausted after %d retries", retryNum+1))
-		// Clear retry counter so scheduler-driven resets get fresh retries.
-		d.retryMu.Lock()
-		delete(d.retryCount, key)
-		d.retryMu.Unlock()
+			fmt.Sprintf("all releases exhausted after %d retries", tried))
 		return failErr
 	}
 
 	d.svc.log.Info("failAndRetry: grabbed alternative release",
-		"category", item.Category, "media_id", item.MediaID, "title", item.Title, "retry", retryNum+1)
+		"category", item.Category, "media_id", item.MediaID, "title", item.Title, "tried", tried)
 	return nil
 }
 
