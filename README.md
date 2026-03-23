@@ -22,9 +22,31 @@ automation. CLI-first, daemon mode, opinionated defaults.
 
 ## Install
 
+### Homebrew (macOS)
+
+```bash
+brew tap jokull/tap
+brew install udl
+```
+
+### Go install
+
+```bash
+go install github.com/jokull/udl/cmd/udl@latest
+```
+
+### From source
+
 ```bash
 go build -o udl ./cmd/udl
 ```
+
+### Download binary
+
+Pre-built binaries for macOS and Linux (amd64 + arm64) are available on the
+[releases page](https://github.com/jokull/udl/releases).
+
+### Dependencies
 
 Requires `par2` for PAR2 verify/repair:
 
