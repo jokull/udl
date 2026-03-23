@@ -29,6 +29,8 @@ brews:
     homepage: https://github.com/jokull/udl
     description: Single Go binary replacing Sonarr + Radarr + NZBGet for Usenet-based media automation
     license: MIT
+    dependencies:
+      - name: par2
     install: |
       bin.install "udl"
     test: |
