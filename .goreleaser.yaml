@@ -1,0 +1,45 @@
+version: 2
+
+builds:
+  - main: ./cmd/udl
+    binary: udl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{.Date}}
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+# brews is deprecated but there's no replacement for CLI formula distribution.
+# homebrew_casks requires `brew install --cask` which is wrong for a CLI binary.
+brews:
+  - repository:
+      owner: jokull
+      name: homebrew-tap
+    name: udl
+    homepage: https://github.com/jokull/udl
+    description: Single Go binary replacing Sonarr + Radarr + NZBGet for Usenet-based media automation
+    license: MIT
+    install: |
+      bin.install "udl"
+    test: |
+      system "#{bin}/udl", "--help"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
