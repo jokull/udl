@@ -358,6 +358,13 @@ var migrateSonarrCmd = &cobra.Command{
 	RunE:  runMigrateSonarr,
 }
 
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "Create a starter config file",
+	Long:  "Creates ~/.config/udl/config.toml with a documented template. Will not overwrite an existing file.",
+	RunE:  runInit,
+}
+
 var configCmd = &cobra.Command{
 	Use:   "config",
 	Short: "Manage configuration",
@@ -477,7 +484,7 @@ func init() {
 	libraryPruneCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
 	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd, libraryPruneIncompleteCmd, libraryVerifyCmd, libraryPruneCmd)
 
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd)
+	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd, initCmd)
 }
 
 var versionCmd = &cobra.Command{
@@ -2450,6 +2457,97 @@ func runConfigPath(cmd *cobra.Command, args []string) error {
 	fmt.Println(p)
 	return nil
 }
+
+func runInit(cmd *cobra.Command, args []string) error {
+	p, err := config.Path()
+	if err != nil {
+		return err
+	}
+
+	// Don't overwrite existing config.
+	if _, err := os.Stat(p); err == nil {
+		return fmt.Errorf("config already exists at %s\nEdit it directly or run: udl config check", p)
+	}
+
+	// Create config directory.
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+
+	if err := os.WriteFile(p, []byte(configTemplate), 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	fmt.Printf("Created %s\n\n", p)
+	fmt.Println("Next steps:")
+	fmt.Println("  1. Edit the config file and fill in your credentials")
+	fmt.Println("  2. Run: udl config check")
+	fmt.Println("  3. Run: udl daemon")
+	return nil
+}
+
+const configTemplate = `# UDL configuration
+# Docs: https://github.com/jokull/udl
+
+# ── Library paths (where Plex/Jellyfin reads from) ──
+[library]
+tv = ""      # e.g. "/media/tv" or "/Users/you/Plex/media/tv"
+movies = ""  # e.g. "/media/movies" or "/Users/you/Plex/media/movies"
+
+# ── Working directories (temporary, can be on a different drive) ──
+[paths]
+incomplete = ""  # active downloads
+complete = ""    # post-processed, before import to library
+
+# ── Quality profile ──
+# Presets: "720p", "1080p" (default), "4k", "remux"
+# Or set min/preferred/upgrade_until individually.
+[quality]
+profile = "1080p"
+# must_not_contain = ["CAM", "HDTS", "TELECINE"]
+# preferred_words = ["FLUX", "NTb"]
+
+# ── TMDB (required) ──
+# Get a free API key at https://www.themoviedb.org/settings/api
+[tmdb]
+apikey = ""
+
+# ── Usenet providers ──
+# At least one provider is required. Most providers offer plans at
+# https://www.reddit.com/r/usenet/wiki/providers
+[[usenet.providers]]
+name = ""          # e.g. "newshosting"
+host = ""          # e.g. "news.newshosting.com"
+port = 563
+tls = true
+username = ""
+password = ""
+connections = 20   # check your plan's limit
+# level = 0        # 0 = primary (default), 1+ = fill/backup
+
+# ── Indexers (Newznab-compatible) ──
+# At least one indexer is required. Popular options:
+# DOGnzb, NZBgeek, Nzb.su, omgwtfnzbs
+[[indexers]]
+name = ""      # e.g. "DOGnzb"
+url = ""       # e.g. "https://api.dognzb.cr"
+apikey = ""
+
+# ── Optional: Plex integration ──
+# Check friends' servers before downloading. Get your token:
+# https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/
+# [plex]
+# token = ""
+
+# ── Optional: Web UI ──
+# [web]
+# port = 9876   # 0 = disabled (default)
+# bind = "127.0.0.1"
+
+# ── Optional: Usenet retention ──
+# [usenet]
+# retention_days = 4000  # reject articles older than this
+`
 
 // --- Migrate commands (no daemon required) ---
 

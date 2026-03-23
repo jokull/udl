@@ -54,6 +54,23 @@ Requires `par2` for PAR2 verify/repair:
 brew install par2
 ```
 
+## Quick Start
+
+```bash
+udl init              # creates ~/.config/udl/config.toml with documented template
+# edit config.toml — fill in TMDB key, Usenet provider, and indexer credentials
+udl config check      # validate your config
+udl daemon            # start the daemon (foreground)
+```
+
+In another terminal:
+
+```bash
+udl movie search "Alien"    # search TMDB
+udl movie add 945961        # add by TMDB ID — searches indexers immediately
+udl queue                   # watch download progress
+```
+
 ## Running on macOS
 
 UDL runs as a LaunchAgent for always-on background operation. The binary needs code signing because it accesses removable volumes (e.g. `/Volumes/Plex`) which require macOS TCC permission — ad-hoc signing pins to CDHash which changes every build, so a self-signed certificate provides a stable identity.
