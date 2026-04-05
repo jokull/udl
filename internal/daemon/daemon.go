@@ -3,8 +3,10 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/rpc"
@@ -17,6 +19,8 @@ import (
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/newznab"
+	"github.com/jokull/udl/internal/nntp"
+	"github.com/jokull/udl/internal/nzb"
 	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/postprocess"
 	"github.com/jokull/udl/internal/quality"
@@ -1680,6 +1684,240 @@ func (s *Service) BlocklistClear(args *Empty, reply *BlocklistClearReply) error 
 	reply.Cleared = n
 	s.log.Info("cleared blocklist", "count", n)
 	return nil
+}
+
+// --- Raw NZB search & grab (bypass media pipeline) ---
+
+// NZBSearchArgs contains arguments for the NZBSearch RPC method.
+type NZBSearchArgs struct {
+	Query    string
+	Category string // Newznab category code, e.g. "3010"
+}
+
+// NZBSearchResult is a single search result for raw NZB search.
+type NZBSearchResult struct {
+	Title    string
+	Size     int64
+	Indexer  string
+	Link     string
+	PubDate  string
+	Category int
+}
+
+// NZBSearchReply is the response from NZBSearch.
+type NZBSearchReply struct {
+	Results []NZBSearchResult
+}
+
+// NZBSearch searches all indexers concurrently with a raw text query and optional category filter.
+func (s *Service) NZBSearch(args *NZBSearchArgs, reply *NZBSearchReply) error {
+	type indexerResult struct {
+		results []NZBSearchResult
+		err     error
+		name    string
+	}
+
+	ch := make(chan indexerResult, len(s.indexers))
+	for _, idx := range s.indexers {
+		go func(idx *newznab.Client) {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			releases, err := idx.SearchWithCatContext(ctx, args.Query, args.Category)
+			if err != nil {
+				ch <- indexerResult{name: idx.Name, err: err}
+				return
+			}
+			var results []NZBSearchResult
+			for _, r := range releases {
+				results = append(results, NZBSearchResult{
+					Title:    r.Title,
+					Size:     r.Size,
+					Indexer:  idx.Name,
+					Link:     r.Link,
+					PubDate:  r.PubDate,
+					Category: r.Category,
+				})
+			}
+			ch <- indexerResult{name: idx.Name, results: results}
+		}(idx)
+	}
+
+	for range s.indexers {
+		res := <-ch
+		if res.err != nil {
+			s.log.Warn("nzb search: indexer error", "indexer", res.name, "error", res.err)
+			continue
+		}
+		reply.Results = append(reply.Results, res.results...)
+	}
+	return nil
+}
+
+// NZBGrabArgs contains arguments for the NZBGrab RPC method.
+type NZBGrabArgs struct {
+	NzbURL    string // direct NZB download URL
+	OutputDir string // where to put the final files
+}
+
+// NZBGrabReply is the response from NZBGrab.
+type NZBGrabReply struct {
+	Files []string // paths of files written to OutputDir
+}
+
+// NZBGrab downloads an NZB via NNTP, post-processes (PAR2/RAR), and
+// moves the resulting files to OutputDir. No database tracking.
+func (s *Service) NZBGrab(args *NZBGrabArgs, reply *NZBGrabReply) error {
+	if s.dl == nil {
+		return fmt.Errorf("downloader not running")
+	}
+	if args.NzbURL == "" {
+		return fmt.Errorf("NZB URL required")
+	}
+	if args.OutputDir == "" {
+		return fmt.Errorf("output directory required")
+	}
+
+	// Use a timeout so the RPC doesn't hang forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
+
+	// 1. Fetch NZB.
+	s.log.Info("nzb grab: fetching NZB", "url", newznab.SanitizeURL(args.NzbURL))
+	nzbData, err := s.dl.fetchNZB(ctx, args.NzbURL)
+	if err != nil {
+		return fmt.Errorf("fetch NZB: %w", err)
+	}
+	s.log.Info("nzb grab: fetched NZB", "bytes", len(nzbData))
+
+	// 2. Parse NZB XML.
+	parsed, err := nzb.Parse(bytes.NewReader(nzbData))
+	if err != nil {
+		return fmt.Errorf("parse NZB: %w", err)
+	}
+	totalSegments := parsed.TotalSegments()
+	s.log.Info("nzb grab: parsed NZB", "files", len(parsed.Files), "total_segments", totalSegments)
+
+	// 3. Create temp download directory.
+	dlDir, err := os.MkdirTemp(s.cfg.Paths.Incomplete, "nzb-grab-*")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	s.log.Info("nzb grab: download dir", "dir", dlDir)
+	defer os.RemoveAll(dlDir)
+
+	// 4. NNTP download with progress logging (throttled to every 50 segments).
+	var lastLoggedPct int
+	progressFn := func(p nntp.Progress) bool {
+		if p.TotalSegments == 0 {
+			return true
+		}
+		pct := int(float64(p.DoneSegments+p.FailedSegments) / float64(p.TotalSegments) * 100)
+		if pct >= lastLoggedPct+5 || p.DoneSegments+p.FailedSegments == p.TotalSegments {
+			s.log.Info("nzb grab: progress",
+				"pct", fmt.Sprintf("%d%%", pct),
+				"done", p.DoneSegments, "failed", p.FailedSegments, "total", p.TotalSegments,
+				"bytes", p.BytesDownloaded)
+			lastLoggedPct = pct
+		}
+		return true
+	}
+
+	s.log.Info("nzb grab: starting NNTP download")
+	_, err = s.dl.engine.Download(ctx, parsed, dlDir, progressFn)
+	if err != nil {
+		if strings.Contains(err.Error(), "segments failed") {
+			s.log.Warn("nzb grab: some segments failed, continuing to post-processing", "error", err)
+		} else {
+			return fmt.Errorf("NNTP download: %w", err)
+		}
+	}
+	s.log.Info("nzb grab: NNTP download complete")
+
+	// 5. Post-process (PAR2 verify/repair, RAR extract).
+	failedSegments := readSegmentHealth(dlDir)
+	password := parsed.Password()
+
+	logProgress := func(phase string, pct float64) {
+		s.log.Info("nzb grab: post-process", "phase", phase, "pct", fmt.Sprintf("%.0f%%", pct))
+	}
+
+	result, err := postprocess.Process(ctx, dlDir, s.log, logProgress, postprocess.Options{
+		Password:       password,
+		FailedSegments: failedSegments,
+	})
+	if err != nil {
+		return fmt.Errorf("post-processing: %w", err)
+	}
+	if !result.Success {
+		return fmt.Errorf("post-processing failed: %s", result.Error)
+	}
+
+	// 6. Move resulting files to output directory.
+	// For raw NZB grabs, move ALL non-metadata files (not just video media).
+	// This handles music (.flac, .mp3), archives (.tar), and anything else.
+	if err := os.MkdirAll(args.OutputDir, 0o755); err != nil {
+		return fmt.Errorf("create output dir: %w", err)
+	}
+
+	metadataFiles := map[string]bool{
+		"manifest.nzb": true, "segments.done": true,
+		".segment-health": true, ".pp-stage": true,
+	}
+	entries, err := os.ReadDir(dlDir)
+	if err != nil {
+		return fmt.Errorf("read download dir: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || metadataFiles[entry.Name()] {
+			continue
+		}
+		// Skip RAR/PAR2 source files if extraction produced output.
+		ext := strings.ToLower(filepath.Ext(entry.Name()))
+		if ext == ".rar" || ext == ".par2" || ext == ".nzb" {
+			continue
+		}
+		// Skip numbered RAR parts (.r00, .r01, etc.)
+		if len(ext) == 4 && ext[1] == 'r' && ext[2] >= '0' && ext[2] <= '9' {
+			continue
+		}
+		src := filepath.Join(dlDir, entry.Name())
+		dst := filepath.Join(args.OutputDir, entry.Name())
+		if err := os.Rename(src, dst); err != nil {
+			if err := nzbGrabCopyFile(src, dst); err != nil {
+				return fmt.Errorf("move %s: %w", entry.Name(), err)
+			}
+		}
+		reply.Files = append(reply.Files, dst)
+	}
+
+	s.log.Info("nzb grab: complete", "files", len(reply.Files), "output", args.OutputDir)
+	return nil
+}
+
+// nzbGrabCopyFile copies src to dst then removes src (cross-device move).
+func nzbGrabCopyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	out.Close()
+	in.Close()
+	return os.Remove(src)
 }
 
 // PlexServers returns the list of discovered shared Plex servers.

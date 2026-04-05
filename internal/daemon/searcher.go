@@ -254,7 +254,18 @@ func releaseAge(pubDate string) int {
 // GrabBest picks the best acceptable release and enqueues it for download.
 // Returns true if a release was grabbed.
 func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, error) {
-	// LLM-first path: ask codex/claude to pick the best release.
+	// Check Plex friends first — skip Usenet entirely if available there.
+	if s.plex != nil {
+		plexGrabbed, plexErr := s.grabFromPlex(ctx)
+		if plexErr != nil {
+			s.log.Debug("plex grab failed, falling through to usenet", "title", ctx.Title, "error", plexErr)
+		} else if plexGrabbed {
+			s.log.Info("release evaluation", "total", len(releases), "rejected", 0, "grabbed", true, "source", "plex")
+			return true, nil
+		}
+	}
+
+	// LLM path: ask codex/claude to pick the best release.
 	if s.llmCLI != "" && len(releases) > 0 {
 		idx, err := s.LLMPickRelease(releases, ctx)
 		if err != nil {
@@ -305,17 +316,6 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 				}
 				return true, nil
 			}
-		}
-	}
-
-	// Check Plex friends first — skip Usenet entirely if available there.
-	if s.plex != nil {
-		plexGrabbed, plexErr := s.grabFromPlex(ctx)
-		if plexErr != nil {
-			s.log.Debug("plex grab failed, falling through to usenet", "title", ctx.Title, "error", plexErr)
-		} else if plexGrabbed {
-			s.log.Info("release evaluation", "total", len(releases), "rejected", 0, "grabbed", true, "source", "plex")
-			return true, nil
 		}
 	}
 

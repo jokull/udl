@@ -996,7 +996,9 @@ func dirSize(path string) int64 {
 // ---------------------------------------------------------------------------
 
 // LibraryVerifyArgs contains arguments for the LibraryVerify RPC method.
-type LibraryVerifyArgs struct{}
+type LibraryVerifyArgs struct {
+	Fix bool // attempt to claim orphan files by matching against wanted/failed media
+}
 
 // LibraryVerifyReply contains the reply for the LibraryVerify RPC method.
 type LibraryVerifyReply struct {
@@ -1004,10 +1006,13 @@ type LibraryVerifyReply struct {
 	Orphans  int
 	Misnamed int
 	Missing  int
+	Claimed  int // orphans successfully matched and claimed
 }
 
 // LibraryVerify runs a read-only DB↔disk consistency check combining missing
 // file detection, orphan detection, and misname detection into a single report.
+// With Fix=true, it also attempts to claim orphan files by parsing their filenames
+// and matching them against wanted/failed movies and episodes in the database.
 func (s *Service) LibraryVerify(args *LibraryVerifyArgs, reply *LibraryVerifyReply) error {
 	// Use cleanup logic in dry-run mode (never modifies anything).
 	cleanupArgs := &LibraryCleanupArgs{
@@ -1024,6 +1029,88 @@ func (s *Service) LibraryVerify(args *LibraryVerifyArgs, reply *LibraryVerifyRep
 	reply.Orphans = cleanupReply.Orphans
 	reply.Misnamed = cleanupReply.Misnamed
 	reply.Missing = cleanupReply.Missing
+
+	if args.Fix {
+		s.claimOrphans(reply)
+	}
+
 	return nil
+}
+
+// claimOrphans attempts to match orphan files against wanted/failed media items.
+// Successfully claimed orphans are removed from findings and the DB is updated.
+func (s *Service) claimOrphans(reply *LibraryVerifyReply) {
+	var remaining []CleanupFinding
+	for _, f := range reply.Findings {
+		if f.Finding != "orphan" {
+			remaining = append(remaining, f)
+			continue
+		}
+
+		base := filepath.Base(f.FilePath)
+		parsed := parser.Parse(base)
+
+		var claimed bool
+		q := parsed.Quality.String()
+
+		if f.MediaType == "movie" && parsed.Title != "" {
+			ok, err := s.db.ClaimOrphanMovie(parsed.Title, parsed.Year, f.FilePath, q)
+			if err != nil {
+				s.log.Warn("claim orphan movie", "path", f.FilePath, "error", err)
+			}
+			claimed = ok
+		} else if f.MediaType == "episode" && parsed.IsTV && parsed.Season >= 0 && parsed.Episode >= 0 {
+			// Try parsed title first, then fall back to extracting the series name
+			// from the parent directory (handles non-standard filenames).
+			seriesTitle := parsed.Title
+			if seriesTitle == "" || !s.seriesExists(seriesTitle) {
+				dirTitle := seriesTitleFromPath(f.FilePath, s.cfg.Library.TV)
+				if dirTitle != "" {
+					seriesTitle = dirTitle
+				}
+			}
+			ok, err := s.db.ClaimOrphanEpisode(seriesTitle, parsed.Season, parsed.Episode, f.FilePath, q)
+			if err != nil {
+				s.log.Warn("claim orphan episode", "path", f.FilePath, "error", err)
+			}
+			claimed = ok
+		}
+
+		if claimed {
+			s.log.Info("claimed orphan", "type", f.MediaType, "path", f.FilePath)
+			reply.Claimed++
+			reply.Orphans--
+		} else {
+			remaining = append(remaining, f)
+		}
+	}
+	reply.Findings = remaining
+}
+
+// seriesExists returns true if a series with the given title exists in the DB.
+func (s *Service) seriesExists(title string) bool {
+	series, err := s.db.FindSeriesByTitle(title)
+	return err == nil && series != nil
+}
+
+// seriesTitleFromPath extracts the series name from a TV library path.
+// Expects structure: root/Series Name (Year)/[Season XX/]file.mkv
+// Strips the trailing " (YYYY)" or " (YYYY-YYYY)" from the folder name.
+func seriesTitleFromPath(filePath, tvRoot string) string {
+	rel, err := filepath.Rel(tvRoot, filePath)
+	if err != nil {
+		return ""
+	}
+	// First component is the series folder.
+	parts := strings.SplitN(rel, string(filepath.Separator), 2)
+	if len(parts) == 0 {
+		return ""
+	}
+	folder := parts[0]
+	// Strip trailing " (YYYY)" or " (YYYY-YYYY)".
+	if idx := strings.LastIndex(folder, " ("); idx > 0 {
+		folder = folder[:idx]
+	}
+	return folder
 }
 

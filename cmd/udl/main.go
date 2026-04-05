@@ -276,7 +276,7 @@ var libraryPruneIncompleteCmd = &cobra.Command{
 var libraryVerifyCmd = &cobra.Command{
 	Use:   "verify",
 	Short: "Check library consistency (missing files, orphans, misnamed)",
-	Long:  "Read-only check that reports all issues without making changes.",
+	Long:  "Read-only check that reports all issues without making changes.\nUse --fix to claim orphan files by matching them against wanted/failed media.",
 	RunE:  runLibraryVerify,
 }
 
@@ -482,9 +482,14 @@ func init() {
 	libraryPruneIncompleteCmd.Flags().Bool("execute", false, "Actually remove directories (default is dry-run)")
 	libraryPruneCmd.Flags().Bool("unmonitored", false, "Prune files for unmonitored episodes")
 	libraryPruneCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
+	libraryVerifyCmd.Flags().Bool("fix", false, "Claim orphan files by matching against wanted/failed media")
 	libraryCmd.AddCommand(libraryImportCmd, libraryCleanupCmd, libraryPruneIncompleteCmd, libraryVerifyCmd, libraryPruneCmd)
 
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd, initCmd)
+	nzbSearchCmd.Flags().String("cat", "", "Newznab category code (e.g. 3010 for music/MP3)")
+	nzbGrabCmd.Flags().StringP("output", "o", ".", "Output directory for downloaded files")
+	nzbCmd.AddCommand(nzbSearchCmd, nzbGrabCmd)
+
+	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd, initCmd, nzbCmd)
 }
 
 var versionCmd = &cobra.Command{
@@ -2404,29 +2409,36 @@ func runLibraryVerify(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
+	fix, _ := cmd.Flags().GetBool("fix")
 	var reply daemon.LibraryVerifyReply
-	if err := client.Call("Service.LibraryVerify", &daemon.LibraryVerifyArgs{}, &reply); err != nil {
+	if err := client.Call("Service.LibraryVerify", &daemon.LibraryVerifyArgs{Fix: fix}, &reply); err != nil {
 		return err
 	}
 
-	if len(reply.Findings) == 0 {
+	if reply.Claimed > 0 {
+		fmt.Printf("claimed %d orphan(s)\n", reply.Claimed)
+	}
+
+	if len(reply.Findings) == 0 && reply.Claimed == 0 {
 		fmt.Println("library OK: no issues found")
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "FINDING\tTYPE\tTITLE\tPATH")
-	for _, f := range reply.Findings {
-		path := f.FilePath
-		if f.Finding == "misnamed" && f.ExpectedPath != "" {
-			path = fmt.Sprintf("%s → %s", f.FilePath, f.ExpectedPath)
+	if len(reply.Findings) > 0 {
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "FINDING\tTYPE\tTITLE\tPATH")
+		for _, f := range reply.Findings {
+			path := f.FilePath
+			if f.Finding == "misnamed" && f.ExpectedPath != "" {
+				path = fmt.Sprintf("%s → %s", f.FilePath, f.ExpectedPath)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Finding, f.MediaType, f.Title, path)
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", f.Finding, f.MediaType, f.Title, path)
+		if err := w.Flush(); err != nil {
+			return err
+		}
+		fmt.Println()
 	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	fmt.Println()
 
 	fmt.Printf("%d orphans, %d misnamed, %d missing\n",
 		reply.Orphans, reply.Misnamed, reply.Missing)
@@ -2642,6 +2654,114 @@ func runMigrateSonarr(cmd *cobra.Command, args []string) error {
 	}
 	if !execute && res.Added > 0 {
 		fmt.Println("\nuse --execute to write to database")
+	}
+	return nil
+}
+
+// --- Raw NZB commands ---
+
+var nzbCmd = &cobra.Command{
+	Use:   "nzb",
+	Short: "Raw Usenet NZB search and download",
+	Long:  "Search indexers and download NZBs directly, bypassing the media library pipeline.",
+}
+
+var nzbSearchCmd = &cobra.Command{
+	Use:   "search [query]",
+	Short: "Search indexers for NZBs",
+	Args:  cobra.MinimumNArgs(1),
+	RunE:  runNZBSearch,
+}
+
+var nzbGrabCmd = &cobra.Command{
+	Use:   "grab [nzb-url]",
+	Short: "Download an NZB to a local directory",
+	Long:  "Fetches the NZB, downloads via NNTP, post-processes (PAR2/RAR), and puts files in the output directory.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runNZBGrab,
+}
+
+func runNZBSearch(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	cat, _ := cmd.Flags().GetString("cat")
+	query := strings.Join(args, " ")
+
+	rpcArgs := &daemon.NZBSearchArgs{
+		Query:    query,
+		Category: cat,
+	}
+	var reply daemon.NZBSearchReply
+	if err := client.Call("Service.NZBSearch", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	if len(reply.Results) == 0 {
+		fmt.Println("no results found")
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "#\tTITLE\tSIZE\tINDEXER\n")
+	for i, r := range reply.Results {
+		size := formatSize(r.Size)
+		title := r.Title
+		if len(title) > 80 {
+			title = title[:77] + "..."
+		}
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\n", i+1, title, size, r.Indexer)
+	}
+	w.Flush()
+
+	fmt.Printf("\nTo download, copy the NZB URL and run:\n")
+	fmt.Printf("  udl nzb grab <nzb-url> -o /path/to/output/\n")
+
+	// Print URLs for easy copy-paste.
+	fmt.Println()
+	for i, r := range reply.Results {
+		fmt.Printf("  [%d] %s\n", i+1, r.Link)
+	}
+
+	return nil
+}
+
+func runNZBGrab(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	outputDir, _ := cmd.Flags().GetString("output")
+	// Resolve relative paths.
+	if !filepath.IsAbs(outputDir) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+		outputDir = filepath.Join(wd, outputDir)
+	}
+
+	nzbURL := args[0]
+
+	fmt.Printf("downloading to %s ...\n", outputDir)
+
+	rpcArgs := &daemon.NZBGrabArgs{
+		NzbURL:    nzbURL,
+		OutputDir: outputDir,
+	}
+	var reply daemon.NZBGrabReply
+	if err := client.Call("Service.NZBGrab", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	fmt.Printf("done — %d file(s):\n", len(reply.Files))
+	for _, f := range reply.Files {
+		fmt.Printf("  %s\n", f)
 	}
 	return nil
 }

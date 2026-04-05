@@ -299,7 +299,8 @@ func (s *Scheduler) seerrApproveLoop(ctx context.Context) {
 	}
 }
 
-// runSeerrApprove fetches pending requests from Seerr and approves them.
+// runSeerrApprove fetches pending requests from Seerr, approves them,
+// and adds the media to UDL for downloading.
 func (s *Scheduler) runSeerrApprove() {
 	pending, err := s.seerr.PendingRequests()
 	if err != nil {
@@ -318,6 +319,35 @@ func (s *Scheduler) runSeerrApprove() {
 			continue
 		}
 		approved++
+
+		// Add media to UDL so it gets downloaded.
+		tmdbID := r.Media.TmdbID
+		if tmdbID == 0 {
+			continue
+		}
+
+		switch r.Media.MediaType {
+		case "movie":
+			var reply AddMovieReply
+			if err := s.svc.AddMovie(&AddMovieArgs{TMDBID: tmdbID}, &reply); err != nil {
+				s.svc.log.Error("seerr: failed to add movie", "tmdb_id", tmdbID, "error", err)
+			} else if reply.AlreadyExists {
+				s.svc.log.Info("seerr: movie already exists", "title", reply.Title)
+			} else {
+				s.svc.log.Info("seerr: added movie", "title", reply.Title, "year", reply.Year)
+			}
+		case "tv":
+			var reply AddSeriesReply
+			if err := s.svc.AddSeries(&AddSeriesArgs{TMDBID: tmdbID}, &reply); err != nil {
+				s.svc.log.Error("seerr: failed to add series", "tmdb_id", tmdbID, "error", err)
+			} else if reply.AlreadyExists {
+				s.svc.log.Info("seerr: series already exists", "title", reply.Title)
+			} else {
+				s.svc.log.Info("seerr: added series", "title", reply.Title, "year", reply.Year)
+			}
+		default:
+			s.svc.log.Warn("seerr: unknown media type", "type", r.Media.MediaType, "tmdb_id", tmdbID)
+		}
 	}
 
 	s.svc.log.Info("seerr: approved requests", "count", approved)

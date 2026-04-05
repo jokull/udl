@@ -1176,6 +1176,49 @@ func (db *DB) FindSeriesByTitle(title string) (*Series, error) {
 	return &s, nil
 }
 
+// ClaimOrphanMovie marks a wanted/failed movie as downloaded with the given file path and quality.
+// Returns true if a row was updated (i.e. a matching movie in claimable status was found).
+func (db *DB) ClaimOrphanMovie(title string, year int, filePath string, q string) (bool, error) {
+	var res sql.Result
+	var err error
+	if year > 0 {
+		res, err = db.Exec(`UPDATE movies SET status = 'downloaded', file_path = ?, quality = ?,
+			download_error = NULL, nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+			download_size = NULL, download_bytes = 0, download_source = NULL, download_started_at = NULL
+			WHERE LOWER(title) = LOWER(?) AND year = ? AND status IN ('wanted', 'failed')`,
+			filePath, q, title, year)
+	} else {
+		res, err = db.Exec(`UPDATE movies SET status = 'downloaded', file_path = ?, quality = ?,
+			download_error = NULL, nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+			download_size = NULL, download_bytes = 0, download_source = NULL, download_started_at = NULL
+			WHERE LOWER(title) = LOWER(?) AND status IN ('wanted', 'failed')`,
+			filePath, q, title)
+	}
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// ClaimOrphanEpisode marks a wanted/failed episode as downloaded with the given file path and quality.
+// Matches by series title (case-insensitive), season, and episode number.
+// Returns true if a row was updated.
+func (db *DB) ClaimOrphanEpisode(seriesTitle string, season, episode int, filePath string, q string) (bool, error) {
+	res, err := db.Exec(`UPDATE episodes SET status = 'downloaded', file_path = ?, quality = ?,
+		download_error = NULL, nzb_url = NULL, nzb_name = NULL, download_progress = 0,
+		download_size = NULL, download_bytes = 0, download_source = NULL, download_started_at = NULL
+		WHERE series_id IN (SELECT id FROM series WHERE LOWER(title) = LOWER(?))
+		  AND season = ? AND episode = ?
+		  AND status IN ('wanted', 'failed')`,
+		filePath, q, seriesTitle, season, episode)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 // ---------------------------------------------------------------------------
 // Library queries
 // ---------------------------------------------------------------------------
@@ -1823,6 +1866,7 @@ func (db *DB) CompleteDownloadTx(category string, mediaID int64, title, nzbName,
 	return db.WithTx(func(tx *sql.Tx) error {
 		table := tableFor(category)
 		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET
+			status = 'downloaded',
 			nzb_url = NULL, nzb_name = NULL, download_progress = 0,
 			download_size = NULL, download_bytes = 0, download_error = NULL,
 			download_source = NULL, download_started_at = NULL

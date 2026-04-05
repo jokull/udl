@@ -28,8 +28,8 @@ type Client struct {
 	http   *http.Client
 }
 
-// sanitizeURL removes the apikey parameter from a URL for safe logging.
-func sanitizeURL(rawURL string) string {
+// SanitizeURL removes the apikey parameter from a URL for safe logging.
+func SanitizeURL(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return rawURL
@@ -110,6 +110,20 @@ func (c *Client) SearchContext(ctx context.Context, query string) ([]Release, er
 	return c.query(ctx, params)
 }
 
+// SearchWithCatContext performs a text search filtered by Newznab category.
+// Category is a Newznab category code like "3010" (music/MP3) or "2000" (movies).
+// If cat is empty, no category filter is applied.
+func (c *Client) SearchWithCatContext(ctx context.Context, query, cat string) ([]Release, error) {
+	params := url.Values{
+		"t": {"search"},
+		"q": {query},
+	}
+	if cat != "" {
+		params.Set("cat", cat)
+	}
+	return c.query(ctx, params)
+}
+
 // SearchMovieText searches for movies by text query within movie categories.
 func (c *Client) SearchMovieText(query string) ([]Release, error) {
 	return c.SearchMovieTextContext(context.Background(), query)
@@ -159,7 +173,7 @@ func (c *Client) CapsContext(ctx context.Context) error {
 	// Check for Newznab API error response.
 	var apiErr nzbError
 	if decodeXML(body, &apiErr) == nil && apiErr.Code != 0 {
-		return WrapInvalid("caps", fmt.Errorf("%s: api error %d: %s", sanitizeURL(reqURL), apiErr.Code, apiErr.Description))
+		return WrapInvalid("caps", fmt.Errorf("%s: api error %d: %s", SanitizeURL(reqURL), apiErr.Code, apiErr.Description))
 	}
 
 	return nil
@@ -181,7 +195,7 @@ func (c *Client) DownloadNZBContext(ctx context.Context, release Release) ([]byt
 	if !strings.Contains(dlURL, "apikey=") {
 		u, err := url.Parse(dlURL)
 		if err != nil {
-			return nil, WrapInvalid("download_nzb", fmt.Errorf("invalid download URL %q: %w", sanitizeURL(dlURL), err))
+			return nil, WrapInvalid("download_nzb", fmt.Errorf("invalid download URL %q: %w", SanitizeURL(dlURL), err))
 		}
 		q := u.Query()
 		q.Set("apikey", c.APIKey)
@@ -237,7 +251,7 @@ func (c *Client) query(ctx context.Context, params url.Values) ([]Release, error
 func (c *Client) doGet(ctx context.Context, client *http.Client, reqURL string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return nil, WrapInvalid("build_request", fmt.Errorf("invalid URL %q: %w", sanitizeURL(reqURL), err))
+		return nil, WrapInvalid("build_request", fmt.Errorf("invalid URL %q: %w", SanitizeURL(reqURL), err))
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -248,17 +262,17 @@ func (c *Client) doGet(ctx context.Context, client *http.Client, reqURL string) 
 
 func classifyTransportError(op, reqURL string, err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return WrapRetryable(op, fmt.Errorf("%s: %w", sanitizeURL(reqURL), err))
+		return WrapRetryable(op, fmt.Errorf("%s: %w", SanitizeURL(reqURL), err))
 	}
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
-		return WrapRetryable(op, fmt.Errorf("%s: %w", sanitizeURL(reqURL), err))
+		return WrapRetryable(op, fmt.Errorf("%s: %w", SanitizeURL(reqURL), err))
 	}
-	return WrapRetryable(op, fmt.Errorf("%s: %w", sanitizeURL(reqURL), err))
+	return WrapRetryable(op, fmt.Errorf("%s: %w", SanitizeURL(reqURL), err))
 }
 
 func classifyStatusError(op, reqURL string, status int) error {
-	err := fmt.Errorf("%s: status %d", sanitizeURL(reqURL), status)
+	err := fmt.Errorf("%s: status %d", SanitizeURL(reqURL), status)
 	switch {
 	case status == http.StatusTooManyRequests:
 		return WrapRetryable(op, err)
