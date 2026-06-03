@@ -10,3 +10,6 @@
 # Local media directory
 .media/
 ITERATE.md
+
+# goreleaser build output
+dist/
