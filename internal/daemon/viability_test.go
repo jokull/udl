@@ -94,6 +94,31 @@ func TestScoreRelease_MustNotContainRejected(t *testing.T) {
 	}
 }
 
+// TestScoreRelease_MustNotContainWordBoundary guards against issue #2: short
+// banned tags like CAM must not match inside larger words such as "Campus".
+func TestScoreRelease_MustNotContainWordBoundary(t *testing.T) {
+	cfg := viabilityTestConfig()
+
+	// These contain "CAM" as a substring but not as a standalone token.
+	ok := []string{
+		"Off.Campus.S01E03.1080p.AMZN.WEB-DL.DUAL.DDP5.1.H.264-TURG",
+		"Off.Campus.2026.S01E03.1080p.AMZN.WEB-DL.H.264.DDP5.1-UBWEB",
+		"The.Cameraman.1928.1080p.BluRay-GROUP",
+	}
+	for _, title := range ok {
+		sr := scoreRelease(newznab.Release{Title: title}, cfg)
+		if sr.Rejected {
+			t.Errorf("%s: should not be rejected (reason: %q)", title, sr.RejectionReason)
+		}
+	}
+
+	// A genuine CAM release (standalone token) must still be rejected.
+	sr := scoreRelease(newznab.Release{Title: "Off.Campus.S01E03.CAM.x264-GROUP"}, cfg)
+	if !sr.Rejected || sr.RejectionReason != "must_not_contain: CAM" {
+		t.Errorf("genuine CAM release should be rejected, got Rejected=%v reason=%q", sr.Rejected, sr.RejectionReason)
+	}
+}
+
 func TestScoreRelease_PreferredWordsBonus(t *testing.T) {
 	cfg := viabilityTestConfig()
 	cfg.Quality.PreferredWords = []string{"FLUX", "NTb"}

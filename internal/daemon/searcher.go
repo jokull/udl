@@ -587,6 +587,34 @@ var rawDiscRe = regexp.MustCompile(`(?i)\b(COMPLETE\.?BLURAY|AVC\.?REMUX|BDREMUX
 // defaultMustNotContain is applied when the config list is empty.
 var defaultMustNotContain = []string{"CAM", "HDTS", "TELECINE"}
 
+// tokenSplitRe splits a release title into tokens on any non-alphanumeric run
+// (dots, dashes, spaces, brackets, etc.).
+var tokenSplitRe = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+
+// mustNotContainMatch reports whether a banned quality term appears in the
+// release title as a whole token (case-insensitive). This avoids false
+// positives where a short tag like "CAM" appears inside a larger word such as
+// "Campus" (issue #2). Multi-token banned terms (containing a separator) fall
+// back to a case-insensitive substring check.
+func mustNotContainMatch(title, word string) bool {
+	word = strings.TrimSpace(word)
+	if word == "" {
+		return false
+	}
+	// Multi-token banned terms (e.g. "Off Campus") can't match a single token;
+	// fall back to substring matching for those.
+	if tokenSplitRe.MatchString(word) {
+		return strings.Contains(strings.ToUpper(title), strings.ToUpper(word))
+	}
+	wordUpper := strings.ToUpper(word)
+	for _, tok := range tokenSplitRe.Split(title, -1) {
+		if strings.ToUpper(tok) == wordUpper {
+			return true
+		}
+	}
+	return false
+}
+
 // scoreRelease parses a release title and assigns a quality score.
 // Rejects raw disc releases, must-not-contain patterns, and applies preferred word bonuses.
 func scoreRelease(rel newznab.Release, cfg *config.Config) ScoredRelease {
@@ -607,14 +635,15 @@ func scoreRelease(rel newznab.Release, cfg *config.Config) ScoredRelease {
 		return sr
 	}
 
-	// Must-not-contain filter.
+	// Must-not-contain filter. Match on whole tokens (word boundaries) so that
+	// short quality tags like "CAM" don't falsely match inside larger words
+	// (e.g. "Campus"). See issue #2.
 	mustNot := cfg.Quality.MustNotContain
 	if len(mustNot) == 0 {
 		mustNot = defaultMustNotContain
 	}
-	titleUpper := strings.ToUpper(rel.Title)
 	for _, word := range mustNot {
-		if strings.Contains(titleUpper, strings.ToUpper(word)) {
+		if mustNotContainMatch(rel.Title, word) {
 			sr.Rejected = true
 			sr.RejectionReason = fmt.Sprintf("must_not_contain: %s", word)
 			return sr
@@ -636,6 +665,7 @@ func scoreRelease(rel newznab.Release, cfg *config.Config) ScoredRelease {
 	}
 
 	// Preferred words bonus: +200 per match.
+	titleUpper := strings.ToUpper(rel.Title)
 	for _, word := range cfg.Quality.PreferredWords {
 		if strings.Contains(titleUpper, strings.ToUpper(word)) {
 			score += 200
