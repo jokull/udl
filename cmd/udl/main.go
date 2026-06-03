@@ -208,8 +208,8 @@ var plexServersCmd = &cobra.Command{
 
 var plexCheckCmd = &cobra.Command{
 	Use:   "check [tmdb-id]",
-	Short: "Check if a movie is available on friends' Plex servers",
-	Long:  "Check by TMDB ID (from 'udl movie search' or 'udl movie list').",
+	Short: "Check if a movie or TV series is available on friends' Plex servers",
+	Long:  "Check by TMDB ID. Resolves automatically to a movie or series from the local DB. For TV, use --season/--episode to filter the output to a specific slice.",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runPlexCheck,
 }
@@ -454,6 +454,8 @@ func init() {
 	searchTriggerCmd.Flags().IntP("season", "s", 0, "Episode season (used with --tmdb)")
 	searchTriggerCmd.Flags().IntP("episode", "e", 0, "Episode number (used with --tmdb)")
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd, queueEvictCmd)
+	plexCheckCmd.Flags().IntP("season", "s", 0, "Filter TV results to a specific season")
+	plexCheckCmd.Flags().IntP("episode", "e", 0, "Filter TV results to a specific episode")
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
 	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
 	plexCleanupCmd.Flags().Bool("verbose", false, "Also show items that would be kept")
@@ -1525,24 +1527,44 @@ func runPlexCheck(cmd *cobra.Command, args []string) error {
 
 	tmdbID, err := strconv.Atoi(args[0])
 	if err != nil {
-		return fmt.Errorf("TMDB ID must be a number (use 'udl movie search' to find it)")
+		return fmt.Errorf("TMDB ID must be a number (use 'udl movie search' or 'udl tv search' to find it)")
 	}
 
-	rpcArgs := &daemon.PlexCheckArgs{TmdbID: tmdbID}
+	season, _ := cmd.Flags().GetInt("season")
+	episode, _ := cmd.Flags().GetInt("episode")
+
+	rpcArgs := &daemon.PlexCheckArgs{TmdbID: tmdbID, Season: season, Episode: episode}
 	var reply daemon.PlexCheckReply
 	if err := client.Call("Service.PlexCheck", rpcArgs, &reply); err != nil {
 		return err
 	}
 
 	if len(reply.Matches) == 0 {
-		fmt.Printf("not found on any friend's server (tmdb=%d)\n", tmdbID)
+		fmt.Printf("%s %q (%d) not found on any friend's server (tmdb=%d)\n", reply.MediaType, reply.Title, reply.Year, tmdbID)
 		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "SERVER\tTITLE\tYEAR\tRESOLUTION\tQUALITY")
-	for _, m := range reply.Matches {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", m.ServerName, m.Title, m.Year, m.Resolution, m.Quality)
+	if reply.MediaType == "tv" {
+		sort.Slice(reply.Matches, func(i, j int) bool {
+			a, b := reply.Matches[i], reply.Matches[j]
+			if a.ServerName != b.ServerName {
+				return a.ServerName < b.ServerName
+			}
+			if a.Season != b.Season {
+				return a.Season < b.Season
+			}
+			return a.Episode < b.Episode
+		})
+		fmt.Fprintln(w, "SERVER\tSERIES\tS/E\tRESOLUTION\tQUALITY")
+		for _, m := range reply.Matches {
+			fmt.Fprintf(w, "%s\t%s\tS%02dE%02d\t%s\t%s\n", m.ServerName, m.Title, m.Season, m.Episode, m.Resolution, m.Quality)
+		}
+	} else {
+		fmt.Fprintln(w, "SERVER\tTITLE\tYEAR\tRESOLUTION\tQUALITY")
+		for _, m := range reply.Matches {
+			fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\n", m.ServerName, m.Title, m.Year, m.Resolution, m.Quality)
+		}
 	}
 	return w.Flush()
 }

@@ -1576,12 +1576,17 @@ type PlexServersReply struct {
 
 // PlexCheckArgs contains arguments for the PlexCheck RPC method.
 type PlexCheckArgs struct {
-	TmdbID int // TMDB ID (required)
+	TmdbID  int // TMDB ID of a movie or series (required)
+	Season  int // optional season filter (TV only, 0 = all)
+	Episode int // optional episode filter (TV only, 0 = all)
 }
 
 // PlexCheckReply contains the reply for the PlexCheck RPC method.
 type PlexCheckReply struct {
-	Matches []plex.MediaMatch
+	MediaType string // "movie" or "tv"
+	Title     string
+	Year      int
+	Matches   []plex.MediaMatch
 }
 
 // --- Plex cleanup types ---
@@ -1943,7 +1948,10 @@ func (s *Service) PlexServers(args *Empty, reply *PlexServersReply) error {
 	return nil
 }
 
-// PlexCheck searches all shared Plex servers for a movie by TMDB ID.
+// PlexCheck searches all shared Plex servers for a movie or TV series by
+// TMDB ID. If the ID matches a movie, returns movie matches; if it matches a
+// series in the local DB, returns episode matches (optionally filtered by
+// season/episode).
 func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 	if s.plex == nil {
 		return fmt.Errorf("PlexCheck: Plex integration not configured (set plex.token or PLEX_TOKEN)")
@@ -1956,43 +1964,85 @@ func (s *Service) PlexCheck(args *PlexCheckArgs, reply *PlexCheckReply) error {
 	if err != nil {
 		return fmt.Errorf("PlexCheck: %w", err)
 	}
-	if movie == nil {
-		return fmt.Errorf("PlexCheck: no movie with TMDB ID %d (use 'udl movie add' first)", args.TmdbID)
-	}
-
-	imdbID := ""
-	if movie.ImdbID.Valid {
-		imdbID = movie.ImdbID.String
-	}
 
 	servers, err := s.plex.DiscoverServers()
 	if err != nil {
 		return fmt.Errorf("PlexCheck: %w", err)
 	}
 
-	// Search all servers concurrently with bounded parallelism.
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 10)
+	if movie != nil {
+		reply.MediaType = "movie"
+		reply.Title = movie.Title
+		reply.Year = movie.Year
+		imdbID := ""
+		if movie.ImdbID.Valid {
+			imdbID = movie.ImdbID.String
+		}
+		reply.Matches = s.plexSearchAllServers(servers, func(srv plex.Server) ([]plex.MediaMatch, error) {
+			return s.plex.SearchMovie(srv, movie.Title, movie.Year, imdbID, movie.TmdbID)
+		})
+		return nil
+	}
+
+	series, err := s.db.FindSeriesByTmdbID(args.TmdbID)
+	if err != nil {
+		return fmt.Errorf("PlexCheck: %w", err)
+	}
+	if series == nil {
+		return fmt.Errorf("PlexCheck: no movie or series with TMDB ID %d (use 'udl movie add' or 'udl tv add' first)", args.TmdbID)
+	}
+
+	reply.MediaType = "tv"
+	reply.Title = series.Title
+	reply.Year = series.Year
+	matches := s.plexSearchAllServers(servers, func(srv plex.Server) ([]plex.MediaMatch, error) {
+		return s.plex.SearchSeries(srv, series.Title)
+	})
+
+	if args.Season > 0 || args.Episode > 0 {
+		filtered := matches[:0]
+		for _, m := range matches {
+			if args.Season > 0 && m.Season != args.Season {
+				continue
+			}
+			if args.Episode > 0 && m.Episode != args.Episode {
+				continue
+			}
+			filtered = append(filtered, m)
+		}
+		matches = filtered
+	}
+	reply.Matches = matches
+	return nil
+}
+
+// plexSearchAllServers fans out a per-server search function across all
+// discovered shared servers concurrently and collects matches.
+func (s *Service) plexSearchAllServers(servers []plex.Server, search func(plex.Server) ([]plex.MediaMatch, error)) []plex.MediaMatch {
+	var (
+		mu      sync.Mutex
+		wg      sync.WaitGroup
+		sem     = make(chan struct{}, 10)
+		results []plex.MediaMatch
+	)
 	for _, srv := range servers {
 		wg.Add(1)
 		go func(srv plex.Server) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			matches, err := s.plex.SearchMovie(srv, movie.Title, movie.Year, imdbID, movie.TmdbID)
+			matches, err := search(srv)
 			if err != nil {
 				s.log.Debug("plex check: search failed", "server", srv.Name, "error", err)
 				return
 			}
 			mu.Lock()
-			reply.Matches = append(reply.Matches, matches...)
+			results = append(results, matches...)
 			mu.Unlock()
 		}(srv)
 	}
 	wg.Wait()
-
-	return nil
+	return results
 }
 
 // PlexCleanup identifies unwatched media older than N days and optionally deletes it.

@@ -51,6 +51,8 @@ type MediaMatch struct {
 	RatingKey   string // Plex metadata ID for fetching download info
 	Title       string
 	Year        int
+	Season      int             // episode season (0 for movies)
+	Episode     int             // episode number (0 for movies)
 	Resolution  string          // raw from Plex: "720", "1080", "4k"
 	Quality     quality.Quality // mapped UDL quality tier
 }
@@ -331,17 +333,49 @@ func (c *Client) SearchMovie(srv Server, title string, year int, imdbID string, 
 // SearchEpisode searches a specific server for a TV episode. Finds the show
 // first, then walks seasons → episodes to locate the specific one.
 func (c *Client) SearchEpisode(srv Server, seriesTitle string, season, episode int) ([]MediaMatch, error) {
-	// Check cache first.
+	episodes, err := c.lookupSeriesEpisodes(srv, seriesTitle)
+	if err != nil || episodes == nil {
+		return nil, err
+	}
+	return c.matchEpisodeFromCache(episodes, srv, seriesTitle, season, episode), nil
+}
+
+// SearchSeries searches a specific server for a TV series and returns every
+// episode found as a MediaMatch. Uses the same cache as SearchEpisode.
+func (c *Client) SearchSeries(srv Server, seriesTitle string) ([]MediaMatch, error) {
+	episodes, err := c.lookupSeriesEpisodes(srv, seriesTitle)
+	if err != nil || episodes == nil {
+		return nil, err
+	}
+	matches := make([]MediaMatch, 0, len(episodes))
+	for _, ep := range episodes {
+		matches = append(matches, MediaMatch{
+			ServerName:  srv.Name,
+			ServerURI:   srv.URI,
+			AccessToken: srv.AccessToken,
+			RatingKey:   ep.RatingKey,
+			Title:       seriesTitle,
+			Season:      ep.Season,
+			Episode:     ep.Episode,
+			Resolution:  ep.Resolution,
+			Quality:     MapResolution(ep.Resolution),
+		})
+	}
+	return matches, nil
+}
+
+// lookupSeriesEpisodes resolves a series by title on a server and returns its
+// full episode list, caching results for subsequent lookups. Returns (nil, nil)
+// if the show is not found on the server.
+func (c *Client) lookupSeriesEpisodes(srv Server, seriesTitle string) ([]episodeMeta, error) {
 	cacheKey := srv.URI + "|" + strings.ToLower(seriesTitle)
 	c.mu.Lock()
 	cached, ok := c.episodeCache[cacheKey]
 	c.mu.Unlock()
-
 	if ok {
-		return c.matchEpisodeFromCache(cached, srv, seriesTitle, season, episode), nil
+		return cached, nil
 	}
 
-	// Search for the show.
 	searchURL := fmt.Sprintf("%s/hubs/search?query=%s&limit=10&includeGuids=1", srv.URI, url.QueryEscape(seriesTitle))
 	req, err := http.NewRequest("GET", searchURL, nil)
 	if err != nil {
@@ -364,7 +398,6 @@ func (c *Client) SearchEpisode(srv Server, seriesTitle string, season, episode i
 		return nil, err
 	}
 
-	// Find the matching show.
 	var showKey string
 	for _, hub := range hubResult.MediaContainer.Hub {
 		if hub.Type != "show" {
@@ -387,18 +420,15 @@ func (c *Client) SearchEpisode(srv Server, seriesTitle string, season, episode i
 		return nil, nil
 	}
 
-	// Fetch all episodes for this show (seasons → episodes).
 	episodes, err := c.fetchAllEpisodes(srv, showKey)
 	if err != nil {
 		return nil, err
 	}
 
-	// Cache for future lookups.
 	c.mu.Lock()
 	c.episodeCache[cacheKey] = episodes
 	c.mu.Unlock()
-
-	return c.matchEpisodeFromCache(episodes, srv, seriesTitle, season, episode), nil
+	return episodes, nil
 }
 
 // GetDownloadInfo fetches full metadata for a matched item and constructs
@@ -902,6 +932,8 @@ func (c *Client) matchEpisodeFromCache(episodes []episodeMeta, srv Server, serie
 				AccessToken: srv.AccessToken,
 				RatingKey:   ep.RatingKey,
 				Title:       seriesTitle,
+				Season:      ep.Season,
+				Episode:     ep.Episode,
 				Resolution:  ep.Resolution,
 				Quality:     MapResolution(ep.Resolution),
 			})
