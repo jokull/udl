@@ -650,6 +650,17 @@ func scoreRelease(rel newznab.Release, cfg *config.Config) ScoredRelease {
 		}
 	}
 
+	// Blocked codecs: hard reject (e.g. AV1 when clients can't decode it).
+	// Codec is normalized by the parser (av1/hevc/h264/vc1/mpeg2/xvid/divx).
+	if parsed.Codec != "" {
+		for _, bc := range cfg.Quality.BlockedCodecs {
+			if strings.EqualFold(strings.TrimSpace(bc), parsed.Codec) {
+				sr.Rejected = true
+				sr.RejectionReason = fmt.Sprintf("blocked codec: %s", parsed.Codec)
+				return sr
+			}
+		}
+	}
 	score := int(q) * 100 // base score from quality tier
 	if q == prefs.Preferred {
 		score += 50 // bonus for preferred quality
@@ -672,6 +683,16 @@ func scoreRelease(rel newznab.Release, cfg *config.Config) ScoredRelease {
 		}
 	}
 
+	// Preferred codecs bonus: +100 per match — enough to break ties between
+	// same-tier releases without dominating quality tier or size.
+	if parsed.Codec != "" {
+		for _, pc := range cfg.Quality.PreferredCodecs {
+			if strings.EqualFold(strings.TrimSpace(pc), parsed.Codec) {
+				score += 100
+				break
+			}
+		}
+	}
 	// Age decay: prefer newer releases. -1 per day old, capped at -500.
 	if ageDays := releaseAge(rel.PubDate); ageDays > 0 {
 		penalty := ageDays

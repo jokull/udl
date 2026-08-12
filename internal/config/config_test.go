@@ -21,6 +21,8 @@ complete = "/tmp/test/complete"
 min = "WEBDL-720p"
 preferred = "WEBDL-1080p"
 upgrade_until = "Bluray-1080p"
+preferred_codecs = ["hevc", "h264"]
+blocked_codecs = ["av1"]
 
 [[usenet.providers]]
 name = "primary"
@@ -93,6 +95,14 @@ func TestLoadRoundTrip(t *testing.T) {
 	}
 	if cfg.Quality.UpgradeUntil != "Bluray-1080p" {
 		t.Errorf("Quality.UpgradeUntil = %q, want Bluray-1080p", cfg.Quality.UpgradeUntil)
+	}
+
+	// Codec preferences
+	if len(cfg.Quality.PreferredCodecs) != 2 || cfg.Quality.PreferredCodecs[0] != "hevc" || cfg.Quality.PreferredCodecs[1] != "h264" {
+		t.Errorf("Quality.PreferredCodecs = %v, want [hevc h264]", cfg.Quality.PreferredCodecs)
+	}
+	if len(cfg.Quality.BlockedCodecs) != 1 || cfg.Quality.BlockedCodecs[0] != "av1" {
+		t.Errorf("Quality.BlockedCodecs = %v, want [av1]", cfg.Quality.BlockedCodecs)
 	}
 
 	// Parsed quality prefs

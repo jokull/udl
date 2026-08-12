@@ -20,6 +20,7 @@ type Result struct {
 	Group   string          // release group
 	IsTV    bool            // true if season/episode detected
 	Edition string          // "Directors Cut", "Extended", etc. (empty if none)
+	Codec   string          // av1, hevc, h264, vc1, mpeg2, xvid, divx (empty if unknown)
 }
 
 // Regex patterns compiled once at init time.
@@ -46,6 +47,10 @@ var (
 
 	// REMUX keyword — checked separately so it takes priority over BluRay
 	remuxPattern = regexp.MustCompile(`(?i)\bREMUX\b`)
+
+	// Codec keywords — order matters (most specific first). Matches whole
+	// tokens so "AVC" doesn't match inside "AVCHD" etc.
+	codecPattern = regexp.MustCompile(`(?i)\b(?:AV1|HEVC|H\.?265|X265|H\.?264|X264|AVC|VC-?1|MPEG-?2|XVID|DIVX)\b`)
 
 	// Release group: the last -GROUP in the title (ignoring file extensions)
 	groupPattern = regexp.MustCompile(`-([A-Za-z0-9]+)(?:\.[a-zA-Z]{2,4})?$`)
@@ -132,6 +137,9 @@ func Parse(title string) Result {
 	} else if m := sourcePattern.FindString(title); m != "" {
 		r.Source = normalizeSource(m)
 	}
+
+	// --- Codec ---
+	r.Codec = extractCodec(title)
 
 	// --- Quality ---
 	r.Quality = combineQuality(r.Source, r.Res)
@@ -293,6 +301,42 @@ func normalizeSource(s string) string {
 		return "DVD"
 	default:
 		return s
+	}
+}
+
+// extractCodec returns the canonical video codec name found in a release
+// title ("av1", "hevc", "h264", "vc1", "mpeg2", "xvid", "divx"), or
+// empty string if no codec token was found.
+func extractCodec(title string) string {
+	if m := codecPattern.FindString(title); m != "" {
+		return normalizeCodec(m)
+	}
+	return ""
+}
+
+// normalizeCodec maps a codec token to its canonical name.
+func normalizeCodec(s string) string {
+	upper := strings.ToUpper(s)
+	upper = strings.ReplaceAll(upper, ".", "")
+	upper = strings.ReplaceAll(upper, "-", "")
+
+	switch upper {
+	case "AV1":
+		return "av1"
+	case "HEVC", "H265", "X265":
+		return "hevc"
+	case "H264", "X264", "AVC":
+		return "h264"
+	case "VC1":
+		return "vc1"
+	case "MPEG2":
+		return "mpeg2"
+	case "XVID":
+		return "xvid"
+	case "DIVX":
+		return "divx"
+	default:
+		return strings.ToLower(s)
 	}
 }
 

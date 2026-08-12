@@ -22,6 +22,7 @@ func TestParse(t *testing.T) {
 				Res:     "1080p",
 				Group:   "GROUP",
 				IsTV:    true,
+				Codec:   "h264",
 			},
 		},
 		{
@@ -35,6 +36,7 @@ func TestParse(t *testing.T) {
 				Res:     "720p",
 				Group:   "FLEET",
 				IsTV:    true,
+				Codec:   "h264",
 			},
 		},
 		{
@@ -49,6 +51,7 @@ func TestParse(t *testing.T) {
 				Res:     "2160p",
 				Group:   "GROUP",
 				IsTV:    false,
+				Codec:   "hevc",
 			},
 		},
 		{
@@ -63,6 +66,33 @@ func TestParse(t *testing.T) {
 				Res:     "1080p",
 				Group:   "FGT",
 				IsTV:    false,
+				Codec:   "h264",
+			},
+		},
+		{
+			input: "The.Block.AU.S22E02.1080p.AV1.10bit-MeGusta",
+			want: Result{
+				Title:   "The Block AU",
+				Season:  22,
+				Episode: 2,
+				Quality: quality.WEBDL1080p,
+				Res:     "1080p",
+				Group:   "MeGusta",
+				IsTV:    true,
+				Codec:   "av1",
+			},
+		},
+		{
+			input: "The.Block.AU.S22E02.1080p.HEVC.x265-MeGusta",
+			want: Result{
+				Title:   "The Block AU",
+				Season:  22,
+				Episode: 2,
+				Quality: quality.WEBDL1080p,
+				Res:     "1080p",
+				Group:   "MeGusta",
+				IsTV:    true,
+				Codec:   "hevc",
 			},
 		},
 		{
@@ -103,6 +133,7 @@ func TestParse(t *testing.T) {
 				Res:     "720p",
 				Group:   "GROUP",
 				IsTV:    false,
+				Codec:   "h264",
 			},
 		},
 		// --- Edge cases: year-in-title ---
@@ -280,6 +311,9 @@ func TestParse(t *testing.T) {
 			}
 			if got.Edition != tc.want.Edition {
 				t.Errorf("Edition: got %q, want %q", got.Edition, tc.want.Edition)
+			}
+			if got.Codec != tc.want.Codec {
+				t.Errorf("Codec: got %q, want %q", got.Codec, tc.want.Codec)
 			}
 		})
 	}

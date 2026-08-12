@@ -2540,6 +2540,8 @@ complete = ""    # post-processed, before import to library
 profile = "1080p"
 # must_not_contain = ["CAM", "HDTS", "TELECINE"]
 # preferred_words = ["FLUX", "NTb"]
+# preferred_codecs = ["hevc", "h264"]   # bonus score for releases using these codecs
+# blocked_codecs = ["av1"]              # hard-reject releases using these codecs
 
 # ── TMDB (required) ──
 # Get a free API key at https://www.themoviedb.org/settings/api

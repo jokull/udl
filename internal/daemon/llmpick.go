@@ -261,6 +261,12 @@ func (s *Service) buildLLMPrompt(releases []ScoredRelease, ctx GrabContext) stri
 	b.WriteString("- Prefer releases from reputable groups over xpost re-uploads\n")
 	b.WriteString("- Consider audio quality: TrueHD/Atmos/DTS-HD MA > DD+/EAC3 > DD/AC3\n")
 	b.WriteString("- x265/HEVC is more efficient than x264 at same quality — prefer for same tier\n")
+	if len(s.cfg.Quality.BlockedCodecs) > 0 {
+		fmt.Fprintf(&b, "- Hard requirement: DO NOT pick releases using blocked codecs: %s\n", strings.Join(s.cfg.Quality.BlockedCodecs, ", "))
+	}
+	if len(s.cfg.Quality.PreferredCodecs) > 0 {
+		fmt.Fprintf(&b, "- Prefer releases using preferred codecs: %s\n", strings.Join(s.cfg.Quality.PreferredCodecs, ", "))
+	}
 	b.WriteString("- Prefer theatrical cut unless user wants extended\n")
 
 	if s.cfg.Usenet.RetentionDays > 0 {
@@ -289,14 +295,23 @@ func (s *Service) buildLLMPrompt(releases []ScoredRelease, ctx GrabContext) stri
 			sizeStr = formatBytes(sr.Release.Size)
 		}
 
-		fmt.Fprintf(&b, "#%d  %s  |  %s  |  %s  |  %s  |  score:%d\n",
-			i+1, sr.Release.Title, sr.Quality, sizeStr, ageStr, sr.Score)
+		fmt.Fprintf(&b, "#%d  %s  |  %s  |  %s  |  %s  |  codec:%s  |  score:%d\n",
+			i+1, sr.Release.Title, sr.Quality, sizeStr, ageStr, codecOrDash(sr.Parsed.Codec), sr.Score)
 	}
 
 	return b.String()
 }
 
 // truncate shortens a string to maxLen, appending "..." if truncated.
+// codecOrDash returns the codec name or "-" when unknown, for the LLM
+// release table.
+func codecOrDash(codec string) string {
+	if codec == "" {
+		return "-"
+	}
+	return codec
+}
+
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s

@@ -59,6 +59,12 @@ type QualityConfig struct {
 	UpgradeUntil   string   `toml:"upgrade_until"`
 	MustNotContain []string `toml:"must_not_contain"` // reject releases containing these (case-insensitive)
 	PreferredWords []string `toml:"preferred_words"`  // bonus score for releases containing these
+	// PreferredCodecs adds a score bonus for releases using these codecs
+	// (e.g. ["hevc", "h264"] to prefer Apple-TV-friendly codecs).
+	PreferredCodecs []string `toml:"preferred_codecs"`
+	// BlockedCodecs hard-rejects releases using these codecs
+	// (e.g. ["av1"] when clients can't decode AV1 in hardware).
+	BlockedCodecs []string `toml:"blocked_codecs"`
 }
 
 // Usenet groups the provider list.
