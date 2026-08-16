@@ -282,6 +282,8 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 				s.log.Warn("LLM pick is blocklisted, falling back to scoring", "title", sr.Release.Title)
 			} else if imported, _ := s.db.IsCompletedInHistory(ctx.Category, ctx.MediaID, sr.Release.Title); imported {
 				s.log.Warn("LLM pick already imported, falling back to scoring", "title", sr.Release.Title)
+			} else if prevGrabbed, _ := s.db.HasGrabbedHistory(ctx.Category, ctx.MediaID, sr.Release.Title); prevGrabbed {
+				s.log.Warn("LLM pick already grabbed without completing, falling back to scoring", "title", sr.Release.Title)
 			} else {
 				// Enqueue the LLM-picked release.
 				enqueued, err := s.db.EnqueueDownload(ctx.Category, ctx.MediaID, sr.Release.Link, sr.Release.Title, sr.Release.Size, "usenet")
@@ -364,6 +366,14 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 		// Already-imported history check.
 		if imported, _ := s.db.IsCompletedInHistory(ctx.Category, ctx.MediaID, sr.Release.Title); imported {
 			s.log.Debug("rejected as already imported", "title", sr.Release.Title)
+			rejCount++
+			continue
+		}
+
+		// Dedup: skip releases that were grabbed before without completing
+		// (issue #3). Re-grabbing the same release is pure waste.
+		if prevGrabbed, _ := s.db.HasGrabbedHistory(ctx.Category, ctx.MediaID, sr.Release.Title); prevGrabbed {
+			s.log.Debug("rejected as already grabbed without completing", "title", sr.Release.Title)
 			rejCount++
 			continue
 		}
@@ -557,18 +567,41 @@ func (s *Service) SearchWantedMovies() error {
 
 	var firstErr error
 	for i := range movies {
-		grabbed, err := s.SearchAndGrabMovie(&movies[i])
+		m := &movies[i]
+
+		// Grab attempt cap: stop re-searching movies grabbed many times
+		// without completing (issue #3).
+		grabbedCount, err := s.db.GrabCountSinceCompleted("movie", m.ID)
+		if err != nil {
+			s.log.Error("movie sweep: grab count query failed", "title", m.Title, "error", err)
+		} else if grabbedCount >= grabAttemptLimit {
+			if err := s.db.MarkGrabLimitReached("movie", m.ID, grabbedCount); err != nil {
+				s.log.Error("movie sweep: mark grab limit reached failed", "title", m.Title, "error", err)
+			}
+			s.log.Warn("movie grab limit reached, marking failed", "title", m.Title, "grabs", grabbedCount)
+			continue
+		}
+
+		// Grab cooldown: skip movies grabbed recently without completing.
+		if last, err := s.db.LastGrabSinceCompleted("movie", m.ID); err == nil && last != "" {
+			if t, err := time.Parse("2006-01-02 15:04:05", last); err == nil && time.Since(t) < grabCooldown {
+				s.log.Debug("movie sweep: skipping movie in grab cooldown", "title", m.Title, "last_grab", last)
+				continue
+			}
+		}
+
+		grabbed, err := s.SearchAndGrabMovie(m)
 		if err != nil {
 			if isRetryable(err) {
-				s.log.Warn("search movie transient failure", "title", movies[i].Title, "error", err)
+				s.log.Warn("search movie transient failure", "title", m.Title, "error", err)
 			} else {
-				s.log.Error("search movie failed", "title", movies[i].Title, "error", err)
+				s.log.Error("search movie failed", "title", m.Title, "error", err)
 			}
 			firstErr = err
 			continue
 		}
 		if grabbed {
-			s.log.Info("grabbed movie", "title", movies[i].Title)
+			s.log.Info("grabbed movie", "title", m.Title)
 		}
 	}
 	if firstErr != nil {
@@ -580,6 +613,14 @@ func (s *Service) SearchWantedMovies() error {
 // punctuationRe matches any character that is not a letter, digit, or space.
 // Used by SearchMovieReleases for text search fallback query cleaning.
 var punctuationRe = regexp.MustCompile(`[^\p{L}\p{N}\s]`)
+
+// grabAttemptLimit is the maximum number of times a media item may be grabbed
+// without completing before it is marked failed and left alone (issue #3).
+const grabAttemptLimit = 10
+
+// grabCooldown is the minimum time between grab attempts for a media item that
+// has not completed. Mirrors database.GrabCooldown for Go-side checks.
+const grabCooldown = 6 * time.Hour
 
 // rawDiscRe matches release titles for raw Bluray disc images (not playable media files).
 var rawDiscRe = regexp.MustCompile(`(?i)\b(COMPLETE\.?BLURAY|AVC\.?REMUX|BDREMUX|DISC\d*|ISO|BDISO)\b`)
@@ -817,7 +858,8 @@ func existingQualityFromDB(db *database.DB, category string, mediaID int64) qual
 	return quality.Parse(qualStr)
 }
 
-// annotateRejections marks releases as rejected if they are blocklisted or already completed.
+// annotateRejections marks releases as rejected if they are blocklisted,
+// already completed, or previously grabbed without completing.
 func annotateRejections(db *database.DB, category string, mediaID int64, releases []ScoredRelease) {
 	for i := range releases {
 		if releases[i].Rejected {
@@ -829,6 +871,9 @@ func annotateRejections(db *database.DB, category string, mediaID int64, release
 		} else if imported, _ := db.IsCompletedInHistory(category, mediaID, releases[i].Release.Title); imported {
 			releases[i].Rejected = true
 			releases[i].RejectionReason = "already completed"
+		} else if prevGrabbed, _ := db.HasGrabbedHistory(category, mediaID, releases[i].Release.Title); prevGrabbed {
+			releases[i].Rejected = true
+			releases[i].RejectionReason = "already grabbed"
 		}
 	}
 }

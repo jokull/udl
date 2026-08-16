@@ -16,6 +16,11 @@ type DB struct {
 	*sql.DB
 }
 
+// GrabCooldown is the minimum time between grab attempts for a media item
+// that has not yet completed. Prevents nightly re-grab churn of wanted items
+// (issue #3).
+const GrabCooldown = 6 * time.Hour
+
 // Open opens (or creates) the SQLite database at path, enables WAL mode and
 // foreign keys, and runs schema migrations. Use ":memory:" for an in-memory
 // database suitable for tests.
@@ -520,17 +525,31 @@ func (db *DB) EpisodesForSeries(seriesID int64) ([]Episode, error) {
 //   - Aired 31+ days ago: eligible every 24 hours
 //   - No air_date: excluded (unannounced episodes are not searched)
 //
+// Episodes are additionally excluded during a grab cooldown: an episode whose
+// most recent grab (after its last completed download) is younger than
+// GrabCooldown is not re-searched, preventing nightly re-grabs of the same
+// wanted episode (issue #3).
+//
 // Results are ordered by air_date DESC (most recently aired first) and limited.
 // Includes the series' tvdb_id in the join.
 func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
 	if limit <= 0 {
 		limit = 5
 	}
+	cooldownMod := fmt.Sprintf("-%d hours", int(GrabCooldown.Hours()))
 	rows, err := db.Query(`
+		WITH grab_state AS (
+			SELECT e.id AS episode_id,
+			       COALESCE((SELECT MAX(c.id) FROM history c
+			                 WHERE c.media_type = 'episode' AND c.media_id = e.id
+			                   AND c.event IN ('completed', 'reset')), 0) AS cutoff
+			FROM episodes e
+		)
 		SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
 		       e.monitored, e.status, e.quality, e.file_path, e.last_searched_at, s.title, s.tvdb_id
 		FROM episodes e
 		JOIN series s ON s.id = e.series_id
+		JOIN grab_state g ON g.episode_id = e.id
 		WHERE e.status = 'wanted'
 		  AND e.monitored = 1
 		  AND e.air_date IS NOT NULL AND e.air_date != '' AND e.air_date <= date('now')
@@ -547,9 +566,22 @@ func (db *DB) SearchableEpisodes(limit int) ([]Episode, error) {
 		      OR (e.air_date < date('now', '-30 days') AND e.last_searched_at < datetime('now', '-24 hours'))
 		    )
 		  )
+		  -- Grab cooldown: exclude episodes grabbed recently without completing.
+		  AND (
+		    NOT EXISTS (
+		      SELECT 1 FROM history h
+		      WHERE h.media_type = 'episode' AND h.media_id = e.id
+		        AND h.event = 'grabbed' AND h.id > g.cutoff
+		    )
+		    OR (
+		      SELECT MAX(h.created_at) FROM history h
+		      WHERE h.media_type = 'episode' AND h.media_id = e.id
+		        AND h.event = 'grabbed' AND h.id > g.cutoff
+		    ) < datetime('now', ?)
+		  )
 		ORDER BY
 		  e.air_date DESC
-		LIMIT ?`, limit)
+		LIMIT ?`, cooldownMod, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -786,6 +818,100 @@ func (db *DB) IsCompletedInHistory(mediaType string, mediaID int64, releaseTitle
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// HasGrabbedHistory returns true if the release title was previously grabbed
+// for the media item without ever completing. Used to dedup grabs: re-grabbing
+// the exact same release after a failed or aborted download is pure waste
+// (same NZB, same failure) and burns indexer quota (issue #3).
+func (db *DB) HasGrabbedHistory(mediaType string, mediaID int64, releaseTitle string) (bool, error) {
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM history h
+		WHERE h.media_type = ? AND h.media_id = ? AND h.source = ? AND h.event = 'grabbed'
+		  AND NOT EXISTS (
+		    SELECT 1 FROM history c
+		    WHERE c.media_type = h.media_type AND c.media_id = h.media_id
+		      AND c.source = h.source AND c.event = 'completed' AND c.id > h.id
+		  )`, mediaType, mediaID, releaseTitle).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// grabCutoff returns the history row id after which grabs should count toward
+// the grab-attempt cap: the most recent 'completed' or 'reset' event. Events
+// before the item last completed (or was explicitly re-armed by the user) are
+// not counted.
+func grabCutoff(db *DB, mediaType string, mediaID int64) int64 {
+	var cutoff int64
+	_ = db.QueryRow(`
+		SELECT COALESCE(MAX(id), 0) FROM history
+		WHERE media_type = ? AND media_id = ? AND event IN ('completed', 'reset')`,
+		mediaType, mediaID).Scan(&cutoff)
+	return cutoff
+}
+
+// GrabCountSinceCompleted returns how many times the media item has been
+// grabbed since its most recent completed download (or explicit user reset).
+// If it never completed, returns the total grab count. Used for the grab
+// attempt cap (issue #3).
+func (db *DB) GrabCountSinceCompleted(mediaType string, mediaID int64) (int, error) {
+	cutoff := grabCutoff(db, mediaType, mediaID)
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*) FROM history
+		WHERE media_type = ? AND media_id = ? AND event = 'grabbed' AND id > ?`,
+		mediaType, mediaID, cutoff).Scan(&count)
+	return count, err
+}
+
+// LastGrabSinceCompleted returns the timestamp of the most recent grab that has
+// not yet led to a completed download or explicit reset. Returns "" if there
+// is none. Used for the grab cooldown (issue #3).
+func (db *DB) LastGrabSinceCompleted(mediaType string, mediaID int64) (string, error) {
+	cutoff := grabCutoff(db, mediaType, mediaID)
+	var ts sql.NullString
+	err := db.QueryRow(`
+		SELECT MAX(created_at) FROM history
+		WHERE media_type = ? AND media_id = ? AND event = 'grabbed' AND id > ?`,
+		mediaType, mediaID, cutoff).Scan(&ts)
+	if err != nil {
+		return "", err
+	}
+	return ts.String, nil
+}
+
+// MarkGrabLimitReached marks a media item as failed because it was grabbed too
+// many times without completing. Unlike a normal failure, download_started_at
+// is left NULL so the scheduler's failed-reset logic will not resurrect it —
+// the item stays failed until the user explicitly retries (issue #3).
+func (db *DB) MarkGrabLimitReached(category string, mediaID int64, attempts int) error {
+	table := tableFor(category)
+	if err := db.ensureMediaTransition(table, mediaID, "failed"); err != nil {
+		return err
+	}
+	_, err := db.Exec(fmt.Sprintf(`
+		UPDATE %s SET
+			status = 'failed',
+			download_error = ?,
+			nzb_url = NULL, nzb_name = NULL,
+			download_progress = 0, download_size = NULL, download_bytes = 0,
+			download_source = NULL, download_started_at = NULL
+		WHERE id = ?`, table),
+		fmt.Sprintf("grab limit reached (%d grabs without completion)", attempts), mediaID)
+	return err
+}
+
+// ResetGrabCounter re-arms a media item's grab-attempt tracking by recording a
+// 'reset' history event. Used when a user explicitly retries a failed item, so
+// the grab attempt cap and cooldown start over (issue #3).
+func (db *DB) ResetGrabCounter(category string, mediaID int64) error {
+	_, err := db.Exec(
+		`INSERT INTO history (media_type, media_id, title, event, source, quality) VALUES (?, ?, '', 'reset', '', '')`,
+		category, mediaID)
+	return err
 }
 
 // ListHistory returns recent history events, most recent first.

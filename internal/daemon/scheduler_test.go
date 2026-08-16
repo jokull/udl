@@ -1,12 +1,17 @@
 package daemon
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/newznab"
+	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/quality"
 )
 
@@ -192,5 +197,98 @@ func TestSearchableEpisodes_OrderByAirDateDesc(t *testing.T) {
 			t.Errorf("episodes not in air_date DESC order: %s before %s",
 				episodes[0].AirDate.String, episodes[1].AirDate.String)
 		}
+	}
+}
+
+// TestEpisodeSearchGrabLimitReached verifies that an episode grabbed the maximum
+// number of times without completing is marked failed instead of re-searched
+// forever (issue #3).
+func TestEpisodeSearchGrabLimitReached(t *testing.T) {
+	s := newTestScheduler(t)
+
+	eps, err := s.svc.db.SearchableEpisodes(10)
+	if err != nil {
+		t.Fatalf("SearchableEpisodes: %v", err)
+	}
+	if len(eps) != 3 {
+		t.Fatalf("expected 3 searchable episodes, got %d", len(eps))
+	}
+	target := eps[0]
+
+	// Simulate grabAttemptLimit grabs that all failed, backdated past the cooldown.
+	for i := 0; i < grabAttemptLimit; i++ {
+		rel := fmt.Sprintf("Some.Release.1080p-%d", i)
+		if err := s.svc.db.AddHistory("episode", target.ID, target.SeriesTitle, "grabbed", rel, "HDTV-1080p"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.svc.db.Exec(`UPDATE history SET created_at = datetime('now', '-7 hours')
+		WHERE media_type = 'episode' AND media_id = ? AND event = 'grabbed'`, target.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	s.runEpisodeSearch()
+
+	ep, err := s.svc.db.GetEpisode(target.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ep.Status != "failed" {
+		t.Errorf("episode status = %q, want failed after grab limit reached", ep.Status)
+	}
+	if ep.DownloadError.Valid && !strings.Contains(ep.DownloadError.String, "grab limit reached") {
+		t.Errorf("download_error = %q, want grab limit reached", ep.DownloadError.String)
+	}
+
+	// Once failed (terminal, no download_started_at), the scheduler must not
+	// resurrect it via the 2h failed-reset.
+	n, err := s.svc.db.ResetFailedEpisodes(2 * time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("ResetFailedEpisodes reset %d capped episodes, want 0", n)
+	}
+}
+
+// TestGrabBestDedup verifies that a release grabbed before without completing is
+// not grabbed again (issue #3).
+func TestGrabBestDedup(t *testing.T) {
+	s := newTestScheduler(t)
+
+	eps, err := s.svc.db.SearchableEpisodes(10)
+	if err != nil {
+		t.Fatalf("SearchableEpisodes: %v", err)
+	}
+	target := eps[0]
+
+	rel := newznab.Release{Title: "Test.Series.S01E01.1080p.WEB.H264-GRP", Size: 0}
+	scored := []ScoredRelease{{
+		Release: rel,
+		Parsed:  parser.Parse(rel.Title),
+		Quality: quality.WEBDL1080p,
+		Score:   100,
+	}}
+	ctx := GrabContext{Category: "episode", MediaID: target.ID, Title: target.SeriesTitle, Season: 1, Episode: 1}
+
+	// First grab succeeds.
+	ok, err := s.svc.GrabBest(scored, ctx)
+	if err != nil {
+		t.Fatalf("GrabBest (first): %v", err)
+	}
+	if !ok {
+		t.Fatal("expected first grab to succeed")
+	}
+
+	// Same release again (episode reset to wanted) must be rejected.
+	if err := s.svc.db.ResetMediaForRetry("episode", target.ID); err != nil {
+		t.Fatal(err)
+	}
+	ok, err = s.svc.GrabBest(scored, ctx)
+	if err != nil {
+		t.Fatalf("GrabBest (second): %v", err)
+	}
+	if ok {
+		t.Fatal("expected re-grab of same release to be rejected by dedup")
 	}
 }

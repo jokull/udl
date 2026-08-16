@@ -1448,6 +1448,9 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 		if err := s.db.ResetMediaForRetry("movie", movie.ID); err != nil {
 			return fmt.Errorf("RetryDownload: %w", err)
 		}
+		if err := s.db.ResetGrabCounter("movie", movie.ID); err != nil {
+			s.log.Error("RetryDownload: reset grab counter failed", "movie_id", movie.ID, "error", err)
+		}
 		if len(s.indexers) > 0 {
 			s.retryMedia("movie", movie.ID)
 		}
@@ -1471,6 +1474,9 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 		if err := s.db.ResetMediaForRetry("episode", ep.ID); err != nil {
 			return fmt.Errorf("RetryDownload: %w", err)
 		}
+		if err := s.db.ResetGrabCounter("episode", ep.ID); err != nil {
+			s.log.Error("RetryDownload: reset grab counter failed", "episode_id", ep.ID, "error", err)
+		}
 		if len(s.indexers) > 0 {
 			s.retryMedia("episode", ep.ID)
 		}
@@ -1479,6 +1485,9 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 		// Single retry by DB media ID (web UI path).
 		if err := s.db.ResetMediaForRetry(args.Category, args.MediaID); err != nil {
 			return fmt.Errorf("RetryDownload: %w", err)
+		}
+		if err := s.db.ResetGrabCounter(args.Category, args.MediaID); err != nil {
+			s.log.Error("RetryDownload: reset grab counter failed", "category", args.Category, "media_id", args.MediaID, "error", err)
 		}
 		if len(s.indexers) > 0 {
 			s.retryMedia(args.Category, args.MediaID)
@@ -1494,6 +1503,9 @@ func (s *Service) RetryDownload(args *RetryDownloadArgs, reply *RetryDownloadRep
 			if err := s.db.ResetMediaForRetry(item.Category, item.MediaID); err != nil {
 				s.log.Error("retry: reset failed", "category", item.Category, "id", item.MediaID, "error", err)
 				continue
+			}
+			if err := s.db.ResetGrabCounter(item.Category, item.MediaID); err != nil {
+				s.log.Error("retry: reset grab counter failed", "category", item.Category, "id", item.MediaID, "error", err)
 			}
 			reply.Count++
 			if len(s.indexers) > 0 {
