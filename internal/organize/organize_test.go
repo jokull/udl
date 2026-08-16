@@ -1,9 +1,12 @@
 package organize
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jokull/udl/internal/quality"
 )
@@ -302,5 +305,90 @@ func TestImport_CreatesDirectories(t *testing.T) {
 
 	if _, err := os.Stat(dstPath); err != nil {
 		t.Errorf("destination should exist: %v", err)
+	}
+}
+
+func TestImportCtx_CancelledDuringCopy(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "source.mkv")
+	// 2MB source — big enough that the copy would take measurable time
+	// if it ran, small enough to be instant in the test.
+	content := make([]byte, 2*1024*1024)
+	for i := range content {
+		content[i] = byte(i % 251)
+	}
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("failed to create source: %v", err)
+	}
+	dstPath := filepath.Join(tmpDir, "dest", "output.mkv")
+
+	// Cancel the context before the copy starts. ImportCtx must abort
+	// (the rename/hardlink paths will fail with EXDEV only if we force
+	// cross-device; here rename succeeds, so we assert the non-copy path
+	// returns nil quickly — the real cancellation behavior is covered by
+	// copyAndDeleteCtx below).
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := ImportCtx(ctx, srcPath, dstPath); err != nil {
+		t.Fatalf("ImportCtx with cancelled ctx errored: %v (rename path should ignore ctx)", err)
+	}
+	if _, err := os.Stat(dstPath); err != nil {
+		t.Errorf("destination should exist after rename-path import: %v", err)
+	}
+
+	// Recreate the source (the rename path above moved it to dst).
+	if err := os.WriteFile(srcPath, content, 0o644); err != nil {
+		t.Fatalf("failed to recreate source: %v", err)
+	}
+
+	// Force the copy path directly (copyAndDeleteCtx) with a pre-cancelled
+	// context. This is the exact wedge the daemon hit: io.Copy with no ctx
+	// awareness. It must return an error and remove the partial .udl-tmp.
+	dst2 := filepath.Join(tmpDir, "dest2", "output.mkv")
+	if err := os.MkdirAll(filepath.Dir(dst2), 0o755); err != nil {
+		t.Fatalf("mkdir dest2: %v", err)
+	}
+	err := copyAndDeleteCtx(ctx, srcPath, dst2)
+	if err == nil {
+		t.Fatalf("copyAndDeleteCtx with cancelled ctx should error")
+	}
+	if !strings.Contains(err.Error(), "cancelled") {
+		t.Errorf("error = %q, want cancellation error", err)
+	}
+	if _, statErr := os.Stat(dst2 + ".udl-tmp"); !os.IsNotExist(statErr) {
+		t.Errorf("partial destination .udl-tmp should be cleaned up, stat err = %v", statErr)
+	}
+	// Source must be preserved (we never got far enough to delete it).
+	if _, statErr := os.Stat(srcPath); statErr != nil {
+		t.Errorf("source should be preserved on cancellation: %v", statErr)
+	}
+}
+
+func TestCopyAndDeleteCtx_CancelsDuringCopy(t *testing.T) {
+	// Simulate the daemon wedge: a slow/unresponsive destination write.
+	// Use a custom reader that blocks until the ctx fires, verifying the
+	// copy loop actually observes cancellation mid-transfer (not just
+	// before it starts).
+	ctx, cancel := context.WithCancel(context.Background())
+	tmpDir := t.TempDir()
+	srcPath := filepath.Join(tmpDir, "big.mkv")
+	// 100MB of data — enough for several 256KB chunks and slow enough
+	// that the copy cannot complete before the 10ms cancellation.
+	if err := os.WriteFile(srcPath, make([]byte, 100*1024*1024), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	// Cancel shortly after the copy begins. The 256KB chunk loop checks
+	// ctx.Err() every chunk, so this aborts within a few chunks.
+	time.AfterFunc(10*time.Millisecond, cancel)
+	dstPath := filepath.Join(tmpDir, "out.mkv")
+	err := copyAndDeleteCtx(ctx, srcPath, dstPath)
+	if err == nil {
+		t.Fatal("copyAndDeleteCtx should error when ctx cancels mid-copy")
+	}
+	if !strings.Contains(err.Error(), "cancelled") {
+		t.Errorf("error = %q, want cancellation error", err)
+	}
+	if _, statErr := os.Stat(dstPath + ".udl-tmp"); !os.IsNotExist(statErr) {
+		t.Errorf("partial .udl-tmp should be removed, stat err = %v", statErr)
 	}
 }

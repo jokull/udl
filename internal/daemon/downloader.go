@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,8 +39,11 @@ type PoolStatuser interface {
 }
 
 // Downloader picks items from the download queue and processes them.
-// Uses two workers: one for NNTP/Plex downloads, one for post-processing.
-// This prevents slow post-processing (PAR2/RAR) from blocking new downloads.
+// Uses a worker pool for NNTP/Plex downloads and a separate worker for
+// post-processing. The pool prevents a single hung item (e.g. a wedged
+// cross-device copy) from blocking the entire queue: other workers keep
+// consuming while one item is stuck. Each item gets its own context so
+// timeouts and cancellation are per-item, not per-queue.
 type Downloader struct {
 	svc           *Service
 	engine        DownloadEngine
@@ -49,7 +53,15 @@ type Downloader struct {
 	stop          chan struct{}
 	stopOnce      sync.Once
 	paused        atomic.Bool
-	ppRetryAfter map[string]time.Time // category:mediaID → earliest retry time
+	ppRetryAfter  map[string]time.Time // category:mediaID → earliest retry time
+	// downloadWorkers is the number of concurrent download worker goroutines.
+	// Defaults to 4; configurable via daemon.download_workers.
+	downloadWorkers int
+	// inFlight tracks items currently being processed by a worker
+	// ("category:mediaID" → true). The watchdog re-enqueues pending items
+	// every 30s including 'downloading' ones; without this guard a pool of
+	// workers could process the same item twice concurrently.
+	inFlight sync.Map
 }
 
 // Pause pauses the download queue processing.
@@ -86,13 +98,14 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 	}
 
 	return &Downloader{
-		svc:           svc,
-		engine:        engine,
-		indexers:      indexers,
-		downloadCh:    make(chan database.QueueItem, 32),
-		postProcessCh: make(chan database.QueueItem, 8),
-		stop:          make(chan struct{}),
-		ppRetryAfter:  make(map[string]time.Time),
+		svc:             svc,
+		engine:          engine,
+		indexers:        indexers,
+		downloadCh:      make(chan database.QueueItem, 32),
+		postProcessCh:   make(chan database.QueueItem, 8),
+		stop:            make(chan struct{}),
+		ppRetryAfter:    make(map[string]time.Time),
+		downloadWorkers: cfg.Daemon.DownloadWorkers,
 	}
 }
 
@@ -100,12 +113,13 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 // Used in tests to inject a fake engine that doesn't require real NNTP providers.
 func NewDownloaderWithEngine(svc *Service, engine DownloadEngine) *Downloader {
 	return &Downloader{
-		svc:           svc,
-		engine:        engine,
-		downloadCh:    make(chan database.QueueItem, 32),
-		postProcessCh: make(chan database.QueueItem, 8),
-		stop:          make(chan struct{}),
-		ppRetryAfter:  make(map[string]time.Time),
+		svc:             svc,
+		engine:          engine,
+		downloadCh:      make(chan database.QueueItem, 32),
+		postProcessCh:   make(chan database.QueueItem, 8),
+		stop:            make(chan struct{}),
+		ppRetryAfter:    make(map[string]time.Time),
+		downloadWorkers: 4,
 	}
 }
 
@@ -160,8 +174,17 @@ func (d *Downloader) Start(ctx context.Context) {
 		}
 	}
 
-	// Download worker: picks up queued items, runs NNTP/Plex download phase.
-	go d.downloadWorker(ctx)
+	// Download worker pool: N workers consume from downloadCh in parallel.
+	// A hung item (wedged copy, stuck HTTP read) blocks only its own worker;
+	// the rest of the queue keeps draining. Default 4, configurable.
+	n := d.downloadWorkers
+	if n < 1 {
+		n = 4
+	}
+	d.svc.log.Info("downloader: starting worker pool", "workers", n)
+	for i := 0; i < n; i++ {
+		go d.downloadWorker(ctx)
+	}
 	// Post-process worker: picks up post_processing items, runs PAR2/RAR/import.
 	go d.postProcessWorker(ctx)
 
@@ -271,6 +294,8 @@ func (d *Downloader) processItem(ctx context.Context, item database.QueueItem) {
 
 // downloadWorker processes queued items: NNTP download or Plex stream.
 // Each item gets a 4-hour timeout to prevent indefinite hangs.
+// Multiple workers run in parallel; the inFlight map guarantees each item
+// is processed by at most one worker even when the watchdog re-enqueues it.
 func (d *Downloader) downloadWorker(ctx context.Context) {
 	for {
 		select {
@@ -289,9 +314,17 @@ func (d *Downloader) downloadWorker(ctx context.Context) {
 				case <-time.After(2 * time.Second):
 				}
 			}
+			key := item.Category + ":" + strconv.FormatInt(item.MediaID, 10)
+			if _, loaded := d.inFlight.LoadOrStore(key, struct{}{}); loaded {
+				// Another worker is already processing this item (watchdog
+				// re-enqueued it). Skip — it will be cleaned up on completion.
+				d.svc.log.Debug("download worker: item already in flight, skipping", "category", item.Category, "media_id", item.MediaID)
+				continue
+			}
 			itemCtx, cancel := context.WithTimeout(ctx, 4*time.Hour)
 			d.processDownload(itemCtx, item)
 			cancel()
+			d.inFlight.Delete(key)
 		}
 	}
 }
@@ -675,7 +708,7 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 		q = quality.WEBDL1080p // conservative default for Plex
 	}
 
-	dstPath, err := d.importToLibrary(item, finalTmpPath, nil, q)
+	dstPath, err := d.importToLibrary(ctx, item, finalTmpPath, nil, q)
 	if err != nil {
 		return d.fail(item, err.Error(), downloadDir)
 	}
@@ -829,7 +862,7 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 	parsed2 := parser.Parse(nzbName)
 	q := parsed2.Quality
 
-	dstPath, err := d.importToLibrary(item, mainMedia, result.SubtitleFiles, q)
+	dstPath, err := d.importToLibrary(ctx, item, mainMedia, result.SubtitleFiles, q)
 	if err != nil {
 		return d.fail(item, err.Error(), downloadDir)
 	}
@@ -839,7 +872,7 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 
 // importToLibrary imports a media file (and optional subtitles) to the library.
 // Handles both movie and episode categories. Returns the destination path.
-func (d *Downloader) importToLibrary(item database.QueueItem, mediaFile string, subtitleFiles []string, q quality.Quality) (string, error) {
+func (d *Downloader) importToLibrary(ctx context.Context, item database.QueueItem, mediaFile string, subtitleFiles []string, q quality.Quality) (string, error) {
 	mediaExt := filepath.Ext(mediaFile)
 
 	switch item.Category {
@@ -849,13 +882,13 @@ func (d *Downloader) importToLibrary(item database.QueueItem, mediaFile string, 
 			return "", fmt.Errorf("get movie %d: %v", item.MediaID, err)
 		}
 		dstPath := organize.MoviePath(d.svc.cfg.Library.Movies, movie.Title, movie.Year, q, mediaExt)
-		if err := organize.Import(mediaFile, dstPath); err != nil {
+		if err := organize.ImportCtx(ctx, mediaFile, dstPath); err != nil {
 			return "", fmt.Errorf("import movie: %v", err)
 		}
 		for _, sub := range subtitleFiles {
 			subExt := filepath.Ext(sub)
 			subDst := organize.SubtitlePath(dstPath, "en", subExt)
-			if err := organize.Import(sub, subDst); err != nil {
+			if err := organize.ImportCtx(ctx, sub, subDst); err != nil {
 				d.svc.log.Warn("failed to import subtitle", "src", sub, "dst", subDst, "error", err)
 			}
 		}
@@ -881,13 +914,13 @@ func (d *Downloader) importToLibrary(item database.QueueItem, mediaFile string, 
 			d.svc.cfg.Library.TV, series.Title, series.Year,
 			ep.Season, ep.Episode, epTitle, q, mediaExt,
 		)
-		if err := organize.Import(mediaFile, dstPath); err != nil {
+		if err := organize.ImportCtx(ctx, mediaFile, dstPath); err != nil {
 			return "", fmt.Errorf("import episode: %v", err)
 		}
 		for _, sub := range subtitleFiles {
 			subExt := filepath.Ext(sub)
 			subDst := organize.SubtitlePath(dstPath, "en", subExt)
-			if err := organize.Import(sub, subDst); err != nil {
+			if err := organize.ImportCtx(ctx, sub, subDst); err != nil {
 				d.svc.log.Warn("failed to import subtitle", "src", sub, "dst", subDst, "error", err)
 			}
 		}

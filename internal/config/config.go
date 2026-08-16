@@ -109,6 +109,7 @@ type WebConfig struct {
 // DaemonConfig holds daemon-level performance tuning.
 type DaemonConfig struct {
 	SearchConcurrency int `toml:"search_concurrency"` // default 3
+	DownloadWorkers   int `toml:"download_workers"`   // parallel download workers, default 4
 }
 
 const (
@@ -198,6 +199,9 @@ func LoadFrom(path string) (*Config, error) {
 	if cfg.Daemon.SearchConcurrency <= 0 {
 		cfg.Daemon.SearchConcurrency = 3
 	}
+	if cfg.Daemon.DownloadWorkers <= 0 {
+		cfg.Daemon.DownloadWorkers = 4
+	}
 
 	return &cfg, nil
 }
@@ -264,6 +268,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Daemon.SearchConcurrency < 1 {
 		return fmt.Errorf("config: daemon.search_concurrency must be >= 1")
+	}
+	if c.Daemon.DownloadWorkers < 1 {
+		return fmt.Errorf("config: daemon.download_workers must be >= 1")
 	}
 
 	return nil

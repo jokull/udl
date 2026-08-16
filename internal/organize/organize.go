@@ -1,6 +1,7 @@
 package organize
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -97,6 +98,15 @@ var ErrDestExists = fmt.Errorf("organize: destination already exists")
 // then hardlink, then copy+delete as last resort.
 // Returns ErrDestExists if the destination file already exists.
 func Import(src, dst string) error {
+	return ImportCtx(context.Background(), src, dst)
+}
+
+// ImportCtx is Import with context cancellation support. The context is
+// honored during the cross-device copy fallback: a cancelled context aborts
+// the copy and removes the partial destination. Rename/hardlink paths are
+// atomic and effectively instantaneous, so they never block long enough to
+// observe cancellation.
+func ImportCtx(ctx context.Context, src, dst string) error {
 	// Remove existing file at destination (upgrade / re-download).
 	if _, err := os.Stat(dst); err == nil {
 		if err := os.Remove(dst); err != nil {
@@ -121,13 +131,21 @@ func Import(src, dst string) error {
 	}
 
 	// Both failed (cross-device). Fall back to copy+delete.
-	return copyAndDelete(src, dst)
+	return copyAndDeleteCtx(ctx, src, dst)
 }
 
 // copyAndDelete copies src to dst atomically then removes src.
 // Writes to a .udl-tmp file, fsyncs, then renames to prevent
 // corrupt library files on crash.
 func copyAndDelete(src, dst string) error {
+	return copyAndDeleteCtx(context.Background(), src, dst)
+}
+
+// copyAndDeleteCtx is copyAndDelete with context cancellation: the copy loop
+// checks ctx every 256KB chunk and aborts (removing the partial destination)
+// when the context is cancelled. This is what prevents a wedged or extremely
+// slow destination filesystem from blocking a download worker forever.
+func copyAndDeleteCtx(ctx context.Context, src, dst string) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("organize: open src %s: %w", src, err)
@@ -140,10 +158,29 @@ func copyAndDelete(src, dst string) error {
 		return fmt.Errorf("organize: create tmp %s: %w", tmpDst, err)
 	}
 
-	if _, err := io.Copy(dstFile, srcFile); err != nil {
-		dstFile.Close()
-		os.Remove(tmpDst)
-		return fmt.Errorf("organize: copy %s -> %s: %w", src, dst, err)
+	buf := make([]byte, 256*1024) // 256KB chunks; same size as the HTTP read loop
+	for {
+		if err := ctx.Err(); err != nil {
+			dstFile.Close()
+			os.Remove(tmpDst)
+			return fmt.Errorf("organize: copy %s -> %s cancelled: %w", src, dst, err)
+		}
+		n, readErr := srcFile.Read(buf)
+		if n > 0 {
+			if _, writeErr := dstFile.Write(buf[:n]); writeErr != nil {
+				dstFile.Close()
+				os.Remove(tmpDst)
+				return fmt.Errorf("organize: copy %s -> %s: %w", src, dst, writeErr)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			dstFile.Close()
+			os.Remove(tmpDst)
+			return fmt.Errorf("organize: copy %s -> %s: %w", src, dst, readErr)
+		}
 	}
 	if err := dstFile.Sync(); err != nil {
 		dstFile.Close()
