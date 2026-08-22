@@ -81,7 +81,7 @@ UDL runs as a LaunchAgent for always-on background operation. The binary needs c
 2. Build and sign:
    ```bash
    go build -o ~/bin/udl ./cmd/udl
-   codesign --force --sign "UDL" ~/bin/udl
+   codesign --force --sign "UDL" -i udl ~/bin/udl
    ```
 3. Install the LaunchAgent plist at `~/Library/LaunchAgents/com.udl.daemon.plist`:
    ```xml
@@ -126,13 +126,43 @@ UDL runs as a LaunchAgent for always-on background operation. The binary needs c
 ### Updating
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist
+launchctl kickstart -k gui/$(id -u)/com.udl.daemon
 go build -o ~/bin/udl ./cmd/udl
-codesign --force --sign "UDL" ~/bin/udl
-launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist
+codesign --force --sign "UDL" -i udl ~/bin/udl
+launchctl kickstart -k gui/$(id -u)/com.udl.daemon
 ```
 
 The `codesign` step prompts for Keychain access to the signing key.
+### Why the signing identity matters (TCC)
+
+macOS gates removable-volume access (`/Volumes/…`) behind TCC. TCC does **not**
+remember "this app path is allowed" — it records the binary's *designated
+requirement* at grant time and rejects any binary whose requirement no longer
+matches. Two signing modes:
+
+- **Ad-hoc** (`codesign -s -`): requirement is pinned to the binary's CDHash,
+  which changes on **every rebuild** → the TCC grant silently dies after each
+  build → downloads hang forever in `mkdir` (the daemon waits on a TCC prompt
+  nobody sees). This is the trap.
+- **Self-signed certificate** (this README's setup): requirement is pinned to
+  `certificate leaf = H"…"` — the cert's hash, stable across rebuilds. Sign
+  with the **same cert** every time and the grant survives forever.
+
+The `-i udl` flag pins the identifier so the requirement reads
+`identifier udl and certificate leaf = H"…"` instead of a build-specific
+CDHash. Never drop it, and never sign with `codesign -s -`.
+
+After changing the signing identity (or re-signing a previously ad-hoc binary),
+macOS may re-prompt once: either a system dialog ("udl wants to access files on
+a removable volume" — click Allow) or a System Settings → Privacy & Security →
+Removable Volumes → udl → off/on toggle. Do it once; with the cert it never
+happens again.
+
+**Run `codesign` from a GUI terminal, not SSH.** The login keychain (where the
+private key lives) is locked outside the Aqua session — from SSH you'll get
+`errSecInternalComponent` and `security unlock-keychain` will fail with
+"User interaction is not allowed". The binary is signed in-place, so after the
+sign step you can return to SSH and `launchctl kickstart`.
 
 ## Agent-Optimized CLI
 
