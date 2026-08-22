@@ -694,6 +694,13 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 			tmpFile.Close()
 			return d.fail(item, fmt.Sprintf("read: %v", readErr), downloadDir)
 		}
+		// Some plex friend servers send the full body but keep the connection
+		// open instead of closing it, so Read() never returns EOF and the
+		// download would block until the 30-minute client timeout fails it.
+		// When Content-Length is known, having all bytes is completion.
+		if totalSize > 0 && downloaded >= totalSize {
+			break
+		}
 	}
 	tmpFile.Close()
 

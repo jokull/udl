@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
@@ -408,6 +409,71 @@ func TestPipeline_MoviePlex(t *testing.T) {
 	// Download dir cleaned up.
 	if fileExists(filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("plex-movie-%d", movieID))) {
 		t.Error("plex download dir not cleaned up")
+	}
+}
+
+// TestPipeline_PlexServerKeepsConnectionOpen reproduces the plex-friend stall:
+// the server sends the full body (Content-Length bytes) but never closes the
+// connection, so Read() would block forever waiting for EOF. The downloader
+// must treat having all expected bytes as completion. The client timeout is 30
+// minutes, so this test would hang for 30 minutes (then fail) without the fix;
+// we fail fast instead via a watchdog.
+func TestPipeline_PlexServerKeepsConnectionOpen(t *testing.T) {
+	cfg := testConfig(t)
+	db, err := database.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	movieID, err := db.AddMovie(22222, "tt2222222", "Gravity", 2013, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Server writes the full body with Content-Length, then holds the
+	// connection open (no EOF) until the client hangs up.
+	data := make([]byte, 4096)
+	copy(data, mkvMagic)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/x-matroska")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.Write(data)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done() // keep connection open: never return, never EOF
+	}))
+	defer srv.Close()
+
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", int64(len(data)), "plex")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+
+	done := make(chan struct{})
+	go func() {
+		d.processItem(context.Background(), item)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("processItem did not return: plex download blocked waiting for EOF after full body received")
+	}
+
+	movie, err := db.GetMovie(movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if movie.Status != "downloaded" {
+		t.Errorf("movie.status = %q, want %q", movie.Status, "downloaded")
+	}
+
+	// File content survived HTTP stream -> disk -> import.
+	magic, err := readMagic(movie.FilePath.String)
+	if err != nil {
+		t.Fatalf("read destination: %v", err)
+	}
+	if len(magic) < 4 || magic[0] != 0x1a {
+		t.Errorf("destination has wrong magic: %x", magic)
 	}
 }
 
