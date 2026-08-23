@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"sort"
@@ -20,6 +23,9 @@ import (
 	"github.com/jokull/udl/internal/daemon"
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/migrate"
+	"github.com/jokull/udl/internal/plex"
+	"github.com/jokull/udl/internal/shadow"
+	"github.com/jokull/udl/internal/shadowfs"
 	"github.com/jokull/udl/internal/tmdb"
 )
 
@@ -220,6 +226,95 @@ var plexCleanupCmd = &cobra.Command{
 	Long:  "Queries Plex watch history on your owned server. Items never watched and added more than --days ago are candidates for deletion. Dry-run by default; use --execute to actually delete files.",
 	RunE:  runPlexCleanup,
 }
+var plexLibrariesCmd = &cobra.Command{
+	Use:   "libraries",
+	Short: "Map all Plex libraries: type, download access, audio languages",
+	Long: `Lists every library section on your own and friends' Plex servers with
+its media type and whether this account can download from it (offline sync).
+
+By default this makes one request to plex.tv plus one per reachable server.
+Additive flags are each rate-limited to --rate requests/second:
+  --counts  fetch per-section item counts (1 request per section)
+  --audio   scan items for audio track languages (1 request per item scanned,
+            capped by --items, so use it sparingly)`,
+	RunE: runPlexLibraries,
+}
+
+var shadowCmd = &cobra.Command{
+	Use:   "shadow",
+	Short: "Virtual shadow libraries from friends' Plex servers",
+}
+
+var shadowCreateCmd = &cobra.Command{
+	Use:   "create [name]",
+	Short: "Create a new shadow library",
+	Long:  "Creates a shadow definition. Use --type movie|show and --mount <path>. Add friend libraries with 'udl shadow add'.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runShadowCreate,
+}
+
+var shadowAddCmd = &cobra.Command{
+	Use:   "add [shadow] [server] [section]",
+	Short: "Add a friend's library section to a shadow",
+	Long:  "Adds one friend library section as a source. List what's addable with 'udl shadow sources <name>'.",
+	Args:  cobra.ExactArgs(3),
+	RunE:  runShadowAdd,
+}
+
+var shadowListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List shadow libraries",
+	RunE:  runShadowList,
+}
+
+var shadowSourcesCmd = &cobra.Command{
+	Use:   "sources [shadow]",
+	Short: "Show friend servers and their sections available to add",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runShadowSources,
+}
+
+var shadowManifestCmd = &cobra.Command{
+	Use:   "manifest [shadow]",
+	Short: "Build the judged, flattened manifest for a shadow",
+	Long:  "Scans every added source, dedupes candidates across sources, ranks by resolution preference, and writes the manifest to ~/.config/udl/shadow/<name>.json. Use --json to print it.",
+	Args:  cobra.ExactArgs(1),
+	RunE:  runShadowManifest,
+}
+
+var shadowMountCmd = &cobra.Command{
+	Use:          "mount [shadow]",
+	Short:        "Mount a shadow as a local NFS filesystem",
+	Long:         "Serves the union of your local files (moved to <mount>.upper) and the shadow manifest over NFSv3, then mounts it at the shadow's mount path so Plex sees both layers. Directory names merge; your files win name collisions. The mount itself needs sudo; Ctrl-C unmounts.",
+	Args:         cobra.ExactArgs(1),
+	RunE:         runShadowMount,
+	SilenceUsage: true,
+}
+
+var shadowUnmountCmd = &cobra.Command{
+	Use:          "unmount [shadow]",
+	Short:        "Unmount a mounted shadow",
+	Args:         cobra.ExactArgs(1),
+	RunE:         runShadowUnmount,
+	SilenceUsage: true,
+}
+
+var shadowEnableCmd = &cobra.Command{
+	Use:          "enable [shadow]",
+	Short:        "Serve and mount a shadow at boot via a LaunchDaemon",
+	Long:         "Installs a root LaunchDaemon that serves the shadow and mounts it at the shadow's mount path when the machine boots, restarting it if it crashes. The mount survives reboots. Uses sudo for the install; remove with 'udl shadow disable <name>'.",
+	Args:         cobra.ExactArgs(1),
+	RunE:         runShadowEnable,
+	SilenceUsage: true,
+}
+
+var shadowDisableCmd = &cobra.Command{
+	Use:          "disable [shadow]",
+	Short:        "Remove a shadow's LaunchDaemon and unmount it",
+	Args:         cobra.ExactArgs(1),
+	RunE:         runShadowDisable,
+	SilenceUsage: true,
+}
 
 var blocklistCmd = &cobra.Command{
 	Use:   "blocklist",
@@ -396,6 +491,14 @@ var movieInfoCmd = &cobra.Command{
 	RunE:  runMovieInfo,
 }
 
+var movieReconcileCmd = &cobra.Command{
+	Use:          "reconcile",
+	Short:        "Reconcile tracked movies against the shadow movies library",
+	Long:         "Matches tracked movies against the 'movies' shadow manifest (by tmdb/imdb GUID). Downloaded movies the shadow covers become 'shadow' (available via the mount, never re-downloaded); downloaded movies it does not cover revert to 'wanted' so UDL re-acquires them. Dry-run by default; use --execute.",
+	RunE:         runMovieReconcile,
+	SilenceUsage: true,
+}
+
 var tvInfoCmd = &cobra.Command{
 	Use:   "info [tmdb-id-or-title]",
 	Short: "Show full details for a series",
@@ -453,6 +556,8 @@ func init() {
 	searchTriggerCmd.Flags().Int("tmdb", 0, "TMDB ID of the movie or series to search")
 	searchTriggerCmd.Flags().IntP("season", "s", 0, "Episode season (used with --tmdb)")
 	searchTriggerCmd.Flags().IntP("episode", "e", 0, "Episode number (used with --tmdb)")
+	movieReconcileCmd.Flags().Bool("execute", false, "Actually apply status changes (default is dry-run)")
+	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd, movieDeleteCmd, movieInfoCmd, movieReconcileCmd)
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd, queueEvictCmd)
 	plexCheckCmd.Flags().IntP("season", "s", 0, "Filter TV results to a specific season")
 	plexCheckCmd.Flags().IntP("episode", "e", 0, "Filter TV results to a specific episode")
@@ -460,6 +565,26 @@ func init() {
 	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
 	plexCleanupCmd.Flags().Bool("verbose", false, "Also show items that would be kept")
 	plexCmd.AddCommand(plexServersCmd, plexCheckCmd, plexCleanupCmd)
+	plexLibrariesCmd.Flags().Bool("counts", false, "Fetch per-section item counts (1 request per section)")
+	plexLibrariesCmd.Flags().Bool("probe", false, "Verify real file fetch per section (ranged GET on first item)")
+	plexLibrariesCmd.Flags().Bool("audio", false, "Scan audio track languages per section (rate-limited, 1 request per item)")
+	plexLibrariesCmd.Flags().Bool("shows", false, "Include TV sections in the audio scan (walks episodes)")
+	plexLibrariesCmd.Flags().Int("items", 25, "Max items/episodes scanned per section for --audio")
+	plexLibrariesCmd.Flags().Int("per-show", 3, "Max episodes examined per show for --audio")
+	plexLibrariesCmd.Flags().Float64("rate", 3, "Max requests per second to Plex servers (0 = unlimited)")
+	plexLibrariesCmd.Flags().String("server", "", "Only show this server (name substring)")
+	plexLibrariesCmd.Flags().Bool("json", false, "Output JSON")
+	plexCmd.AddCommand(plexLibrariesCmd)
+	shadowCreateCmd.Flags().String("type", "", "media type: movie or show")
+	shadowCreateCmd.Flags().String("mount", "", "local path the Plex library points at")
+	shadowCreateCmd.Flags().StringSlice("prefer", nil, "resolution preference, highest first (e.g. 4k,1080,720)")
+	shadowManifestCmd.Flags().Bool("json", false, "Print the full manifest as JSON")
+	shadowMountCmd.Flags().String("port", "", "NFS port (default: auto-assigned)")
+	shadowMountCmd.Flags().Int("cache-size", 50, "block cache size in GiB")
+	shadowMountCmd.Flags().Bool("no-tuning", false, "skip disabling Plex preview thumbnails")
+	shadowMountCmd.Flags().Bool("daemon", false, "run as a root daemon: serve only, no mount (for launchd + automount)")
+	shadowEnableCmd.Flags().String("port", "", "fixed NFS port for the serve daemon (default: first free from 2055)")
+	shadowCmd.AddCommand(shadowCreateCmd, shadowAddCmd, shadowListCmd, shadowSourcesCmd, shadowManifestCmd, shadowMountCmd, shadowUnmountCmd, shadowEnableCmd, shadowDisableCmd)
 	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
 	configCmd.AddCommand(configCheckCmd, configPathCmd, configShowCmd)
 
@@ -491,7 +616,7 @@ func init() {
 	nzbGrabCmd.Flags().StringP("output", "o", ".", "Output directory for downloaded files")
 	nzbCmd.AddCommand(nzbSearchCmd, nzbGrabCmd)
 
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd, initCmd, nzbCmd)
+	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, shadowCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd, initCmd, nzbCmd)
 }
 
 var versionCmd = &cobra.Command{
@@ -1662,6 +1787,1127 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+type plexSectionJSON struct {
+	Title     string         `json:"title"`
+	Key       string         `json:"key"`
+	Type      string         `json:"type"`
+	Download  bool           `json:"download"`
+	Fetch     bool           `json:"fetch,omitempty"`
+	Items     *int           `json:"items,omitempty"`
+	Scanned   int            `json:"scanned,omitempty"`
+	Languages map[string]int `json:"languages,omitempty"`
+}
+
+type plexLibrariesJSON struct {
+	Server    string            `json:"server"`
+	Owned     bool              `json:"owned"`
+	Reachable bool              `json:"reachable"`
+	Error     string            `json:"error,omitempty"`
+	Sections  []plexSectionJSON `json:"sections,omitempty"`
+}
+
+func runPlexLibraries(cmd *cobra.Command, args []string) error {
+	token := plexToken()
+	if token == "" {
+		return fmt.Errorf("no Plex token configured (set plex.token or PLEX_TOKEN)")
+	}
+	audio, _ := cmd.Flags().GetBool("audio")
+	shows, _ := cmd.Flags().GetBool("shows")
+	counts, _ := cmd.Flags().GetBool("counts")
+	probe, _ := cmd.Flags().GetBool("probe")
+	items, _ := cmd.Flags().GetInt("items")
+	perShow, _ := cmd.Flags().GetInt("per-show")
+	rate, _ := cmd.Flags().GetFloat64("rate")
+	serverFilter, _ := cmd.Flags().GetString("server")
+	jsonOut, _ := cmd.Flags().GetBool("json")
+
+	client := plex.New(token)
+	client.SetRateLimit(rate)
+	ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Minute)
+	defer cancel()
+
+	var servers []plex.Server
+	owned, err := client.DiscoverOwnedServer()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: owned server: %v\n", err)
+	} else {
+		servers = append(servers, *owned)
+	}
+	friends, err := client.DiscoverServers()
+	if err != nil {
+		return fmt.Errorf("discover friends' servers: %w", err)
+	}
+	servers = append(servers, friends...)
+
+	var entries []*plexLibrariesJSON
+	for _, srv := range servers {
+		if serverFilter != "" && !strings.Contains(strings.ToLower(srv.Name), strings.ToLower(serverFilter)) {
+			continue
+		}
+		entry := &plexLibrariesJSON{Server: srv.Name, Owned: srv.Owned, Reachable: true, Sections: []plexSectionJSON{}}
+		entries = append(entries, entry)
+
+		secs, err := client.LibrarySectionsAll(srv)
+		if err != nil {
+			entry.Reachable = false
+			entry.Error = err.Error()
+			continue
+		}
+		for _, sec := range secs {
+			row := plexSectionJSON{Title: sec.Title, Key: sec.Key, Type: sec.Type, Download: sec.Download}
+			if counts {
+				if n, err := client.SectionTotalSize(srv, sec.Key); err == nil {
+					row.Items = &n
+				}
+			}
+			if probe {
+				ok, err := client.ProbeDownload(ctx, srv, sec.Key)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warning: probe %s/%s: %v\n", srv.Name, sec.Title, err)
+				}
+				row.Fetch = ok
+			}
+			if audio && (sec.Type == "movie" || (sec.Type == "show" && shows)) {
+				st, err := client.SectionLanguageStats(ctx, srv, sec, plex.ScanOptions{
+					MaxItems:     items,
+					MaxPerShow:   perShow,
+					IncludeShows: shows,
+				})
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warning: audio scan %s/%s: %v\n", srv.Name, sec.Title, err)
+				} else {
+					row.Languages = st.ByLanguage
+					row.Scanned = st.Scanned
+				}
+			}
+			entry.Sections = append(entry.Sections, row)
+		}
+	}
+
+	if jsonOut {
+		data, err := json.MarshalIndent(entries, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(data))
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	header := "SERVER\tOWNED\tSECTION\tTYPE\tDOWNLOAD\tITEMS\tLANG"
+	if probe {
+		header = "SERVER\tOWNED\tSECTION\tTYPE\tDOWNLOAD\tFETCH\tITEMS\tLANG"
+	}
+	fmt.Fprintln(w, header)
+	for _, e := range entries {
+		if !e.Reachable {
+			if probe {
+				fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\t-\tunreachable: %s\n", e.Server, e.Error)
+			} else {
+				fmt.Fprintf(w, "%s\t-\t-\t-\t-\t-\tunreachable: %s\n", e.Server, e.Error)
+			}
+			continue
+		}
+		for _, s := range e.Sections {
+			ownedCol := "no"
+			if e.Owned {
+				ownedCol = "yes"
+			}
+			dlCol := "no"
+			if s.Download {
+				dlCol = "yes"
+			}
+			itemsCol := "-"
+			if s.Items != nil {
+				itemsCol = strconv.Itoa(*s.Items)
+			} else if s.Scanned > 0 {
+				itemsCol = fmt.Sprintf("scan:%d", s.Scanned)
+			}
+			langCol := "-"
+			if len(s.Languages) > 0 {
+				keys := make([]string, 0, len(s.Languages))
+				for k := range s.Languages {
+					keys = append(keys, k)
+				}
+				sort.Strings(keys)
+				parts := make([]string, 0, len(keys))
+				for _, k := range keys {
+					parts = append(parts, fmt.Sprintf("%s:%d", k, s.Languages[k]))
+				}
+				langCol = strings.Join(parts, " ")
+			}
+			if probe {
+				fetchCol := "no"
+				if s.Fetch {
+					fetchCol = "yes"
+				}
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					e.Server, ownedCol, s.Title, s.Type, dlCol, fetchCol, itemsCol, langCol)
+			} else {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+					e.Server, ownedCol, s.Title, s.Type, dlCol, itemsCol, langCol)
+			}
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func runShadowCreate(cmd *cobra.Command, args []string) error {
+	name := args[0]
+	mediaType, _ := cmd.Flags().GetString("type")
+	mount, _ := cmd.Flags().GetString("mount")
+	if mediaType != "movie" && mediaType != "show" {
+		return fmt.Errorf("--type must be 'movie' or 'show'")
+	}
+	if mount == "" {
+		return fmt.Errorf("--mount is required (the local path your Plex library points at)")
+	}
+	prefer, _ := cmd.Flags().GetStringSlice("prefer")
+
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	if shadow.Get(defs, name) != nil {
+		return fmt.Errorf("shadow %q already exists", name)
+	}
+	defs = append(defs, shadow.Def{Name: name, Type: mediaType, Mount: mount, Prefer: prefer})
+	if err := shadow.Save(defs); err != nil {
+		return err
+	}
+	fmt.Printf("created shadow %q (%s) at %s — add libraries with 'udl shadow add %s <server> <section>'\n",
+		name, mediaType, mount, name)
+	return nil
+}
+
+func runShadowAdd(cmd *cobra.Command, args []string) error {
+	name, server, section := args[0], args[1], args[2]
+
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	def := shadow.Get(defs, name)
+	if def == nil {
+		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", name)
+	}
+	for _, s := range def.Sources {
+		if s.Server == server && strings.EqualFold(s.Section, section) {
+			return fmt.Errorf("%s:%s already added to %q", server, section, name)
+		}
+	}
+	def.Sources = append(def.Sources, shadow.Source{Server: server, Section: section})
+	if err := shadow.Save(defs); err != nil {
+		return err
+	}
+	fmt.Printf("added %s:%s to shadow %q (%d sources)\n", server, section, name, len(def.Sources))
+	return nil
+}
+
+func runShadowList(cmd *cobra.Command, args []string) error {
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	if len(defs) == 0 {
+		fmt.Println("no shadow libraries configured (use 'udl shadow create')")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tTYPE\tMOUNT\tSOURCES")
+	for _, d := range defs {
+		srcs := make([]string, 0, len(d.Sources))
+		for _, s := range d.Sources {
+			srcs = append(srcs, s.Server+":"+s.Section)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", d.Name, d.Type, d.Mount, strings.Join(srcs, ", "))
+	}
+	return w.Flush()
+}
+
+func runShadowSources(cmd *cobra.Command, args []string) error {
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	def := shadow.Get(defs, args[0])
+	if def == nil {
+		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	token := cfg.Plex.Token
+	if token == "" {
+		token = os.Getenv("PLEX_TOKEN")
+	}
+	if token == "" {
+		return fmt.Errorf("plex token not configured (set plex.token in config or PLEX_TOKEN env var)")
+	}
+
+	avail, err := shadow.AvailableSections(context.Background(), plex.New(token), def)
+	if err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERVER\tREACHABLE\tSECTIONS (this shadow type: "+def.Type+")")
+	for _, a := range avail {
+		status := "yes"
+		if !a.Reachable {
+			status = "no (" + a.Error + ")"
+		}
+		var parts []string
+		for _, sec := range a.Sections {
+			mark := ""
+			for _, added := range a.Added {
+				if strings.EqualFold(sec, added) {
+					mark = " [added]"
+					break
+				}
+			}
+			parts = append(parts, sec+mark)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\n", a.Server, status, strings.Join(parts, ", "))
+	}
+	return w.Flush()
+}
+
+func runShadowManifest(cmd *cobra.Command, args []string) error {
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	def := shadow.Get(defs, args[0])
+	if def == nil {
+		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
+	}
+	if len(def.Sources) == 0 {
+		return fmt.Errorf("shadow %q has no sources — add some with 'udl shadow add %s <server> <section>'", def.Name, def.Name)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	token := cfg.Plex.Token
+	if token == "" {
+		token = os.Getenv("PLEX_TOKEN")
+	}
+	if token == "" {
+		return fmt.Errorf("plex token not configured (set plex.token in config or PLEX_TOKEN env var)")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	m, err := shadow.Build(ctx, plex.New(token), def)
+	if err != nil {
+		return err
+	}
+
+	path, err := shadow.ManifestPath(def.Name)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return err
+	}
+
+	if jsonOut, _ := cmd.Flags().GetBool("json"); jsonOut {
+		fmt.Println(string(data))
+		return nil
+	}
+
+	fmt.Printf("shadow %s (%s) mount=%s\n", m.Name, m.Type, m.Mount)
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERVER\tSECTION\tSTATUS\tITEMS")
+	for _, s := range m.Sources {
+		status := "ok"
+		if !s.OK {
+			status = "ERR: " + s.Error
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\n", s.Server, s.Section, status, s.Items)
+	}
+	w.Flush()
+	fmt.Printf("candidates %d, kept %d, dupes dropped %d, failed %d, total %s\n",
+		m.Stats.Candidates, m.Stats.Kept, m.Stats.Dupes, m.Stats.Failed, formatSize(m.Stats.TotalSize))
+	fmt.Printf("manifest: %s\n", path)
+	return nil
+}
+
+func runShadowMount(cmd *cobra.Command, args []string) error {
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	def := shadow.Get(defs, args[0])
+	if def == nil {
+		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
+	}
+	m, err := shadow.LoadManifest(def.Name)
+	if err != nil {
+		return fmt.Errorf("manifest for %q not built — run 'udl shadow manifest %s' first: %w", def.Name, def.Name, err)
+	}
+	if len(m.Items) == 0 {
+		return fmt.Errorf("manifest for %q is empty — rebuild it with 'udl shadow manifest %s'", def.Name, def.Name)
+	}
+
+	var totalSize int64
+	for _, it := range m.Items {
+		totalSize += it.Size
+	}
+	fmt.Printf("shadow %s (%s): %d items, %s\n", def.Name, m.Type, len(m.Items), formatSize(totalSize))
+
+	daemon, _ := cmd.Flags().GetBool("daemon")
+	// Resolve the real mountpoint (following symlinks like media/dubbed-tv).
+	// A mount whose server died (Ctrl-C'd foreground process, crash) becomes
+	// an orphan: every stat/readdir hangs on RPC timeouts. Only the mount
+	// table is consulted — never the path itself, which would hang.
+	real, mounted, err := resolveMount(def.Mount)
+	if err != nil {
+		return fmt.Errorf("check mount table: %w", err)
+	}
+	// The daemon never mounts (automount owns the mountpoint), so it serves
+	// even when something is already mounted there.
+	if mounted && !daemon {
+		return fmt.Errorf("%s is already mounted — unmount it first ('udl shadow unmount %s' or 'sudo umount -f %s')", real, def.Name, real)
+	}
+
+	upper := real + ".upper"
+	if def.Upper != "" {
+		upper = def.Upper
+	}
+
+	// One-time move of existing local files into the upper layer so the mount
+	// point can be taken over without losing the user's own files. The upper
+	// dir is created only after the move decision so a fresh run never skips
+	// it. In daemon mode none of this runs: the mountpoint is an autofs
+	// trigger, and even stat'ing it makes automountd try to mount against a
+	// server that is not up yet — a self-inflicted hang.
+	moved := false
+	if !daemon {
+		if st, err := os.Stat(real); err == nil && st.IsDir() && !dirEmpty(real) {
+			if _, uerr := os.Stat(upper); os.IsNotExist(uerr) || (uerr == nil && dirEmpty(upper)) {
+				if uerr == nil {
+					if err := os.Remove(upper); err != nil {
+						return fmt.Errorf("remove stale %s: %w", upper, err)
+					}
+				}
+				fmt.Printf("  moving local files: %s -> %s\n", real, upper)
+				if err := os.Rename(real, upper); err != nil {
+					return fmt.Errorf("move %s to %s: %w", real, upper, err)
+				}
+				moved = true
+			} else {
+				fmt.Printf("  note: %s still has files and %s exists — those files are hidden by the mount\n", real, upper)
+			}
+		}
+		if err := os.MkdirAll(real, 0o755); err != nil {
+			return err
+		}
+	}
+	// The upper layer is a real directory in both modes: ensure it exists so
+	// the union has a home for locally downloaded files. The mountpoint
+	// itself is never touched in daemon mode (autofs/mount owns it).
+	if err := os.MkdirAll(upper, 0o755); err != nil {
+		return err
+	}
+	fmt.Printf("  upper layer: %s\n", upper)
+
+	cacheDir, err := shadow.CacheDir(def.Name)
+	if err != nil {
+		return err
+	}
+	cacheGB, _ := cmd.Flags().GetInt("cache-size")
+	cache := shadowfs.NewBlockCache(cacheDir, int64(cacheGB)<<30)
+	fs := shadowfs.NewUnion(upper, m.Items, cache)
+	fmt.Printf("  block cache: %s (%d GiB)\n", cacheDir, cacheGB)
+
+	// Port resolution: --port flag wins, then the def's fixed port (set by
+	// 'udl shadow enable' for automount), then auto-assigned.
+	portFlag, _ := cmd.Flags().GetString("port")
+	port := portFlag
+	if port == "" && def.Port > 0 {
+		port = strconv.Itoa(def.Port)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		return fmt.Errorf("shadowfs: listen: %w", err)
+	}
+	tcpAddr := ln.Addr().(*net.TCPAddr)
+	fmt.Printf("  NFS server: 127.0.0.1:%d\n", tcpAddr.Port)
+
+	// The server must accept connections BEFORE mount_nfs runs — mount_nfs
+	// blocks on its MNT RPC until the server answers, so starting it after
+	// the mount would deadlock.
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- shadowfs.Serve(ln, fs)
+	}()
+
+	if noTuning, _ := cmd.Flags().GetBool("no-tuning"); !noTuning {
+		tuneShadowPlex(cmd.Context(), def)
+	}
+
+	ctx, cancel := context.WithTimeout(cmd.Context(), 120*time.Second)
+	defer cancel()
+	if daemon {
+		// The agent runs in the user's session, which macOS System Policy
+		// approves for mounts — unlike launchd system daemons. Mount via
+		// passwordless sudo (one-time /etc/sudoers.d rule) so the mount
+		// comes up at login and survives restarts.
+		//
+		// macOS 26's System Policy intermittently STALLS mount_nfs for
+		// launchd-spawned processes (deny(4) — a hang, not an error), so
+		// each attempt is bounded and retried; a mount made by any approved
+		// process survives agent restarts, and the fallback is mounting from
+		// a terminal once.
+		already, _ := isMounted(real)
+		if already {
+			fmt.Printf("  already mounted at %s\n", real)
+		} else {
+			opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,nolocks,resvport", tcpAddr.Port, tcpAddr.Port)
+			var out []byte
+			var err error
+			for range 3 {
+				mctx, mcancel := context.WithTimeout(cmd.Context(), 20*time.Second)
+				mnt := exec.CommandContext(mctx, "sudo", "-n", "mount", "-o", opts, "-t", "nfs", "127.0.0.1:/", real)
+				out, err = mnt.CombinedOutput()
+				mcancel()
+				if err == nil {
+					break
+				}
+				if mctx.Err() != nil {
+					fmt.Printf("  mount attempt stalled (%s) — retrying\n", strings.TrimSpace(string(out)))
+				}
+			}
+			if err != nil {
+				fmt.Printf("  mount skipped: %s\n", strings.TrimSpace(string(out)))
+				fmt.Println("  mount it once from a terminal to recover:")
+				fmt.Printf("    sudo mount -o %s -t nfs 127.0.0.1:/ %s\n", opts, real)
+			} else {
+				fmt.Printf("  mounted at %s via sudo\n", real)
+			}
+		}
+	} else {
+		opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,nolocks,resvport", tcpAddr.Port, tcpAddr.Port)
+		fmt.Printf("  mounting: sudo mount -o %s -t nfs 127.0.0.1:/ %s\n", opts, real)
+		fmt.Println("  (enter your password when prompted)")
+		mnt := exec.CommandContext(ctx, "sudo", "mount", "-o", opts, "-t", "nfs", "127.0.0.1:/", real)
+		mnt.Stdin, mnt.Stdout, mnt.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := mnt.Run(); err != nil {
+			ln.Close()
+			if moved {
+				// macOS filesystem events (Spotlight) may briefly hold the
+				// moved dirs, so retry; fall back to per-entry moves.
+				fmt.Printf("restoring local files: %s -> %s\n", upper, real)
+				var rerr error
+				for range 10 {
+					if rerr = os.Rename(upper, real); rerr == nil {
+						break
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+				if rerr != nil {
+					des, derr := os.ReadDir(upper)
+					if derr == nil {
+						restored := 0
+						for _, e := range des {
+							if err := os.Rename(filepath.Join(upper, e.Name()), filepath.Join(real, e.Name())); err == nil {
+								restored++
+							}
+						}
+						if restored == len(des) {
+							_ = os.Remove(upper)
+							rerr = nil
+						} else {
+							rerr = fmt.Errorf("moved %d/%d entries back", restored, len(des))
+						}
+					}
+				}
+				if rerr != nil {
+					fmt.Printf("  warning: could not restore automatically (%v) — files remain at %s\n", rerr, upper)
+				} else {
+					fmt.Println("  local files restored")
+				}
+			}
+			if ctx.Err() != nil {
+				return fmt.Errorf("mount at %s timed out after 120s (sudo mount did not complete) — try again", real)
+			}
+			return fmt.Errorf("mount at %s failed (sudo): %w", real, err)
+		}
+		// Confirm the mount actually happened and the union is visible.
+		des, rerr := os.ReadDir(real)
+		if rerr != nil || len(des) == 0 {
+			fmt.Printf("  warning: mount reported success but %s shows %v entries — check 'mount'\n", real, len(des))
+		} else {
+			fmt.Printf("  mounted: %d entries visible at %s\n", len(des), real)
+		}
+	}
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sig
+		fmt.Printf("\nunmounting %s...\n", real)
+		if daemon {
+			um := exec.Command("sudo", "-n", "umount", real)
+			um.Stdin, um.Stdout, um.Stderr = os.Stdin, os.Stdout, os.Stderr
+			_ = um.Run()
+		} else {
+			um := exec.Command("sudo", "umount", real)
+			um.Stdin, um.Stdout, um.Stderr = os.Stdin, os.Stdout, os.Stderr
+			_ = um.Run()
+		}
+		os.Exit(0)
+	}()
+
+	// Heartbeat so a long-serving mount never looks hung.
+	go func() {
+		for {
+			time.Sleep(15 * time.Second)
+			hits, misses, bytes := cache.Stats()
+			fmt.Printf("  serving: %s streamed, %d cache hits, %d fetches\n", formatSize(bytes), hits, misses)
+		}
+	}()
+
+	fmt.Println("serving — Ctrl-C to unmount")
+	return <-serveErr
+}
+
+func runShadowUnmount(cmd *cobra.Command, args []string) error {
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	def := shadow.Get(defs, args[0])
+	if def == nil {
+		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
+	}
+	real, _, err := resolveMount(def.Mount)
+	if err != nil {
+		return fmt.Errorf("check mount table: %w", err)
+	}
+	um := exec.Command("sudo", "umount", real)
+	um.Stdin, um.Stdout, um.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := um.Run(); err != nil {
+		return fmt.Errorf("unmount %s failed: %w", real, err)
+	}
+	fmt.Printf("unmounted %s\n", real)
+	return nil
+}
+
+// shadowLabel returns the LaunchDaemon label for a shadow.
+func shadowLabel(name string) string {
+	return "com.jokull.udl-shadow-" + name
+}
+
+// shadowPlist renders the per-user LaunchAgent plist for a shadow. The agent
+// runs in the user's session (approved by macOS System Policy for /Volumes
+// access — system-domain daemons are denied file-read-data there) with the
+// user's own HOME, so config/cache resolve naturally. KeepAlive restarts it
+// unless it exits cleanly, so crashes self-heal.
+func shadowPlist(label, exe, name, home string) string {
+	logPath := filepath.Join(home, "Library", "Logs", label+".log")
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>%s</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+		<string>shadow</string>
+		<string>mount</string>
+		<string>%s</string>
+		<string>--daemon</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>%s</string>
+	<key>StandardErrorPath</key>
+	<string>%s</string>
+</dict>
+</plist>
+`, label, exe, name, logPath, logPath)
+}
+
+func runShadowEnable(cmd *cobra.Command, args []string) error {
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	def := shadow.Get(defs, args[0])
+	if def == nil {
+		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
+	}
+	if _, err := shadow.LoadManifest(def.Name); err != nil {
+		return fmt.Errorf("manifest for %q not built — run 'udl shadow manifest %s' first: %w", def.Name, def.Name, err)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	label := shadowLabel(def.Name)
+
+	sudoRun := func(args ...string) error {
+		ex := exec.Command("sudo", args...)
+		ex.Stdin, ex.Stdout, ex.Stderr = os.Stdin, os.Stdout, os.Stderr
+		return ex.Run()
+	}
+	// Clear any previous install first: an old system LaunchDaemon can linger
+	// as a zombie holding the NFS port, and its socket is not visible or
+	// killable from the user session until launchd reaps it.
+	_ = sudoRun("launchctl", "bootout", "system/"+label)
+	_ = sudoRun("rm", "-f", "/Library/LaunchDaemons/"+label+".plist")
+	_ = runQuiet("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), label))
+
+	// Fixed NFS port for the serve daemon: --port wins, then the def's, then
+	// the first free port from 2055. Persisted so automount and the daemon
+	// agree. The def's saved port is only reused if it is actually free now.
+	portFlag, _ := cmd.Flags().GetString("port")
+	port := 0
+	if portFlag != "" {
+		port, err = strconv.Atoi(portFlag)
+		if err != nil {
+			return fmt.Errorf("invalid --port %q: %w", portFlag, err)
+		}
+	} else if def.Port > 0 && portFree(def.Port) {
+		port = def.Port
+	}
+	if port == 0 {
+		port = pickFreePort(2055)
+		if port == 0 {
+			return fmt.Errorf("no free NFS port found in 2055-2154")
+		}
+	}
+	if def.Port != port {
+		def.Port = port
+		if err := shadow.Save(defs); err != nil {
+			return err
+		}
+		fmt.Printf("  fixed NFS port: %d (saved to shadow.toml)\n", port)
+	}
+
+	// The server is a per-user LaunchAgent: macOS System Policy denies
+	// system-domain daemons file-read-data and file-mount on /Volumes/Plex,
+	// but user-session processes are approved. The agent mounts itself via
+	// passwordless sudo at login. (automountd is NOT used: its NFS client
+	// cannot complete the mount handshake with a loopback server on this
+	// macOS build.)
+	if err := writeAutoMaps(nil, "", 0, sudoRun); err != nil {
+		return err
+	}
+	if err := sudoRun("automount", "-vc"); err != nil {
+		return fmt.Errorf("automount reload failed: %w", err)
+	}
+	fmt.Println("  automount map removed (agent mounts via sudo instead)")
+
+	// Per-user LaunchAgent: serves the union in the user's session (approved
+	// for /Volumes access), restarts on crash, runs at login.
+	uid := os.Getuid()
+	agentDir := filepath.Join(home, "Library", "LaunchAgents")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		return err
+	}
+	plistPath := filepath.Join(agentDir, label+".plist")
+	if err := os.WriteFile(plistPath, []byte(shadowPlist(label, exe, def.Name, home)), 0o644); err != nil {
+		return err
+	}
+	// The bootout above leaves the previous instance shutting down for a
+	// moment; bootstrapping the same label immediately can race it with
+	// "Input/output error". Retry briefly.
+	var bootErr error
+	for range 5 {
+		bootErr = runQuiet("launchctl", "bootstrap", fmt.Sprintf("gui/%d", uid), plistPath)
+		if bootErr == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if bootErr != nil {
+		return fmt.Errorf("bootstrap LaunchAgent failed: %w", bootErr)
+	}
+	for range 5 {
+		if err := runQuiet("launchctl", "kickstart", fmt.Sprintf("gui/%d/%s", uid, label)); err == nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	fmt.Printf("enabled %s — serves at login on port %d, restarts on failure\n", def.Name, port)
+	fmt.Printf("log: %s\n", filepath.Join(home, "Library", "Logs", label+".log"))
+	fmt.Println("for the automatic mount at login, add a passwordless sudo rule once:")
+	fmt.Println("  echo '$(whoami) ALL=(root) NOPASSWD: /sbin/mount, /sbin/umount' | sudo tee /etc/sudoers.d/udl-shadow")
+	fmt.Printf("remove with: udl shadow disable %s\n", def.Name)
+	return nil
+}
+
+func runShadowDisable(cmd *cobra.Command, args []string) error {
+	defs, err := shadow.Load()
+	if err != nil {
+		return err
+	}
+	def := shadow.Get(defs, args[0])
+	if def == nil {
+		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	label := shadowLabel(def.Name)
+	agentPlist := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+	sysPlist := filepath.Join("/Library/LaunchDaemons", label+".plist")
+
+	sudoRun := func(args ...string) error {
+		ex := exec.Command("sudo", args...)
+		ex.Stdin, ex.Stdout, ex.Stderr = os.Stdin, os.Stdout, os.Stderr
+		return ex.Run()
+	}
+	// bootout sends SIGTERM; the server exits 0 (graceful). Clean both the
+	// per-user agent and any older system-daemon install.
+	_ = runQuiet("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), label))
+	_ = sudoRun("launchctl", "bootout", "system/"+label)
+	_ = sudoRun("rm", "-f", sysPlist)
+	// Remove the automount entry (rebuild the map from the remaining defs;
+	// the disabled shadow stays in shadow.toml but its map entry must go).
+	var remaining []shadow.Def
+	for _, d := range defs {
+		if d.Name == def.Name {
+			continue
+		}
+		remaining = append(remaining, d)
+	}
+	if err := writeAutoMaps(remaining, "", 0, sudoRun); err != nil {
+		return err
+	}
+	if err := sudoRun("automount", "-vc"); err != nil {
+		return fmt.Errorf("automount reload failed: %w", err)
+	}
+	if err := os.Remove(agentPlist); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove %s failed: %w", agentPlist, err)
+	}
+	fmt.Printf("disabled %s — serve agent and automount entry removed\n", def.Name)
+	return nil
+}
+
+// runQuiet runs a command with output to the terminal but ignores failure
+// (used for best-effort cleanup steps).
+func runQuiet(name string, args ...string) error {
+	ex := exec.Command(name, args...)
+	ex.Stdin, ex.Stdout, ex.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return ex.Run()
+}
+
+// writeAutoMaps regenerates /etc/auto_udl from the defs (plus the given
+// extra entry) and ensures /etc/auto_master references it. Called with the
+// current defs; pass the shadow's own real path and port to add it, or empty
+// to rebuild from defs only (removing it).
+func writeAutoMaps(defs []shadow.Def, real string, port int, sudoRun func(...string) error) error {
+	entries := []string{}
+	seen := map[string]bool{}
+	entry := func(r string, p int) string {
+		// 127.0.0.1, not "localhost": mount_nfs resolves localhost to ::1
+		// first, and the server binds IPv4 loopback only, so the mount never
+		// connects. mountport must match port: mount_nfs resolves the MOUNT
+		// protocol via portmap unless mountport is given, and there is no
+		// portmap on loopback.
+		return fmt.Sprintf("%s -fstype=nfs,nolocks,resvport,vers=3,port=%d,mountport=%d 127.0.0.1:/", r, p, p)
+	}
+	if real != "" {
+		entries = append(entries, entry(real, port))
+		seen[real] = true
+	}
+	for _, d := range defs {
+		if d.Port == 0 {
+			continue
+		}
+		r, _, err := resolveMount(d.Mount)
+		if err != nil {
+			continue
+		}
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		entries = append(entries, entry(r, d.Port))
+	}
+	sort.Strings(entries)
+
+	tmp, err := os.CreateTemp("", "auto_udl-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	for _, e := range entries {
+		if _, err := tmp.WriteString(e + "\n"); err != nil {
+			tmp.Close()
+			return err
+		}
+	}
+	tmp.Close()
+	if len(entries) == 0 {
+		// No shadows left: drop the map and its auto_master reference.
+		_ = sudoRun("rm", "-f", "/etc/auto_udl")
+		return removeAutoMasterLine(sudoRun)
+	}
+	if err := sudoRun("install", "-m", "644", tmpName, "/etc/auto_udl"); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("install /etc/auto_udl failed: %w", err)
+	}
+	os.Remove(tmpName)
+	return ensureAutoMasterLine(sudoRun)
+}
+
+// ensureAutoMasterLine appends the direct-map reference to /etc/auto_master
+// if it is not already there.
+func ensureAutoMasterLine(sudoRun func(...string) error) error {
+	data, err := os.ReadFile("/etc/auto_master")
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(data), "/etc/auto_udl") {
+		return nil
+	}
+	ex := exec.Command("sudo", "sh", "-c", `echo "/- /etc/auto_udl" >> /etc/auto_master`)
+	ex.Stdin, ex.Stdout, ex.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return ex.Run()
+}
+
+// removeAutoMasterLine drops the auto_udl reference from /etc/auto_master.
+func removeAutoMasterLine(sudoRun func(...string) error) error {
+	data, err := os.ReadFile("/etc/auto_master")
+	if err != nil {
+		return err
+	}
+	var kept []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, "/etc/auto_udl") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	out := strings.Join(kept, "\n")
+	if out == string(data) {
+		return nil
+	}
+	tmp, err := os.CreateTemp("", "auto_master-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(out); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+	if err := sudoRun("install", "-m", "644", tmpName, "/etc/auto_master"); err != nil {
+		os.Remove(tmpName)
+		return fmt.Errorf("install /etc/auto_master failed: %w", err)
+	}
+	os.Remove(tmpName)
+	return nil
+}
+
+// pickFreePort returns the first free TCP port starting at start.
+func pickFreePort(start int) int {
+	for p := start; p < start+100; p++ {
+		if portFree(p) {
+			return p
+		}
+	}
+	return 0
+}
+
+// portFree reports whether a TCP port can be bound on loopback.
+func portFree(p int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+	if err != nil {
+		return false
+	}
+	ln.Close()
+	return true
+}
+
+// tuneShadowPlex disables the Plex features that read whole media files on
+// the owned server, scoped to the library sections this shadow is mounted at:
+// preview thumbnails, intro/credit/ad markers, and voice-activity analysis.
+// Those would otherwise stream entire shadow files from friends' servers.
+func tuneShadowPlex(ctx context.Context, def *shadow.Def) {
+	token := plexToken()
+	if token == "" {
+		fmt.Println("plex tuning skipped: no token configured")
+		return
+	}
+	client := plex.New(token)
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	srv, err := client.DiscoverOwnedServer()
+	if err != nil {
+		fmt.Printf("plex tuning skipped: %v\n", err)
+		return
+	}
+	if err := client.SetPreferences(cctx, *srv, map[string]string{"GenerateBIFBehavior": "never"}); err != nil {
+		fmt.Printf("plex tuning skipped: %v\n", err)
+		return
+	}
+	fmt.Println("plex: preview thumbnails disabled (GenerateBIFBehavior=never)")
+
+	real, _, err := resolveMount(def.Mount)
+	if err != nil {
+		fmt.Printf("plex tuning skipped: %v\n", err)
+		return
+	}
+	sections, err := client.LibrarySections(*srv)
+	if err != nil {
+		fmt.Printf("plex tuning skipped: %v\n", err)
+		return
+	}
+	markerPrefs := map[string]string{
+		"enableIntroMarkerGeneration":   "0",
+		"enableCreditsMarkerGeneration": "0",
+		"enableAdMarkerGeneration":      "0",
+		"enableBIFGeneration":           "0",
+		"enableVoiceActivityGeneration": "0",
+	}
+	matched := 0
+	for _, s := range sections {
+		if s.Type != def.Type {
+			continue
+		}
+		for _, loc := range s.Locations {
+			locReal, _, lerr := resolveMount(loc)
+			if lerr != nil || locReal != real {
+				continue
+			}
+			if err := client.SetSectionPreferences(cctx, *srv, s.Key, markerPrefs); err != nil {
+				fmt.Printf("plex tuning skipped: section %s: %v\n", s.Title, err)
+				continue
+			}
+			fmt.Printf("plex: intro/credit/ad/BIF/voice-activity analysis disabled on %q\n", s.Title)
+			matched++
+		}
+	}
+	if matched == 0 {
+		fmt.Println("plex tuning: no owned library section matched this shadow's mount path")
+	}
+}
+
+// plexToken returns the configured Plex token, from config or PLEX_TOKEN.
+func plexToken() string {
+	cfg, err := config.Load()
+	if err == nil && cfg.Plex.Token != "" {
+		return cfg.Plex.Token
+	}
+	return os.Getenv("PLEX_TOKEN")
+}
+
+// dirEmpty reports whether a directory has no entries.
+func dirEmpty(dir string) bool {
+	des, err := os.ReadDir(dir)
+	return err == nil && len(des) == 0
+}
+
+// isMounted reports whether path is currently a mountpoint, by scanning the
+// mount table. Reading /sbin/mount never blocks, unlike touching the path
+// itself when the mount's server is dead.
+func isMounted(path string) (bool, error) {
+	out, err := exec.Command("/sbin/mount").Output()
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, " on "+path) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// resolveMount resolves the real path for a shadow mount point and reports
+// whether anything is mounted there. It never stats or readlinks a path
+// that could be a dead NFS mount: the directory prefix is resolved with
+// readlink only, the mount table is checked before the final component is
+// touched, and the final symlink (e.g. media/dubbed-tv -> ../dubbed-tv) is
+// only read once its resolved parent is known not to be the mount.
+func resolveMount(p string) (real string, mounted bool, err error) {
+	clean := filepath.Clean(p)
+	dir := resolveDir(filepath.Dir(clean))
+	real = filepath.Join(dir, filepath.Base(clean))
+	mounted, err = isMounted(real)
+	if err != nil || mounted {
+		return real, mounted, err
+	}
+	target, rerr := os.Readlink(real)
+	if rerr != nil {
+		return real, false, nil // not a symlink — nothing else to resolve
+	}
+	if filepath.IsAbs(target) {
+		real = filepath.Clean(target)
+	} else {
+		real = filepath.Clean(filepath.Join(dir, target))
+	}
+	mounted, err = isMounted(real)
+	return real, mounted, err
+}
+
+// resolveDir resolves symlinks in a directory path using only readlink on
+// each component as it is reached. It never descends into a final mount:
+// callers only pass parent directories of configured mount points.
+func resolveDir(dir string) string {
+	cur := filepath.Clean(dir)
+	for range 10 {
+		t, err := os.Readlink(cur)
+		if err == nil {
+			if filepath.IsAbs(t) {
+				cur = filepath.Clean(t)
+			} else {
+				cur = filepath.Clean(filepath.Join(filepath.Dir(cur), t))
+			}
+			continue
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return cur
+		}
+		t, err = os.Readlink(parent)
+		if err == nil {
+			if filepath.IsAbs(t) {
+				cur = filepath.Clean(filepath.Join(t, filepath.Base(cur)))
+			} else {
+				cur = filepath.Clean(filepath.Join(filepath.Dir(parent), t, filepath.Base(cur)))
+			}
+			continue
+		}
+		return cur
+	}
+	return cur
+}
+
 // mediaTag formats a TMDB-based media identifier for CLI output.
 // Movies: "movie:<tmdb_id>", Episodes: "episode:<series_tmdb_id>:S01E02".
 // Falls back to "category:<db_id>" if TMDB ID is unavailable.
@@ -1939,6 +3185,93 @@ func runWanted(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\n", item.Category, item.TmdbID, item.Title, airDate, lastSearched, searchable)
 	}
 	return w.Flush()
+}
+
+func runMovieReconcile(cmd *cobra.Command, args []string) error {
+	dir, err := config.DataDir()
+	if err != nil {
+		return err
+	}
+	db, err := database.Open(filepath.Join(dir, "udl.db"))
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	movies, err := db.ListMovies()
+	if err != nil {
+		return err
+	}
+	m, err := shadow.LoadManifest("movies")
+	if err != nil {
+		return fmt.Errorf("movies shadow manifest not built — run 'udl shadow manifest movies' first: %w", err)
+	}
+	tmdbInShadow := map[string]bool{}
+	imdbInShadow := map[string]bool{}
+	for _, it := range m.Items {
+		switch {
+		case strings.HasPrefix(it.GUID, "tmdb://"):
+			tmdbInShadow[strings.TrimPrefix(it.GUID, "tmdb://")] = true
+		case strings.HasPrefix(it.GUID, "imdb://"):
+			imdbInShadow[strings.TrimPrefix(it.GUID, "imdb://")] = true
+		}
+	}
+
+	execute, _ := cmd.Flags().GetBool("execute")
+	var toShadow, toWanted, alreadyWanted int
+	var shown []string
+	for _, mo := range movies {
+		switch mo.Status {
+		case "shadow":
+			continue
+		case "wanted":
+			alreadyWanted++
+			continue
+		}
+		if mo.Status != "downloaded" {
+			continue
+		}
+		inShadow := tmdbInShadow[strconv.Itoa(mo.TmdbID)] ||
+			(mo.ImdbID.Valid && imdbInShadow[mo.ImdbID.String])
+		if inShadow {
+			toShadow++
+			if execute {
+				if err := db.UpdateMovieStatus(mo.ID, "shadow", mo.Quality.String, ""); err != nil {
+					return fmt.Errorf("%s: %w", mo.Title, err)
+				}
+			}
+		} else {
+			toWanted++
+			if execute {
+				if err := db.UpdateMovieStatus(mo.ID, "wanted", mo.Quality.String, ""); err != nil {
+					return fmt.Errorf("%s: %w", mo.Title, err)
+				}
+			}
+		}
+		if len(shown) < 15 {
+			state := "shadow"
+			if !inShadow {
+				state = "wanted"
+			}
+			shown = append(shown, fmt.Sprintf("  %s (%d) -> %s", mo.Title, mo.Year, state))
+		}
+	}
+
+	fmt.Printf("movies: %d tracked (%d wanted, %d downloaded)\n", len(movies), alreadyWanted, toShadow+toWanted)
+	fmt.Printf("shadow covers: %d downloaded -> shadow (available via mount)\n", toShadow)
+	fmt.Printf("not covered:   %d downloaded -> wanted (re-download via usenet)\n", toWanted)
+	if len(shown) > 0 {
+		fmt.Println("sample:")
+		for _, s := range shown {
+			fmt.Println(s)
+		}
+	}
+	if execute {
+		fmt.Printf("applied: %d movies updated\n", toShadow+toWanted)
+	} else {
+		fmt.Println("dry-run — use --execute to apply")
+	}
+	return nil
 }
 
 func runMovieInfo(cmd *cobra.Command, args []string) error {
@@ -2789,4 +4122,3 @@ func runNZBGrab(cmd *cobra.Command, args []string) error {
 	}
 	return nil
 }
-

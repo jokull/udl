@@ -148,9 +148,41 @@ matches. Two signing modes:
   `certificate leaf = H"…"` — the cert's hash, stable across rebuilds. Sign
   with the **same cert** every time and the grant survives forever.
 
-The `-i udl` flag pins the identifier so the requirement reads
-`identifier udl and certificate leaf = H"…"` instead of a build-specific
-CDHash. Never drop it, and never sign with `codesign -s -`.
+### Is signing required? What does it unlock?
+
+Signing is **not required to run** — an unsigned binary works, and for media
+paths outside `/Volumes` it needs no grants at all. But the moment a launchd-
+spawned process touches macOS-sensitive paths, the ad-hoc identity becomes a
+liability. Beyond the TCC grant above, on recent macOS (Sequoia and later)
+the **System Policy kernel extension** evaluates launchd-spawned processes
+against the same identity and **stalls** — a hang, not an error — when they
+read paths under volumes that contain NFS mounts
+(`System Policy: udl(-1) deny(4) file-read-data …` in the kernel log), and
+intermittently stalls their `mount_nfs` (`deny(4) file-mount`). With a stable
+certificate the identity stops changing per rebuild, the evaluation is granted
+once, and both classes of stall disappear.
+
+Signing **unlocks**:
+
+- **Grants survive rebuilds.** TCC and System Policy record the designated
+  requirement; the cert's leaf hash is stable, the CDHash is not. No
+  re-prompting, no silent denial after every `go build`.
+- **Union upper layers may live under volumes containing NFS mounts.** The
+  shadow NFS feature (see `docs/nfs-sharp-edges.md`) normally requires upper
+  layers on the boot volume because an unsigned agent stalls reading them
+  under `/Volumes/Plex`. Signed, the upper can be the daemon's actual import
+  directory on the media volume — so newly downloaded media appears in the
+  shadow union (and Plex) automatically.
+- **Deterministic mounts at boot.** The shadow agents mount their NFS exports
+  via passwordless sudo at login. Unsigned, that mount can stall
+  intermittently and needs a one-time terminal fallback; signed, it just
+  works.
+- **No per-build churn.** Rebuild → re-sign with the same cert → nothing else
+  changes.
+
+Rule of thumb: **unsigned = fine for a manually-run CLI; signed = required
+for always-on daemons, anything touching `/Volumes`, or the shadow NFS
+feature.**
 
 After changing the signing identity (or re-signing a previously ad-hoc binary),
 macOS may re-prompt once: either a system dialog ("udl wants to access files on
@@ -251,9 +283,10 @@ udl library verify                    # read-only DB/disk consistency check
 udl library prune                     # delete files for unmonitored episodes
 udl library prune-incomplete          # find stale download dirs (dry-run)
 
-# Plex integration
-udl plex servers             # list Plex friend servers
-udl plex check <tmdb-id>     # check if friends have it (by TMDB ID)
+udl plex libraries           # map all libraries: type, download access, audio languages
+udl plex cleanup             # show unwatched old media (dry-run)
+udl plex cleanup --execute   # delete unwatched media older than 90 days
+udl plex cleanup --days 30   # shorter age threshold
 udl plex cleanup             # show unwatched old media (dry-run)
 udl plex cleanup --execute   # delete unwatched media older than 90 days
 udl plex cleanup --days 30   # shorter age threshold
@@ -297,7 +330,22 @@ keep    series  Severance (2022)     WEBDL-1080p   60d   — (watched)
 would delete 2 items (22.9 GB), keep 2 — use --execute to apply
 ```
 
-On `--execute`: files are deleted, database status is reset to "wanted" (so they can be re-grabbed later if needed), and a "cleaned" history event is recorded. Empty directories are cleaned up automatically. Requires `[plex] token` in config.
+## Plex Libraries
+
+Map every library section on your own and friends' Plex servers: media type, whether your account can download from it (offline sync), and — on request — which audio track languages appear in each library.
+
+```bash
+udl plex libraries                           # cheap: discovery + sections
+udl plex libraries --counts                  # + per-section item counts
+udl plex libraries --audio                   # + scan audio languages (rate-limited)
+udl plex libraries --audio --shows           # include TV sections (walks episodes)
+udl plex libraries --audio --items 10        # cap scans at 10 items per section
+udl plex libraries --server kari --json      # one server, machine-readable
+```
+
+The default run costs one request to plex.tv plus one per reachable server. `--counts` adds one request per section; `--audio` adds one request per item scanned (Plex only exposes per-track languages via the per-item metadata endpoint), capped by `--items` and throttled to `--rate` requests/second (default 3) so scans stay well under Plex's request limits. Show sections are skipped unless `--shows` is given — each show costs one episode-list request plus one per episode examined (`--per-show`, default 3). The download column reflects what the shared-library owner has allowed for your account (`allowSync`/`allowDownloads`).
+
+## Migrating from Sonarr/Radarr
 
 ## Migrating from Sonarr/Radarr
 

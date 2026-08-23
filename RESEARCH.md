@@ -19,8 +19,7 @@
 | Need | Library | Stars | Notes |
 |------|---------|-------|-------|
 | NNTP client | [Tensai75/nntp](https://github.com/Tensai75/nntp) | 0 | Fork of chrisfarms, actively maintained (Feb 2026) |
-| NNTP pool | [Tensai75/nntpPool](https://github.com/Tensai75/nntpPool) | 0 | Connection pooling, used in nzb-monkey-go |
-| Extraction (high-level) | [golift/xtractr](https://github.com/golift/xtractr) | 47 | Queued extraction, built for *arr ecosystem |
+| NFS server (shadow mount) | [willscott/go-nfs](https://github.com/willscott/go-nfs) | — | Pure Go NFSv3 server; synthetic-union export for `udl shadow mount`, no kext on macOS |
 
 ### Build Ourselves
 

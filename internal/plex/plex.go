@@ -20,15 +20,19 @@ import (
 
 // Client is a Plex API client scoped to a single authentication token.
 type Client struct {
-	token      string
-	httpClient *http.Client
-	servers    []Server
-	serversErr error
+	token       string
+	httpClient  *http.Client
+	servers     []Server
+	serversErr  error
 	serversOnce sync.Once
-	ownedServer  *Server
-	ownedErr     error
-	ownedOnce    sync.Once
-	mu         sync.Mutex // protects episodeCache only
+	ownedServer *Server
+	ownedErr    error
+	ownedOnce   sync.Once
+	mu          sync.Mutex // protects episodeCache only
+
+	// limiter throttles outgoing requests when set (see SetRateLimit).
+	limiter       *rateLimiter
+	baseTransport http.RoundTripper
 
 	// episodeCache stores series episode data keyed by "serverURI|seriesTitle"
 	// to avoid repeating the 3-call chain for multiple episodes of the same show.
@@ -41,6 +45,8 @@ type Server struct {
 	URI         string // best connection URI
 	AccessToken string
 	Owned       bool
+	// Connections lists alternate URIs (best first) to try when URI fails.
+	Connections []string
 }
 
 // MediaMatch describes a media item found on a friend's server.
@@ -65,17 +71,38 @@ type DownloadInfo struct {
 }
 
 type episodeMeta struct {
-	Season    int
-	Episode   int
+	Season     int
+	Episode    int
 	Resolution string
-	RatingKey string
+	RatingKey  string
 }
 
 // LibrarySection describes a Plex library section (movie or show).
 type LibrarySection struct {
-	Key   string // section ID, e.g. "1"
-	Title string // e.g. "Movies", "TV Shows"
-	Type  string // "movie" or "show"
+	Key       string   // section ID, e.g. "1"
+	Title     string   // e.g. "Movies", "TV Shows"
+	Type      string   // "movie" or "show"
+	Locations []string // root media paths the section points at
+	// Download reports whether this account may sync/download (offline sync)
+	// media from this section. Plex exposes it as allowSync on older servers
+	// and allowDownloads on newer ones.
+	Download bool
+}
+
+// flexBool decodes Plex JSON booleans, which may appear as true/false,
+// 1/0, or "1"/"0" depending on server version.
+type flexBool bool
+
+func (b *flexBool) UnmarshalJSON(data []byte) error {
+	switch strings.Trim(string(data), `"`) {
+	case "true", "1":
+		*b = true
+	case "false", "0", "null", "":
+		*b = false
+	default:
+		return fmt.Errorf("plex: invalid boolean %q", string(data))
+	}
+	return nil
 }
 
 // LibraryItem describes a media item with watch status from the owned server.
@@ -180,6 +207,7 @@ func (c *Client) discoverServersInternal() ([]Server, error) {
 			URI:         uri,
 			AccessToken: r.AccessToken,
 			Owned:       r.Owned,
+			Connections: orderedConnections(r.Connections),
 		})
 	}
 
@@ -544,6 +572,40 @@ func (c *Client) Servers() []Server {
 	return c.servers
 }
 
+// SetPreferences updates server preferences via PUT /:/prefs, e.g.
+// {"GenerateBIFrames": "0"} to disable preview thumbnails.
+func (c *Client) SetPreferences(ctx context.Context, srv Server, prefs map[string]string) error {
+	return c.putPrefs(ctx, srv, "/:/prefs", prefs)
+}
+
+// SetSectionPreferences updates a library section's advanced settings via
+// PUT /library/sections/{key}/prefs, e.g. disabling intro/credit detection.
+func (c *Client) SetSectionPreferences(ctx context.Context, srv Server, sectionKey string, prefs map[string]string) error {
+	return c.putPrefs(ctx, srv, "/library/sections/"+sectionKey+"/prefs", prefs)
+}
+
+func (c *Client) putPrefs(ctx context.Context, srv Server, path string, prefs map[string]string) error {
+	q := url.Values{}
+	for k, v := range prefs {
+		q.Set(k, v)
+	}
+	q.Set("X-Plex-Token", srv.AccessToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, srv.URI+path+"?"+q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	c.setServerHeaders(req, srv.AccessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("plex: set preferences: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("plex: set preferences: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // DiscoverOwnedServer fetches the user's own Plex server from plex.tv.
 // Results are cached for the lifetime of the Client. Safe for concurrent use.
 func (c *Client) DiscoverOwnedServer() (*Server, error) {
@@ -597,8 +659,19 @@ func (c *Client) discoverOwnedInternal() (*Server, error) {
 	return nil, nil
 }
 
-// LibrarySections returns the library sections on a server.
+// LibrarySections returns the library sections on a server, filtered to
+// movie and show sections.
 func (c *Client) LibrarySections(srv Server) ([]LibrarySection, error) {
+	return c.fetchSections(srv, true)
+}
+
+// LibrarySectionsAll returns every library section on a server (movies,
+// shows, music, other videos) with download/sync permission for this account.
+func (c *Client) LibrarySectionsAll(srv Server) ([]LibrarySection, error) {
+	return c.fetchSections(srv, false)
+}
+
+func (c *Client) fetchSections(srv Server, mediaOnly bool) ([]LibrarySection, error) {
 	reqURL := fmt.Sprintf("%s/library/sections", srv.URI)
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
@@ -619,9 +692,14 @@ func (c *Client) LibrarySections(srv Server) ([]LibrarySection, error) {
 	var result struct {
 		MediaContainer struct {
 			Directory []struct {
-				Key   string `json:"key"`
-				Title string `json:"title"`
-				Type  string `json:"type"`
+				Key            string   `json:"key"`
+				Title          string   `json:"title"`
+				Type           string   `json:"type"`
+				AllowSync      flexBool `json:"allowSync"`
+				AllowDownloads flexBool `json:"allowDownloads"`
+				Location       []struct {
+					Path string `json:"path"`
+				} `json:"Location"`
 			} `json:"Directory"`
 		} `json:"MediaContainer"`
 	}
@@ -631,13 +709,22 @@ func (c *Client) LibrarySections(srv Server) ([]LibrarySection, error) {
 
 	var sections []LibrarySection
 	for _, d := range result.MediaContainer.Directory {
-		if d.Type == "movie" || d.Type == "show" {
-			sections = append(sections, LibrarySection{
-				Key:   d.Key,
-				Title: d.Title,
-				Type:  d.Type,
-			})
+		if mediaOnly && d.Type != "movie" && d.Type != "show" {
+			continue
 		}
+		locs := make([]string, 0, len(d.Location))
+		for _, l := range d.Location {
+			if l.Path != "" {
+				locs = append(locs, l.Path)
+			}
+		}
+		sections = append(sections, LibrarySection{
+			Key:       d.Key,
+			Title:     d.Title,
+			Type:      d.Type,
+			Locations: locs,
+			Download:  bool(d.AllowDownloads) || bool(d.AllowSync),
+		})
 	}
 	return sections, nil
 }
@@ -911,10 +998,10 @@ func (c *Client) fetchAllEpisodes(srv Server, showKey string) ([]episodeMeta, er
 			}
 			res := bestResolution(ep.Media)
 			allEpisodes = append(allEpisodes, episodeMeta{
-				Season:    ep.ParentIndex,
-				Episode:   ep.Index,
+				Season:     ep.ParentIndex,
+				Episode:    ep.Index,
 				Resolution: res,
-				RatingKey: ep.RatingKey,
+				RatingKey:  ep.RatingKey,
 			})
 		}
 	}
@@ -994,8 +1081,8 @@ type hubSearchResponse struct {
 }
 
 type hubSection struct {
-	Type     string         `json:"type"`
-	Metadata []hubMetadata  `json:"Metadata"`
+	Type     string        `json:"type"`
+	Metadata []hubMetadata `json:"Metadata"`
 }
 
 type hubMetadata struct {
@@ -1003,8 +1090,8 @@ type hubMetadata struct {
 	Type        string      `json:"type"`
 	Title       string      `json:"title"`
 	Year        int         `json:"year"`
-	PlexGUID    string      `json:"guid"`  // plex-native GUID string (e.g. "plex://movie/...")
-	GUID        []guidTag   `json:"Guid"`  // external IDs (IMDB, TMDB, TVDB) — requires includeGuids=1
+	PlexGUID    string      `json:"guid"` // plex-native GUID string (e.g. "plex://movie/...")
+	GUID        []guidTag   `json:"Guid"` // external IDs (IMDB, TMDB, TVDB) — requires includeGuids=1
 	Media       []mediaPart `json:"Media"`
 	ParentIndex int         `json:"parentIndex"` // season number for episodes
 	Index       int         `json:"index"`       // episode number
@@ -1020,24 +1107,242 @@ type mediaPart struct {
 }
 
 type partDetail struct {
-	Key       string `json:"key"`  // e.g. "/library/parts/12345/..."
-	File      string `json:"file"` // original filename on server
-	Size      int64  `json:"size"` // file size in bytes
-	Container string `json:"container"`
+	Key       string         `json:"key"`  // e.g. "/library/parts/12345/..."
+	File      string         `json:"file"` // original filename on server
+	Size      int64          `json:"size"` // file size in bytes
+	Container string         `json:"container"`
+	Stream    []StreamDetail `json:"Stream"`
+}
+
+// StreamDetail is one media stream inside a part. StreamType 2 = audio.
+type StreamDetail struct {
+	ID           int    `json:"id"`
+	StreamType   int    `json:"streamType"`
+	Codec        string `json:"codec"`
+	LanguageCode string `json:"languageCode"` // ISO 639-2, e.g. "isl", "eng"
+	Language     string `json:"language"`
 }
 
 // metadataDetail is the full metadata response from /library/metadata/{id}.
 type metadataDetail struct {
-	RatingKey string     `json:"ratingKey"`
-	Title     string     `json:"title"`
-	Year      int        `json:"year"`
+	RatingKey string      `json:"ratingKey"`
+	Title     string      `json:"title"`
+	Year      int         `json:"year"`
 	Media     []mediaPart `json:"Media"`
 }
 
+// childrenResponse is the response from /library/metadata/{key}/children
+// (seasons of a show, or episodes of a season).
 type childrenResponse struct {
 	MediaContainer struct {
 		Metadata []hubMetadata `json:"Metadata"`
 	} `json:"MediaContainer"`
+}
+
+// SectionItem is one item from a library section dump
+// (/library/sections/{key}/all?includeGuids=1).
+type SectionItem struct {
+	RatingKey   string      `json:"ratingKey"`
+	Type        string      `json:"type"` // "movie" or "show"
+	Title       string      `json:"title"`
+	Year        int         `json:"year"`
+	PlexGUID    string      `json:"guid"`
+	GUIDs       []guidTag   `json:"Guid"`
+	ParentIndex int         `json:"parentIndex"`
+	Index       int         `json:"index"`
+	Media       []mediaPart `json:"Media"`
+}
+
+// ItemMedia is one Media entry in a full metadata detail.
+type ItemMedia struct {
+	VideoResolution string     `json:"videoResolution"`
+	Parts           []ItemPart `json:"Part"`
+}
+
+// ItemPart is one file part of an item.
+type ItemPart struct {
+	Key       string         `json:"key"`
+	File      string         `json:"file"`
+	Size      int64          `json:"size"`
+	Container string         `json:"container"`
+	Streams   []StreamDetail `json:"Stream"`
+}
+
+// ItemDetail is the full metadata for a single item (/library/metadata/{id}).
+type ItemDetail struct {
+	RatingKey string      `json:"ratingKey"`
+	Type      string      `json:"type"`
+	Title     string      `json:"title"`
+	Year      int         `json:"year"`
+	Media     []ItemMedia `json:"Media"`
+}
+
+// EpisodeInfo identifies one episode within a series.
+type EpisodeInfo struct {
+	RatingKey  string
+	Season     int
+	Episode    int
+	Resolution string
+}
+
+// SectionItems dumps all items in a library section, paging through results.
+func (c *Client) SectionItems(srv Server, sectionKey string) ([]SectionItem, error) {
+	return c.SectionItemsLimit(srv, sectionKey, 0)
+}
+
+// ProbeDownload verifies this account can actually fetch a file from a
+// section: it takes the first item, resolves its media part, and issues a
+// ranged GET. The allowSync/allowDownloads flags misreport real capability
+// (e.g. Vader reports 0 yet streams fine), so this is the ground-truth check
+// for shadow sourcing.
+func (c *Client) ProbeDownload(ctx context.Context, srv Server, sectionKey string) (bool, error) {
+	items, err := c.SectionItemsLimit(srv, sectionKey, 1)
+	if err != nil {
+		return false, err
+	}
+	if len(items) == 0 {
+		return false, nil
+	}
+	d, err := c.ItemDetail(srv, items[0].RatingKey)
+	if err != nil {
+		return false, err
+	}
+	if len(d.Media) == 0 || len(d.Media[0].Parts) == 0 {
+		return false, nil
+	}
+	part := d.Media[0].Parts[0]
+	u := fmt.Sprintf("%s%s?X-Plex-Token=%s", srv.URI, part.Key, srv.AccessToken)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Range", "bytes=0-1")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4))
+	return resp.StatusCode == http.StatusPartialContent || resp.StatusCode == http.StatusOK, nil
+}
+
+// SectionItemsLimit dumps up to limit items from a library section, paging
+// through results. limit <= 0 fetches everything.
+func (c *Client) SectionItemsLimit(srv Server, sectionKey string, limit int) ([]SectionItem, error) {
+	var items []SectionItem
+	start := 0
+	const pageSize = 500
+	for {
+		reqURL := fmt.Sprintf("%s/library/sections/%s/all?includeGuids=1&X-Plex-Container-Start=%d&X-Plex-Container-Size=%d",
+			srv.URI, sectionKey, start, pageSize)
+		req, err := http.NewRequest("GET", reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.setServerHeaders(req, srv.AccessToken)
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("plex: section items: %w", err)
+		}
+		var page struct {
+			MediaContainer struct {
+				Metadata []SectionItem `json:"Metadata"`
+			} `json:"MediaContainer"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("plex: decode section items: %w", err)
+		}
+		resp.Body.Close()
+
+		items = append(items, page.MediaContainer.Metadata...)
+		if limit > 0 && len(items) >= limit {
+			items = items[:limit]
+			break
+		}
+		if len(page.MediaContainer.Metadata) < pageSize {
+			break
+		}
+		start += pageSize
+		if start >= 20000 {
+			break
+		}
+	}
+	return items, nil
+}
+
+// ItemDetail fetches the full metadata for a single item, including all
+// media parts and their streams (audio languages etc.).
+func (c *Client) ItemDetail(srv Server, ratingKey string) (*ItemDetail, error) {
+	reqURL := fmt.Sprintf("%s/library/metadata/%s", srv.URI, ratingKey)
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setServerHeaders(req, srv.AccessToken)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("plex: item detail: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("plex: item detail %s: status %d", ratingKey, resp.StatusCode)
+	}
+
+	var result struct {
+		MediaContainer struct {
+			Metadata []ItemDetail `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("plex: decode item detail: %w", err)
+	}
+	if len(result.MediaContainer.Metadata) == 0 {
+		return nil, fmt.Errorf("plex: no item detail for %s", ratingKey)
+	}
+	return &result.MediaContainer.Metadata[0], nil
+}
+
+// SeriesEpisodes returns every episode of a series with season + episode
+// numbers, walking seasons -> episodes.
+func (c *Client) SeriesEpisodes(srv Server, showKey string) ([]EpisodeInfo, error) {
+	eps, err := c.fetchAllEpisodes(srv, showKey)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]EpisodeInfo, 0, len(eps))
+	for _, e := range eps {
+		out = append(out, EpisodeInfo{
+			RatingKey:  e.RatingKey,
+			Season:     e.Season,
+			Episode:    e.Episode,
+			Resolution: e.Resolution,
+		})
+	}
+	return out, nil
+}
+
+// orderedConnections returns candidate URIs for a server, best first:
+// direct connections (https before http), then relay, then local. Used for
+// connection fallback when the best URI is unreachable.
+func orderedConnections(conns []resourceConnection) []string {
+	var direct, relay, local []string
+	for _, c := range conns {
+		switch {
+		case c.Relay:
+			relay = append(relay, c.URI)
+		case c.Local:
+			local = append(local, c.URI)
+		case c.Protocol == "https":
+			direct = append(direct, c.URI)
+		default:
+			direct = append(direct, c.URI)
+		}
+	}
+	return append(append(direct, relay...), local...)
 }
 
 // libraryItemMeta is the JSON shape returned by /library/sections/{key}/all

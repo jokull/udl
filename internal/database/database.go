@@ -299,6 +299,13 @@ var allowedMediaTransitions = map[string]map[string]bool{
 		"downloaded": true,
 		"wanted":     true,
 		"failed":     true,
+		"shadow":     true,
+	},
+	"shadow": {
+		"shadow":     true,
+		"wanted":     true,
+		"downloaded": true,
+		"failed":     true,
 	},
 	"failed": {
 		"failed": true,
