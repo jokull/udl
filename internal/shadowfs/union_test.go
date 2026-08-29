@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/jokull/udl/internal/shadow"
+	"golang.org/x/text/unicode/norm"
 )
 
 // stubFetcher serves fixed bytes per URL, counting calls.
@@ -224,5 +225,44 @@ func TestEmptyUpperRootIsVirtual(t *testing.T) {
 	rn := names(root)
 	if !contains(rn, "Bluey (2018)") || !contains(rn, remoteMov) {
 		t.Fatalf("root entries = %v", rn)
+	}
+}
+
+func TestNFDNameNormalization(t *testing.T) {
+	// macOS/Plex resolve filenames in decomposed (NFD) Unicode, but remote
+	// Plex servers deliver titles in precomposed (NFC). The union must serve
+	// and look up NFD names so the client's 404 on non-ASCII titles (a play
+	// spinner) can't happen.
+	nfc := "Pokémon Mewtwo á móti Mew (1998).mp4"
+	nfd := norm.NFD.String(nfc)
+	if nfc == nfd {
+		t.Skip("name has no decomposable characters")
+	}
+	sf := &stubFetcher{data: map[string][]byte{"http://x/n": make([]byte, 100)}}
+	fs := NewUnion(t.TempDir(), []shadow.Item{
+		{VirtualPath: nfc, URL: "http://x/n", Size: 100},
+	}, sf)
+
+	// Served directory entry must be the decomposed form the client asks for.
+	root, err := fs.ReadDir("/")
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	got := names(root)
+	if len(got) != 1 || got[0] != nfd {
+		t.Fatalf("ReadDir = %v, want NFD %q", got, nfd)
+	}
+
+	// Lookup/open by the decomposed (client) bytes must resolve.
+	if _, err := fs.Stat("/" + nfd); err != nil {
+		t.Fatalf("Stat by NFD name: %v", err)
+	}
+	f, err := fs.OpenFile("/"+nfd, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("OpenFile by NFD name: %v", err)
+	}
+	defer f.Close()
+	if _, err := io.ReadFull(f, make([]byte, 100)); err != nil {
+		t.Fatalf("read item: %v", err)
 	}
 }

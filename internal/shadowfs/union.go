@@ -12,7 +12,17 @@ import (
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/jokull/udl/internal/shadow"
+	"golang.org/x/text/unicode/norm"
 )
+
+// normalizeName decomposes a filesystem name into macOS NFD form. macOS (and
+// therefore the Plex Media Server) resolves filesystem names in decomposed
+// (NFD) Unicode, but remote Plex servers deliver titles in precomposed (NFC)
+// form, so manifest virtual paths are NFC. The NFS union is an exact-byte
+// filesystem, so serving NFC names makes every non-ASCII file unfindable to
+// the Plex client ("Couldn't find the file to stream" -> 404 -> play spinner).
+// Decomposing here matches the bytes the client actually looks up.
+func normalizeName(s string) string { return norm.NFD.String(s) }
 
 // UnionFS is a read-only layered filesystem: real files from the local upper
 // directory with shadow items below it. Directory names merge recursively, so
@@ -45,12 +55,13 @@ func NewUnion(upper string, items []shadow.Item, fetch Fetcher) *UnionFS {
 		built: time.Now(),
 	}
 	for i := range items {
-		p := strings.Trim(items[i].VirtualPath, "/")
+		vp := normalizeName(items[i].VirtualPath)
+		p := strings.Trim(vp, "/")
 		if p == "" {
 			continue
 		}
 		u.items[p] = &Item{
-			VirtualPath: items[i].VirtualPath,
+			VirtualPath: vp,
 			URL:         items[i].URL,
 			Size:        items[i].Size,
 		}
@@ -69,7 +80,7 @@ func (u *UnionFS) clean(name string) (string, bool) {
 	if name == "" {
 		return "", true
 	}
-	p := path.Clean(strings.TrimPrefix(name, "/"))
+	p := path.Clean(strings.TrimPrefix(normalizeName(name), "/"))
 	if p == "." {
 		p = ""
 	}
