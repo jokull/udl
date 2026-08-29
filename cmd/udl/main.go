@@ -67,6 +67,48 @@ var movieAddCmd = &cobra.Command{
 	RunE:  runMovieAdd,
 }
 
+var movieOwnCmd = &cobra.Command{
+	Use:   "own [tmdb-id]",
+	Short: "Download a movie locally past its shadow status",
+	Long: `Explicitly download a movie that a shadow already provides. The default
+for a monitored and shadow-covered movie is to NOT download it (status
+"shadow" — available via the mount). This command opts into owning it
+locally: status becomes "wanted" and the indexers are searched immediately.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runMovieOwn,
+}
+
+func runMovieOwn(cmd *cobra.Command, args []string) error {
+	tmdbID, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("TMDB ID must be a number (use 'udl movie search' to find it)")
+	}
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.OwnMovieReply
+	if err := client.Call("Service.OwnMovie", &daemon.OwnMovieArgs{TMDBID: tmdbID}, &reply); err != nil {
+		return err
+	}
+	switch reply.Status {
+	case "downloaded":
+		fmt.Printf("already owned locally: %s (%d) [tmdb=%d]\n", reply.Title, reply.Year, reply.TmdbID)
+	case "wanted":
+		fmt.Printf("owning: %s (%d) [tmdb=%d]\n", reply.Title, reply.Year, reply.TmdbID)
+		if reply.Grabbed {
+			fmt.Println("  -> release found and enqueued for download")
+		} else {
+			fmt.Println("  -> no matching release found on indexers; will retry in the search cycle")
+		}
+	default:
+		fmt.Printf("owning: %s (%d) [tmdb=%d] (status %s)\n", reply.Title, reply.Year, reply.TmdbID, reply.Status)
+	}
+	return nil
+}
+
 var movieListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List wanted and downloaded movies",
@@ -222,8 +264,8 @@ var plexCheckCmd = &cobra.Command{
 
 var plexCleanupCmd = &cobra.Command{
 	Use:   "cleanup",
-	Short: "Delete unwatched media older than N days from library",
-	Long:  "Queries Plex watch history on your owned server. Items never watched and added more than --days ago are candidates for deletion. Dry-run by default; use --execute to actually delete files.",
+	Short: "List unwatched media older than N days as delete candidates",
+	Long:  "Read-only delete-candidate report for AI handoff. Queries Plex watch history on your owned server and lists items never watched, added more than --days ago, with per-row watch count, last-watched, size, and safety hints (shadow coverage, rarity, holiday, ...). Nothing is deleted.",
 	RunE:  runPlexCleanup,
 }
 var plexLibrariesCmd = &cobra.Command{
@@ -265,6 +307,36 @@ var shadowListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List shadow libraries",
 	RunE:  runShadowList,
+}
+
+var shadowCoveredCmd = &cobra.Command{
+	Use:   "covered [tmdb-id]",
+	Short: "Show which shadows already provide a movie",
+	Long: `Reports whether the built shadow manifests carry the movie (matched by
+tmdb:// then imdb:// GUID). A covered movie is available via the mount
+without a download; 'udl movie own' still downloads it locally if you
+want to own it.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runShadowCovered,
+}
+
+func runShadowCovered(cmd *cobra.Command, args []string) error {
+	tmdbID, err := strconv.Atoi(args[0])
+	if err != nil {
+		return fmt.Errorf("TMDB ID must be a number")
+	}
+	cov, err := shadow.Covered(tmdbID, "")
+	if err != nil {
+		return fmt.Errorf("load shadow manifests: %w", err)
+	}
+	if len(cov) == 0 {
+		fmt.Printf("tmdb %d: not covered by any shadow\n", tmdbID)
+		return nil
+	}
+	for _, c := range cov {
+		fmt.Printf("%s: %s (%s)\n", c.Shadow, c.Title, c.GUID)
+	}
+	return nil
 }
 
 var shadowSourcesCmd = &cobra.Command{
@@ -522,7 +594,6 @@ Examples:
 }
 
 func init() {
-	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd, movieDeleteCmd, movieInfoCmd)
 	movieRemoveCmd.Flags().Bool("keep-files", false, "Only remove from database, keep files on disk")
 	movieDeleteCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
 	movieDeleteCmd.Flags().Bool("search", false, "Re-search after delete (blocklists old NZB)")
@@ -557,12 +628,11 @@ func init() {
 	searchTriggerCmd.Flags().IntP("season", "s", 0, "Episode season (used with --tmdb)")
 	searchTriggerCmd.Flags().IntP("episode", "e", 0, "Episode number (used with --tmdb)")
 	movieReconcileCmd.Flags().Bool("execute", false, "Actually apply status changes (default is dry-run)")
-	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd, movieDeleteCmd, movieInfoCmd, movieReconcileCmd)
+	movieCmd.AddCommand(movieAddCmd, movieListCmd, movieSearchCmd, movieReleasesCmd, movieGrabCmd, movieRemoveCmd, movieDeleteCmd, movieInfoCmd, movieReconcileCmd, movieOwnCmd)
 	queueCmd.AddCommand(queuePauseCmd, queueResumeCmd, queueClearCmd, queueRetryCmd, queueEvictCmd)
 	plexCheckCmd.Flags().IntP("season", "s", 0, "Filter TV results to a specific season")
 	plexCheckCmd.Flags().IntP("episode", "e", 0, "Filter TV results to a specific episode")
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
-	plexCleanupCmd.Flags().Bool("execute", false, "Actually delete files (default is dry-run)")
 	plexCleanupCmd.Flags().Bool("verbose", false, "Also show items that would be kept")
 	plexCmd.AddCommand(plexServersCmd, plexCheckCmd, plexCleanupCmd)
 	plexLibrariesCmd.Flags().Bool("counts", false, "Fetch per-section item counts (1 request per section)")
@@ -584,7 +654,7 @@ func init() {
 	shadowMountCmd.Flags().Bool("no-tuning", false, "skip disabling Plex preview thumbnails")
 	shadowMountCmd.Flags().Bool("daemon", false, "run as a root daemon: serve only, no mount (for launchd + automount)")
 	shadowEnableCmd.Flags().String("port", "", "fixed NFS port for the serve daemon (default: first free from 2055)")
-	shadowCmd.AddCommand(shadowCreateCmd, shadowAddCmd, shadowListCmd, shadowSourcesCmd, shadowManifestCmd, shadowMountCmd, shadowUnmountCmd, shadowEnableCmd, shadowDisableCmd)
+	shadowCmd.AddCommand(shadowCreateCmd, shadowAddCmd, shadowListCmd, shadowSourcesCmd, shadowManifestCmd, shadowMountCmd, shadowUnmountCmd, shadowEnableCmd, shadowDisableCmd, shadowCoveredCmd)
 	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
 	configCmd.AddCommand(configCheckCmd, configPathCmd, configShowCmd)
 
@@ -783,11 +853,16 @@ func runMovieAdd(cmd *cobra.Command, args []string) error {
 		}
 	} else {
 		fmt.Printf("added: %s (%d) [tmdb=%d]\n", reply.Title, reply.Year, reply.TmdbID)
-		if reply.Grabbed {
+		if reply.ShadowStatus {
+			fmt.Printf("  -> available via shadow (%s) — nothing to download; 'udl movie own %d' to download locally\n", reply.ShadowNames, reply.TmdbID)
+		} else if reply.Grabbed {
 			fmt.Println("  -> release found and enqueued for download")
 		} else {
 			fmt.Println("  -> no matching release found on indexers")
 		}
+	}
+	if reply.ShadowNames != "" && !reply.ShadowStatus {
+		fmt.Printf("  note: also available via shadow (%s) — a different version (e.g. dubbed)\n", reply.ShadowNames)
 	}
 	return nil
 }
@@ -1702,10 +1777,9 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 	defer client.Close()
 
 	days, _ := cmd.Flags().GetInt("days")
-	execute, _ := cmd.Flags().GetBool("execute")
 	verbose, _ := cmd.Flags().GetBool("verbose")
 
-	rpcArgs := &daemon.PlexCleanupArgs{Days: days, Execute: execute}
+	rpcArgs := &daemon.PlexCleanupArgs{Days: days}
 	var reply daemon.PlexCleanupReply
 	if err := client.Call("Service.PlexCleanup", rpcArgs, &reply); err != nil {
 		return err
@@ -1727,15 +1801,12 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 
 	// Show items in a table.
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ACTION\tTYPE\tTITLE\tQUALITY\tAGE\tSIZE\tLAST WATCHED\tWATCHED BY")
+	fmt.Fprintln(w, "ACTION\tTYPE\tTITLE\tQUALITY\tAGE\tSIZE\tWATCH COUNT\tLAST WATCHED\tWATCHED BY\tHINTS")
 	for _, item := range reply.Items {
 		if item.Action == "keep" && !verbose {
 			continue
 		}
 		action := item.Action
-		if item.Deleted {
-			action = "deleted"
-		}
 		if item.Action == "keep" {
 			action = fmt.Sprintf("keep (%s)", item.Reason)
 		}
@@ -1748,8 +1819,13 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 		if item.Year > 0 {
 			title = fmt.Sprintf("%s (%d)", item.Title, item.Year)
 		}
-		if item.MediaType == "season" {
-			title = fmt.Sprintf("%s S%02d (%dep)", title, item.Season, item.EpisodeCount)
+		if item.MediaType == "episode" {
+			title = fmt.Sprintf("%s S%02dE%02d", title, item.Season, item.Episode)
+		}
+
+		watchCount := "-"
+		if item.WatchCount > 0 {
+			watchCount = strconv.Itoa(item.WatchCount)
 		}
 
 		lastWatched := "-"
@@ -1768,8 +1844,13 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 			watchedBy = strings.Join(item.WatchedBy, ", ")
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			action, item.MediaType, title, item.Quality, age, size, lastWatched, watchedBy)
+		hints := "-"
+		if len(item.Hints) > 0 {
+			hints = strings.Join(item.Hints, ", ")
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			action, item.MediaType, title, item.Quality, age, size, watchCount, lastWatched, watchedBy, hints)
 	}
 	if err := w.Flush(); err != nil {
 		return err
@@ -1777,13 +1858,8 @@ func runPlexCleanup(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 
 	// Summary.
-	if execute {
-		fmt.Printf("deleted %d items (%s), kept %d\n",
-			reply.DeletedCount, formatSize(reply.DeletedSize), reply.TotalKeep)
-	} else {
-		fmt.Printf("would delete %d items (%s), keep %d — use --execute to apply\n",
-			reply.TotalDelete, formatSize(reply.TotalSize), reply.TotalKeep)
-	}
+	fmt.Printf("%d delete candidates (%s reclaimable), %d kept — read-only report for AI handoff\n",
+		reply.TotalDelete, formatSize(reply.TotalSize), reply.TotalKeep)
 	return nil
 }
 
@@ -3295,6 +3371,9 @@ func runMovieInfo(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("tmdb:%d  %s (%d)\n", reply.TmdbID, reply.Title, reply.Year)
 	fmt.Printf("status:      %s\n", reply.Status)
+	if cov, covErr := shadow.Covered(reply.TmdbID, ""); covErr == nil && len(cov) > 0 {
+		fmt.Printf("shadow:      available via %s\n", shadow.FormatCoverage(cov))
+	}
 	if reply.Quality != "" {
 		fmt.Printf("quality:     %s\n", reply.Quality)
 	}

@@ -274,6 +274,7 @@ var allowedMediaTransitions = map[string]map[string]bool{
 		"downloading": true,
 		"downloaded":  true,
 		"failed":      true,
+		"shadow":      true, // covered by a shadow at add time — nothing to download
 	},
 	"queued": {
 		"queued":      true,
@@ -827,6 +828,9 @@ func (db *DB) IsCompletedInHistory(mediaType string, mediaID int64, releaseTitle
 	return count > 0, nil
 }
 
+// HistoryEventCount returns how many history rows exist for the media item
+// matching any of the given events. Used to detect re-grab signals: a
+// 'deleted'/'cleaned' event followed by re-acquisition means the user wanted
 // HasGrabbedHistory returns true if the release title was previously grabbed
 // for the media item without ever completing. Used to dedup grabs: re-grabbing
 // the exact same release after a failed or aborted download is pure waste
@@ -845,6 +849,27 @@ func (db *DB) HasGrabbedHistory(mediaType string, mediaID int64, releaseTitle st
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// HistoryEventCount returns how many history rows exist for the media item
+// matching any of the given events. Used to detect re-grab signals: a
+// 'deleted'/'cleaned' event followed by re-acquisition means the user wanted
+// the item back, which weighs against cleanup.
+func (db *DB) HistoryEventCount(mediaType string, mediaID int64, events ...string) (int, error) {
+	if len(events) == 0 {
+		return 0, nil
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(events)), ",")
+	args := make([]any, 0, len(events)+2)
+	args = append(args, mediaType, mediaID)
+	for _, e := range events {
+		args = append(args, e)
+	}
+	var count int
+	err := db.QueryRow(fmt.Sprintf(
+		`SELECT COUNT(*) FROM history WHERE media_type = ? AND media_id = ? AND event IN (%s)`,
+		placeholders), args...).Scan(&count)
+	return count, err
 }
 
 // grabCutoff returns the history row id after which grabs should count toward
@@ -1435,11 +1460,13 @@ func (db *DB) DownloadedMovies() ([]Movie, error) {
 	return movies, rows.Err()
 }
 
-// DownloadedEpisodes returns all episodes with status 'downloaded', including series info.
+// DownloadedEpisodes returns all episodes with status 'downloaded', including
+// series title and per-episode monitoring/download-source state (used by
+// plex cleanup's flattened episode rows).
 func (db *DB) DownloadedEpisodes() ([]Episode, error) {
 	rows, err := db.Query(
 		`SELECT e.id, e.series_id, e.season, e.episode, e.title, e.air_date,
-		        e.status, e.quality, e.file_path, s.title
+		        e.status, e.quality, e.file_path, s.title, e.monitored, e.download_source
 		 FROM episodes e
 		 JOIN series s ON s.id = e.series_id
 		 WHERE e.status = 'downloaded'
@@ -1455,7 +1482,7 @@ func (db *DB) DownloadedEpisodes() ([]Episode, error) {
 		var ep Episode
 		if err := rows.Scan(&ep.ID, &ep.SeriesID, &ep.Season, &ep.Episode,
 			&ep.Title, &ep.AirDate, &ep.Status, &ep.Quality, &ep.FilePath,
-			&ep.SeriesTitle); err != nil {
+			&ep.SeriesTitle, &ep.Monitored, &ep.DownloadSource); err != nil {
 			return nil, err
 		}
 		episodes = append(episodes, ep)

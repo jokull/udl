@@ -147,6 +147,39 @@ func TestMediaStatusTransitionValidation(t *testing.T) {
 	}
 }
 
+// Shadow-status movies: wanted -> shadow (covered at add time) is allowed,
+// and shadow -> wanted is the explicit "own it locally" opt-in.
+func TestShadowTransitions(t *testing.T) {
+	db := mustOpen(t)
+
+	id, err := db.AddMovie(552, "tt0137525", "Shadow Test", 2001, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpdateMovieStatus(id, "shadow", "", ""); err != nil {
+		t.Fatalf("wanted->shadow should be allowed: %v", err)
+	}
+	m, err := db.GetMovie(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status != "shadow" {
+		t.Errorf("status = %q, want 'shadow'", m.Status)
+	}
+
+	if err := db.UpdateMovieStatus(id, "wanted", "", ""); err != nil {
+		t.Fatalf("shadow->wanted should be allowed: %v", err)
+	}
+	m, err = db.GetMovie(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status != "wanted" {
+		t.Errorf("status = %q, want 'wanted' after own", m.Status)
+	}
+}
+
 func TestAddAndListSeries(t *testing.T) {
 	db := mustOpen(t)
 
@@ -364,6 +397,104 @@ func TestAllEpisodeFilePaths(t *testing.T) {
 	}
 	if paths["/tv/test/s01e01.mkv"] != ep1.ID {
 		t.Errorf("expected id %d for ep1 path, got %d", ep1.ID, paths["/tv/test/s01e01.mkv"])
+	}
+}
+
+func TestHistoryEventCount(t *testing.T) {
+	db := mustOpen(t)
+	epID := addTestSeriesWithEpisode(t, db)
+
+	n, err := db.HistoryEventCount("episode", epID, "deleted", "cleaned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("HistoryEventCount before events = %d, want 0", n)
+	}
+
+	if err := db.AddHistory("episode", epID, "Test Series S01E01", "deleted", "manual", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddHistory("episode", epID, "Test Series S01E01", "grabbed", "Rel.1080p", "1080p"); err != nil {
+		t.Fatal(err)
+	}
+
+	n, err = db.HistoryEventCount("episode", epID, "deleted", "cleaned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("HistoryEventCount after delete = %d, want 1 (grabbed must not count)", n)
+	}
+
+	// Events on other media do not leak in.
+	movieID, _ := db.AddMovie(550, "tt0137523", "Fight Club", 1999, "", "")
+	if err := db.AddHistory("movie", movieID, "Fight Club", "deleted", "manual", ""); err != nil {
+		t.Fatal(err)
+	}
+	n, err = db.HistoryEventCount("episode", epID, "deleted", "cleaned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("HistoryEventCount after other-media event = %d, want 1", n)
+	}
+
+	// No events → 0, no error.
+	n, err = db.HistoryEventCount("movie", movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("HistoryEventCount no-events = %d, want 0", n)
+	}
+}
+
+func TestDownloadedEpisodesFields(t *testing.T) {
+	db := mustOpen(t)
+	sid, _ := db.AddSeries(9999, 5555, "tt9999999", "Test Series", 2023, "", "")
+	db.AddEpisode(sid, 1, 1, "Ep1", "2023-01-01")
+	db.AddEpisode(sid, 1, 2, "Ep2", "2023-01-08")
+	db.SetSeasonMonitored(sid, 1, false)
+
+	ep1, _ := db.FindEpisode(sid, 1, 1)
+	ep2, _ := db.FindEpisode(sid, 1, 2)
+	db.UpdateEpisodeStatus(ep1.ID, "downloaded", "WEBDL-1080p", "/tv/test/s01e01.mkv")
+	if _, err := db.EnqueueDownload("episode", ep2.ID, "url", "plex:friends", 500, "plex"); err != nil {
+		t.Fatal(err)
+	}
+	db.UpdateEpisodeStatus(ep2.ID, "downloaded", "WEBDL-1080p", "/tv/test/s01e02.mkv")
+
+	eps, err := db.DownloadedEpisodes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 2 {
+		t.Fatalf("DownloadedEpisodes = %d, want 2", len(eps))
+	}
+
+	var ep1Row, ep2Row *Episode
+	for i := range eps {
+		if eps[i].Episode == 1 {
+			ep1Row = &eps[i]
+		} else {
+			ep2Row = &eps[i]
+		}
+	}
+	if ep1Row == nil || ep2Row == nil {
+		t.Fatal("episode rows missing")
+	}
+	if ep1Row.SeriesTitle != "Test Series" {
+		t.Errorf("SeriesTitle = %q, want %q", ep1Row.SeriesTitle, "Test Series")
+	}
+	if ep1Row.Monitored {
+		t.Error("ep1 monitored = true, want false (season unmonitored)")
+	}
+	if ep1Row.DownloadSource.Valid {
+		t.Errorf("ep1 source = %q, want empty (usenet grab has no source set)", ep1Row.DownloadSource.String)
+	}
+	if !ep2Row.DownloadSource.Valid || ep2Row.DownloadSource.String != "plex" {
+		t.Errorf("ep2 source = %v, want plex", ep2Row.DownloadSource)
 	}
 }
 

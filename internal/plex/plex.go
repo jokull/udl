@@ -121,9 +121,11 @@ type LibraryItem struct {
 
 // WatchHistoryEntry represents a single watch event from Plex's history.
 type WatchHistoryEntry struct {
-	AccountID int
-	RatingKey string
-	ViewedAt  int64 // unix timestamp
+	AccountID  int
+	RatingKey  string
+	ViewedAt   int64 // unix timestamp
+	ViewOffset int64 // playback position at session end, ms (0 if unknown)
+	Duration   int64 // media duration, ms (0 if unknown)
 }
 
 // New creates a Plex client. The token is a Plex authentication token
@@ -908,9 +910,11 @@ func (c *Client) WatchHistory(srv Server, sectionID string) (map[string][]WatchH
 			MediaContainer struct {
 				Size     int `json:"size"`
 				Metadata []struct {
-					RatingKey string `json:"ratingKey"`
-					AccountID int    `json:"accountID"`
-					ViewedAt  int64  `json:"viewedAt"`
+					RatingKey  string `json:"ratingKey"`
+					AccountID  int    `json:"accountID"`
+					ViewedAt   int64  `json:"viewedAt"`
+					ViewOffset int64  `json:"viewOffset"`
+					Duration   int64  `json:"duration"`
 				} `json:"Metadata"`
 			} `json:"MediaContainer"`
 		}
@@ -922,9 +926,11 @@ func (c *Client) WatchHistory(srv Server, sectionID string) (map[string][]WatchH
 
 		for _, m := range page.MediaContainer.Metadata {
 			entry := WatchHistoryEntry{
-				AccountID: m.AccountID,
-				RatingKey: m.RatingKey,
-				ViewedAt:  m.ViewedAt,
+				AccountID:  m.AccountID,
+				RatingKey:  m.RatingKey,
+				ViewedAt:   m.ViewedAt,
+				ViewOffset: m.ViewOffset,
+				Duration:   m.Duration,
 			}
 			result[m.RatingKey] = append(result[m.RatingKey], entry)
 		}

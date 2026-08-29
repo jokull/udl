@@ -37,7 +37,16 @@ type BlockCache struct {
 	writes   int
 
 	hits, misses, bytesServed atomic.Int64
+	freeWarned                atomic.Bool
 }
+
+// statfsFn reports free bytes on the volume containing path. Swapped in
+// tests; default is the platform Statfs wrapper.
+var statfsFn = statfsFreeBytes
+
+// minFreeBytes is the volume free-space floor below which new blocks are not
+// written; the cache degrades to fetch-every-read instead of filling the disk.
+const minFreeBytes = 1 << 30 // 1 GiB
 
 // Stats returns cumulative cache hits, block fetches, and bytes served.
 func (c *BlockCache) Stats() (hits, misses, bytes int64) {
@@ -177,10 +186,17 @@ func (c *BlockCache) fetch(ctx context.Context, url string, off, size int64) ([]
 }
 
 // store writes a block atomically (temp + rename); cache write failures are
-// non-fatal.
+// non-fatal. New blocks are refused when the volume has less than minFreeBytes
+// free — the cache degrades to fetch-every-read instead of filling the disk.
 func (c *BlockCache) store(p string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
+	}
+	if free, err := statfsFn(filepath.Dir(p)); err == nil && free < minFreeBytes {
+		if c.freeWarned.CompareAndSwap(false, true) {
+			fmt.Fprintf(os.Stderr, "shadowfs: refusing block cache write — volume free space below %d MiB (free=%d MiB); serving fetch-every-read\n", minFreeBytes>>20, free>>20)
+		}
+		return nil
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
 	if err != nil {

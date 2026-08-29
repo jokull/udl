@@ -236,13 +236,7 @@ Queue shows `movie:<tmdb-id>` and `episode:<tmdb-id>:S01E02` — matching the re
 udl daemon                   # start daemon (foreground)
 udl status                   # check daemon status
 
-# Movies — TMDB ID is the only identifier you need
-udl movie search "Title"     # search TMDB, shows TMDB IDs
-udl movie add <tmdb-id>      # add by TMDB ID
-udl movie list               # list movies (shows TMDB IDs)
-udl movie releases <tmdb-id> # search indexers for releases
-udl movie grab <tmdb-id> <#> # grab release # for a movie
-udl movie remove <tmdb-id>   # remove from monitoring
+udl movie own <tmdb-id>      # download locally past shadow status
 
 # TV — same pattern, all by TMDB ID
 udl tv search "Title"        # search TMDB for series
@@ -284,12 +278,13 @@ udl library prune                     # delete files for unmonitored episodes
 udl library prune-incomplete          # find stale download dirs (dry-run)
 
 udl plex libraries           # map all libraries: type, download access, audio languages
-udl plex cleanup             # show unwatched old media (dry-run)
-udl plex cleanup --execute   # delete unwatched media older than 90 days
+udl plex cleanup             # delete candidates: unwatched, older than 90 days (read-only)
 udl plex cleanup --days 30   # shorter age threshold
-udl plex cleanup             # show unwatched old media (dry-run)
-udl plex cleanup --execute   # delete unwatched media older than 90 days
-udl plex cleanup --days 30   # shorter age threshold
+udl plex cleanup --verbose   # also show kept items with reasons
+
+# Shadows — virtual NFS libraries of friends' Plex media
+udl shadow list              # list shadows (dubbed, dubbed-tv, movies)
+udl shadow covered <tmdb-id> # which shadows already provide a movie
 ```
 
 ## Web UI
@@ -308,7 +303,22 @@ The dashboard shows library stats, active downloads with live progress (via SSE)
 
 Pages use htmx for dynamic updates — the queue refreshes automatically via server-sent events.
 
-## Plex Cleanup
+Read-only delete-candidate report for AI handoff. Queries your owned Plex server's watch history and lists items never watched, added more than N days ago, with per-row watch count, last-watched, size, and safety hints (shadow coverage, rarity, holiday viewing, ...). Nothing is ever deleted by this command — `udl tv delete` / `udl movie delete` are the only deleters.
+
+```bash
+udl plex cleanup                 # all candidates (read-only)
+udl plex cleanup --days 30       # items older than 30 days (default: 90)
+udl plex cleanup --verbose       # also show kept items with reasons
+```
+
+Output:
+```
+ACTION  TYPE    TITLE                QUALITY       AGE   SIZE   WATCH COUNT  LAST WATCHED  WATCHED BY  HINTS
+delete  movie   Late Night (2024)    WEBDL-1080p   120d  4.2 GB  0             -             -           -
+delete  episode Bluey S03E12         1080p          140d  900 MB  0             -             -           shadow-covered:dubbed
+...
+12 delete candidates (169 GB reclaimable), 340 kept — read-only report for AI handoff
+```
 
 Reclaim disk space by deleting media that was never watched on your Plex server. Queries your owned Plex server's watch history and identifies items added more than N days ago with zero plays.
 

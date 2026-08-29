@@ -25,6 +25,7 @@ import (
 	"github.com/jokull/udl/internal/postprocess"
 	"github.com/jokull/udl/internal/quality"
 	"github.com/jokull/udl/internal/seerr"
+	"github.com/jokull/udl/internal/shadow"
 	"github.com/jokull/udl/internal/tmdb"
 	"github.com/jokull/udl/internal/web"
 )
@@ -106,6 +107,23 @@ type AddMovieReply struct {
 	Grabbed       bool   // true if a release was immediately enqueued
 	AlreadyExists bool   // true if the movie was already in the database
 	Status        string // current status when AlreadyExists is true
+	ShadowNames   string // comma-separated shadows covering the movie, if any
+	ShadowStatus  bool   // added as status "shadow" (available via mount, not downloaded)
+}
+
+// OwnMovieArgs contains arguments for the OwnMovie RPC method: explicitly
+// download a movie past its shadow status.
+type OwnMovieArgs struct {
+	TMDBID int
+}
+
+// OwnMovieReply contains the reply for the OwnMovie RPC method.
+type OwnMovieReply struct {
+	Title   string
+	Year    int
+	TmdbID  int
+	Grabbed bool // true if a release was immediately enqueued
+	Status  string
 }
 
 // SearchMovieArgs contains arguments for the SearchMovie (indexer search) RPC method.
@@ -677,7 +695,9 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 		reply.AlreadyExists = true
 		reply.Status = existing.Status
 
-		// Re-search if wanted or failed.
+		// Re-search if wanted or failed. Shadow-status movies are available
+		// via the mount and never re-searched; 'udl movie own' opts into a
+		// local download.
 		if (existing.Status == "wanted" || existing.Status == "failed") && len(s.indexers) > 0 {
 			if existing.Status == "failed" {
 				s.db.ResetMediaForRetry("movie", existing.ID)
@@ -688,6 +708,13 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 			}
 			reply.Grabbed = grabbed
 		}
+		imdb := ""
+		if existing.ImdbID.Valid {
+			imdb = existing.ImdbID.String
+		}
+		if cov, covErr := shadow.Covered(existing.TmdbID, imdb); covErr == nil && len(cov) > 0 {
+			reply.ShadowNames = shadow.FormatCoverage(cov)
+		}
 		return nil
 	}
 
@@ -695,6 +722,24 @@ func (s *Service) AddMovie(args *AddMovieArgs, reply *AddMovieReply) error {
 	reply.Year = movie.Year
 	reply.TmdbID = movie.TMDBID
 	s.log.Info("added movie", "title", movie.Title, "year", movie.Year, "tmdb_id", movie.TMDBID)
+
+	// A movie the 'movies' shadow already carries becomes status "shadow":
+	// available via the mount, nothing to download. The explicit 'udl movie
+	// own' command is the only way past it. Coverage from other shadows
+	// (e.g. an Icelandic dub in 'dubbed') is reported but does not suppress
+	// the download — a different version is not the same movie.
+	cov, covErr := shadow.Covered(movie.TMDBID, movie.IMDBID)
+	if covErr == nil && len(cov) > 0 {
+		reply.ShadowNames = shadow.FormatCoverage(cov)
+		if shadow.CoveredBy("movies", movie.TMDBID, movie.IMDBID) {
+			if err := s.db.UpdateMovieStatus(id, "shadow", "", ""); err != nil {
+				s.log.Error("mark shadow-covered movie", "title", movie.Title, "error", err)
+			} else {
+				reply.ShadowStatus = true
+				return nil
+			}
+		}
+	}
 
 	// Immediately search indexers for this movie.
 	if len(s.indexers) > 0 {
@@ -720,6 +765,61 @@ func (s *Service) ListMovies(args *Empty, reply *MovieListReply) error {
 		return err
 	}
 	reply.Movies = movies
+	return nil
+}
+
+// OwnMovie explicitly downloads a movie past its shadow status: shadow ->
+// wanted, then an immediate indexer search. The default for a monitored and
+// shadow-covered movie is to NOT download; this is the manual opt-in.
+func (s *Service) OwnMovie(args *OwnMovieArgs, reply *OwnMovieReply) error {
+	if args.TMDBID == 0 {
+		return fmt.Errorf("OwnMovie: TMDB ID is required")
+	}
+	movie, err := s.db.FindMovieByTmdbID(args.TMDBID)
+	if err != nil {
+		return fmt.Errorf("OwnMovie: %w", err)
+	}
+	if movie == nil {
+		return fmt.Errorf("OwnMovie: movie %d is not tracked — add it first ('udl movie add %d')", args.TMDBID, args.TMDBID)
+	}
+	reply.Title = movie.Title
+	reply.Year = movie.Year
+	reply.TmdbID = movie.TmdbID
+	reply.Status = movie.Status
+
+	switch movie.Status {
+	case "shadow":
+		// Opt in: shadow -> wanted, then search immediately.
+		if err := s.db.UpdateMovieStatus(movie.ID, "wanted", movie.Quality.String, ""); err != nil {
+			return fmt.Errorf("OwnMovie: %w", err)
+		}
+		reply.Status = "wanted"
+		s.log.Info("own movie", "title", movie.Title, "tmdb_id", movie.TmdbID)
+		if len(s.indexers) > 0 {
+			grabbed, searchErr := s.SearchAndGrabMovie(movie)
+			if searchErr != nil {
+				s.log.Error("own-movie search failed", "title", movie.Title, "error", searchErr)
+			}
+			reply.Grabbed = grabbed
+		}
+	case "downloaded":
+		reply.Status = "downloaded"
+	case "wanted", "failed":
+		// Already downloading or retryable; re-search for failed.
+		if movie.Status == "failed" {
+			if err := s.db.ResetMediaForRetry("movie", movie.ID); err != nil {
+				return fmt.Errorf("OwnMovie: %w", err)
+			}
+			reply.Status = "wanted"
+		}
+		if len(s.indexers) > 0 {
+			grabbed, searchErr := s.SearchAndGrabMovie(movie)
+			if searchErr != nil {
+				s.log.Error("own-movie re-search failed", "title", movie.Title, "error", searchErr)
+			}
+			reply.Grabbed = grabbed
+		}
+	}
 	return nil
 }
 
@@ -1605,8 +1705,7 @@ type PlexCheckReply struct {
 
 // PlexCleanupArgs contains arguments for the PlexCleanup RPC method.
 type PlexCleanupArgs struct {
-	Days    int  // minimum age in days since added to Plex (default 90)
-	Execute bool // false = dry-run
+	Days int // minimum age in days since added to Plex (default 90)
 }
 
 // PlexCleanupItem describes a single media item considered for cleanup.
@@ -1615,25 +1714,25 @@ type PlexCleanupItem struct {
 	Title         string
 	Year          int
 	Season        int // season number (0 for movies)
-	EpisodeCount  int // number of episodes in this season group
+	Episode       int // episode number (flattened TV rows)
+	EpisodeCount  int // episode count (1 for flattened TV rows)
+	WatchCount    int // number of times watched (Plex viewCount)
 	Quality       string
 	AddedDays     int      // days since added to Plex
 	SizeBytes     int64    // total size of files to delete
 	Action        string   // "delete" or "keep"
 	Reason        string   // why kept: "watched", "too-recent", "not-in-plex"
-	Deleted       bool     // true if actually deleted (when Execute=true)
 	LastWatchedAt int64    // unix timestamp of most recent watch (0 if never)
 	WatchedBy     []string // Plex usernames who watched
+	Hints         []string // AI handoff hints: shadow coverage, rarity, holiday, ...
 }
 
 // PlexCleanupReply contains the reply for the PlexCleanup RPC method.
 type PlexCleanupReply struct {
-	Items        []PlexCleanupItem
-	TotalDelete  int   // count of items to delete
-	TotalKeep    int   // count of items kept
-	TotalSize    int64 // total bytes to reclaim
-	DeletedCount int   // actually deleted (Execute mode)
-	DeletedSize  int64 // bytes actually reclaimed
+	Items       []PlexCleanupItem
+	TotalDelete int   // count of items to delete
+	TotalKeep   int   // count of items kept
+	TotalSize   int64 // total bytes to reclaim
 }
 
 // --- TV delete / library prune types ---
@@ -2057,10 +2156,11 @@ func (s *Service) plexSearchAllServers(servers []plex.Server, search func(plex.S
 	return results
 }
 
-// PlexCleanup identifies unwatched media older than N days and optionally deletes it.
-// Queries the user's owned Plex server for watch history, cross-references with the
-// UDL database, and removes files that have never been watched.
-// TV series are grouped at the season level for granular cleanup.
+// PlexCleanup identifies unwatched media older than N days. Read-only: it
+// queries the user's owned Plex server for watch history, cross-references
+// with the UDL database, and returns per-item candidate rows (movies and
+// flattened TV episodes) with watch data and AI handoff hints. Nothing is
+// ever deleted by this method.
 func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) error {
 	if s.plex == nil {
 		return fmt.Errorf("PlexCleanup: Plex integration not configured (set plex.token or PLEX_TOKEN)")
@@ -2107,6 +2207,20 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 	watchedByMap := make(map[string]map[string]bool) // ratingKey → set of names
 	lastWatchedMap := make(map[string]int64)         // ratingKey → latest viewedAt
 
+	// Playback depth per ratingKey: how often it was started, and the deepest
+	// viewOffset/duration fraction seen. Used for the "stalled" hint.
+	startsByKey := make(map[string]int)
+	maxFracByKey := make(map[string]float64)
+	fracSeenByKey := make(map[string]bool)
+
+	// Shadow coverage: tmdb:// and imdb:// GUIDs present in any shadow
+	// manifest, mapped to the shadow names carrying them.
+	var tmdbCovered map[int][]string
+	var imdbCovered map[string][]string
+	if mdir, err := shadow.ManifestDir(); err == nil {
+		tmdbCovered, imdbCovered, _ = shadow.CoveredSet(mdir)
+	}
+
 	for _, sec := range sections {
 		// Fetch watch history for this section.
 		history, err := s.plex.WatchHistory(*ownedSrv, sec.Key)
@@ -2123,6 +2237,13 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 					}
 					if name, ok := accountNames[e.AccountID]; ok {
 						watchedByMap[rk][name] = true
+					}
+					startsByKey[rk]++
+					if e.Duration > 0 {
+						fracSeenByKey[rk] = true
+						if frac := float64(e.ViewOffset) / float64(e.Duration); frac > maxFracByKey[rk] {
+							maxFracByKey[rk] = frac
+						}
 					}
 				}
 			}
@@ -2212,11 +2333,21 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 			continue
 		}
 
-		// Enrich with watch history data.
-		if lw, ok := lastWatchedMap[pf.ratingKey]; ok {
-			item.LastWatchedAt = lw
+		// AI handoff hints: computed deterministically from DB, shadow
+		// manifests, and Plex playback depth.
+		source := ""
+		if movie.DownloadSource.Valid && movie.DownloadSource.String != "" && movie.DownloadSource.String != "usenet" {
+			source = movie.DownloadSource.String
 		}
-		item.WatchedBy = watcherNames(pf.ratingKey)
+		item.Hints = cleanupHints(cleanupHintInput{
+			Title:          movie.Title,
+			CoveredShadows: coveredNames(tmdbCovered, imdbCovered, movie.TmdbID, movie.ImdbID.String),
+			BlocklistCount: blocklistCountFor(s.db, "movie", movie.ID),
+			Regrabbed:      regrabbed(s.db, "movie", movie.ID),
+			Stalled:        startsByKey[pf.ratingKey] >= 2 && fracSeenByKey[pf.ratingKey] && maxFracByKey[pf.ratingKey] < 0.5,
+			OldGrab:        oldGrab(movie.AddedAt.String),
+			Source:         source,
+		})
 
 		addedTime := time.Unix(pf.addedAt, 0)
 		item.AddedDays = int(time.Since(addedTime).Hours() / 24)
@@ -2236,109 +2367,58 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 			item.Action = "delete"
 			reply.TotalDelete++
 			reply.TotalSize += item.SizeBytes
-
-			if args.Execute {
-				if err := os.Remove(movie.FilePath.String); err != nil {
-					s.log.Error("plex cleanup: delete movie file", "path", movie.FilePath.String, "error", err)
-				} else {
-					item.Deleted = true
-					reply.DeletedCount++
-					reply.DeletedSize += item.SizeBytes
-					s.db.UpdateMovieStatus(movie.ID, "wanted", "", "")
-					s.db.AddHistory("movie", movie.ID,
-						fmt.Sprintf("%s (%d)", movie.Title, movie.Year),
-						"cleaned", "plex-cleanup", "")
-					s.log.Info("plex cleanup: deleted movie", "title", movie.Title, "year", movie.Year)
-				}
-			}
 		}
 		reply.Items = append(reply.Items, item)
 	}
 
-	// --- Process TV seasons ---
-	// Group downloaded episodes by series+season for granular cleanup.
+	// --- Process TV episodes (flattened: one row per episode) ---
 	downloadedEps, err := s.db.DownloadedEpisodes()
 	if err != nil {
 		return fmt.Errorf("PlexCleanup: list episodes: %w", err)
 	}
 
-	type seasonKey struct {
-		seriesID int64
-		season   int
+	// Series metadata cache (year/tmdb/imdb for hint and display purposes).
+	type seriesMeta struct {
+		year   int
+		tmdbID int
+		imdbID string
 	}
-	type seasonGroup struct {
-		seriesID    int64
-		title       string
-		year        int
-		season      int
-		episodes    []database.Episode
-		anyWatched  bool
-		latestWatch int64
-		watchedBy   map[string]bool
-		earliestAdd int64
-		totalSize   int64
+	seriesCache := make(map[int64]seriesMeta)
+	seriesMetaFor := func(seriesID int64) seriesMeta {
+		if m, ok := seriesCache[seriesID]; ok {
+			return m
+		}
+		series, err := s.db.GetSeries(seriesID)
+		if err != nil {
+			seriesCache[seriesID] = seriesMeta{}
+			return seriesMeta{}
+		}
+		m := seriesMeta{
+			year:   series.Year,
+			tmdbID: series.TmdbID,
+			imdbID: series.ImdbID.String,
+		}
+		seriesCache[seriesID] = m
+		return m
 	}
-	seasonMap := make(map[seasonKey]*seasonGroup)
 
 	for _, ep := range downloadedEps {
-		key := seasonKey{seriesID: ep.SeriesID, season: ep.Season}
-		sg, ok := seasonMap[key]
-		if !ok {
-			series, err := s.db.GetSeries(ep.SeriesID)
-			if err != nil {
-				continue
-			}
-			sg = &seasonGroup{
-				seriesID:  ep.SeriesID,
-				title:     series.Title,
-				year:      series.Year,
-				season:    ep.Season,
-				watchedBy: make(map[string]bool),
-			}
-			seasonMap[key] = sg
+		if !ep.FilePath.Valid || ep.FilePath.String == "" {
+			continue
 		}
-		sg.episodes = append(sg.episodes, ep)
-
-		if ep.FilePath.Valid && ep.FilePath.String != "" {
-			if pf, ok := plexFiles[ep.FilePath.String]; ok {
-				if pf.viewCount > 0 || lastWatchedMap[pf.ratingKey] > 0 {
-					sg.anyWatched = true
-				}
-				// Enrich from watch history.
-				if lw, ok := lastWatchedMap[pf.ratingKey]; ok && lw > sg.latestWatch {
-					sg.latestWatch = lw
-				}
-				for _, name := range watcherNames(pf.ratingKey) {
-					sg.watchedBy[name] = true
-				}
-				if sg.earliestAdd == 0 || pf.addedAt < sg.earliestAdd {
-					sg.earliestAdd = pf.addedAt
-				}
-			}
-			if fi, err := os.Stat(ep.FilePath.String); err == nil {
-				sg.totalSize += fi.Size()
-			}
-		}
-	}
-
-	for _, sg := range seasonMap {
-		var watchedBySlice []string
-		for name := range sg.watchedBy {
-			watchedBySlice = append(watchedBySlice, name)
-		}
+		meta := seriesMetaFor(ep.SeriesID)
 
 		item := PlexCleanupItem{
-			MediaType:     "season",
-			Title:         sg.title,
-			Year:          sg.year,
-			Season:        sg.season,
-			EpisodeCount:  len(sg.episodes),
-			SizeBytes:     sg.totalSize,
-			LastWatchedAt: sg.latestWatch,
-			WatchedBy:     watchedBySlice,
+			MediaType: "episode",
+			Title:     ep.SeriesTitle,
+			Year:      meta.year,
+			Season:    ep.Season,
+			Episode:   ep.Episode,
+			Quality:   ep.Quality.String,
 		}
 
-		if sg.earliestAdd == 0 {
+		pf, inPlex := plexFiles[ep.FilePath.String]
+		if !inPlex || pf == nil {
 			item.Action = "keep"
 			item.Reason = "not-in-plex"
 			reply.TotalKeep++
@@ -2346,10 +2426,32 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 			continue
 		}
 
-		addedTime := time.Unix(sg.earliestAdd, 0)
+		// Per-episode watch data.
+		item.WatchCount = pf.viewCount
+		if lw, ok := lastWatchedMap[pf.ratingKey]; ok {
+			item.LastWatchedAt = lw
+		}
+		item.WatchedBy = watcherNames(pf.ratingKey)
+
+		addedTime := time.Unix(pf.addedAt, 0)
 		item.AddedDays = int(time.Since(addedTime).Hours() / 24)
 
-		if sg.anyWatched {
+		// AI handoff hints for this episode.
+		source := ""
+		if ep.DownloadSource.Valid && ep.DownloadSource.String != "" && ep.DownloadSource.String != "usenet" {
+			source = ep.DownloadSource.String
+		}
+		item.Hints = cleanupHints(cleanupHintInput{
+			Title:          ep.SeriesTitle,
+			CoveredShadows: coveredNames(tmdbCovered, imdbCovered, meta.tmdbID, meta.imdbID),
+			BlocklistCount: blocklistCountFor(s.db, "episode", ep.ID),
+			Regrabbed:      regrabbed(s.db, "episode", ep.ID),
+			Unmonitored:    !ep.Monitored,
+			Stalled:        startsByKey[pf.ratingKey] >= 2 && fracSeenByKey[pf.ratingKey] && maxFracByKey[pf.ratingKey] < 0.5,
+			Source:         source,
+		})
+
+		if pf.viewCount > 0 || lastWatchedMap[pf.ratingKey] > 0 {
 			item.Action = "keep"
 			item.Reason = "watched"
 			reply.TotalKeep++
@@ -2360,39 +2462,12 @@ func (s *Service) PlexCleanup(args *PlexCleanupArgs, reply *PlexCleanupReply) er
 		} else {
 			item.Action = "delete"
 			reply.TotalDelete++
-			reply.TotalSize += sg.totalSize
-
-			if args.Execute {
-				// Delete the season folder (not the entire series).
-				seasonFolder := filepath.Join(
-					s.cfg.Library.TV,
-					fmt.Sprintf("%s (%d)", sg.title, sg.year),
-					fmt.Sprintf("Season %02d", sg.season),
-				)
-				if err := os.RemoveAll(seasonFolder); err != nil {
-					s.log.Error("plex cleanup: delete season folder", "path", seasonFolder, "error", err)
-				} else {
-					item.Deleted = true
-					reply.DeletedCount++
-					reply.DeletedSize += sg.totalSize
-					// Reset only this season's episodes to wanted.
-					for _, ep := range sg.episodes {
-						s.db.UpdateEpisodeStatus(ep.ID, "wanted", "", "")
-					}
-					s.db.AddHistory("series", sg.seriesID,
-						fmt.Sprintf("%s (%d) S%02d", sg.title, sg.year, sg.season),
-						"cleaned", "plex-cleanup", "")
-					s.log.Info("plex cleanup: deleted season", "title", sg.title, "year", sg.year, "season", sg.season)
-				}
+			if fi, err := os.Stat(ep.FilePath.String); err == nil {
+				item.SizeBytes = fi.Size()
 			}
+			reply.TotalSize += item.SizeBytes
 		}
 		reply.Items = append(reply.Items, item)
-	}
-
-	// Clean up empty directories after deletions.
-	if args.Execute && reply.DeletedCount > 0 {
-		removeEmptyDirs(s.cfg.Library.Movies)
-		removeEmptyDirs(s.cfg.Library.TV)
 	}
 
 	return nil

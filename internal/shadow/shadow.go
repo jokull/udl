@@ -64,6 +64,15 @@ func ManifestPath(name string) (string, error) {
 	return filepath.Join(dir, "shadow", name+".json"), nil
 }
 
+// ManifestDir returns the directory holding all built shadow manifests.
+func ManifestDir() (string, error) {
+	dir, err := config.DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "shadow"), nil
+}
+
 // LoadManifest reads a previously built manifest for a shadow.
 func LoadManifest(name string) (*Manifest, error) {
 	path, err := ManifestPath(name)
