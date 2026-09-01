@@ -95,6 +95,9 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 	indexers := make([]*newznab.Client, len(cfg.Indexers))
 	for i, idx := range cfg.Indexers {
 		indexers[i] = newznab.New(idx.Name, idx.URL, idx.APIKey)
+		if len(idx.Headers) > 0 {
+			indexers[i].SetHeaders(idx.Headers)
+		}
 	}
 
 	return &Downloader{

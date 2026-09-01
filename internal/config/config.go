@@ -90,6 +90,10 @@ type Indexer struct {
 	Name   string `toml:"name"`
 	URL    string `toml:"url"`
 	APIKey string `toml:"apikey"`
+	// Headers are extra HTTP headers sent on every request to this indexer
+	// (e.g. User-Agent overrides, Referer, cookies). Keys are case-insensitive
+	// and override the default User-Agent when present.
+	Headers map[string]string `toml:"headers"`
 }
 
 // SeerrConfig holds optional Seerr (Overseerr/Jellyseerr) integration settings.

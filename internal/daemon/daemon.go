@@ -2719,6 +2719,9 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 	indexers := make([]*newznab.Client, len(cfg.Indexers))
 	for i, idx := range cfg.Indexers {
 		indexers[i] = newznab.New(idx.Name, idx.URL, idx.APIKey)
+		if len(idx.Headers) > 0 {
+			indexers[i].SetHeaders(idx.Headers)
+		}
 	}
 
 	// Initialize Plex client if a token is available.

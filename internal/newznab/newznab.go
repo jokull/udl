@@ -20,12 +20,18 @@ import (
 // maxResponseSize limits indexer response bodies to 10MB.
 const maxResponseSize = 10 * 1024 * 1024
 
+// defaultUserAgent is sent on every indexer request unless overridden via
+// per-indexer Headers. Some indexers (e.g. NZBFinder) reject Go's default
+// "Go-http-client/1.1" user agent with HTTP 403.
+const defaultUserAgent = "udl/1.0 (+https://github.com/jokull/udl)"
+
 // Client talks to a single Newznab-compatible indexer.
 type Client struct {
-	Name   string
-	URL    string // base URL like "https://api.nzbgeek.info"
-	APIKey string
-	http   *http.Client
+	Name    string
+	URL     string // base URL like "https://api.nzbgeek.info"
+	APIKey  string
+	Headers map[string]string // extra HTTP headers sent on every request
+	http    *http.Client
 }
 
 // SanitizeURL removes the apikey parameter from a URL for safe logging.
@@ -45,10 +51,19 @@ func SanitizeURL(rawURL string) string {
 // New creates a new Newznab client.
 func New(name, baseURL, apiKey string) *Client {
 	return &Client{
-		Name:   name,
-		URL:    strings.TrimRight(baseURL, "/"),
-		APIKey: apiKey,
-		http:   &http.Client{Timeout: 30 * time.Second},
+		Name:    name,
+		URL:     strings.TrimRight(baseURL, "/"),
+		APIKey:  apiKey,
+		Headers: map[string]string{"User-Agent": defaultUserAgent},
+		http:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// SetHeaders merges extra HTTP headers onto the client, overriding the
+// default User-Agent when a "User-Agent" key is present.
+func (c *Client) SetHeaders(h map[string]string) {
+	for k, v := range h {
+		c.Headers[k] = v
 	}
 }
 
@@ -252,6 +267,9 @@ func (c *Client) doGet(ctx context.Context, client *http.Client, reqURL string) 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, WrapInvalid("build_request", fmt.Errorf("invalid URL %q: %w", SanitizeURL(reqURL), err))
+	}
+	for k, v := range c.Headers {
+		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
