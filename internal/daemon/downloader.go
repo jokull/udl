@@ -3,12 +3,16 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +29,7 @@ import (
 	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/postprocess"
 	"github.com/jokull/udl/internal/quality"
+	"github.com/jokull/udl/internal/rangefetch"
 )
 
 // DownloadEngine abstracts the NNTP download engine for testing.
@@ -62,6 +67,15 @@ type Downloader struct {
 	// every 30s including 'downloading' ones; without this guard a pool of
 	// workers could process the same item twice concurrently.
 	inFlight sync.Map
+	// plexFetch transfers Plex friend media with validated, resumable range
+	// requests (see internal/rangefetch).
+	plexFetch *rangefetch.Fetcher
+	// plexMu guards plexRetry, which tracks interruptions of in-progress Plex
+	// downloads so a flaky source backs off instead of restarting from zero.
+	plexMu    sync.Mutex
+	plexRetry map[string]*plexRetryState
+	// lastAttemptPrune throttles server_attempts pruning in the watchdog.
+	lastAttemptPrune time.Time
 }
 
 // Pause pauses the download queue processing.
@@ -109,6 +123,8 @@ func NewDownloader(svc *Service, log *slog.Logger) *Downloader {
 		stop:            make(chan struct{}),
 		ppRetryAfter:    make(map[string]time.Time),
 		downloadWorkers: cfg.Daemon.DownloadWorkers,
+		plexFetch:       newPlexFetcher(),
+		plexRetry:       make(map[string]*plexRetryState),
 	}
 }
 
@@ -123,6 +139,8 @@ func NewDownloaderWithEngine(svc *Service, engine DownloadEngine) *Downloader {
 		stop:            make(chan struct{}),
 		ppRetryAfter:    make(map[string]time.Time),
 		downloadWorkers: 4,
+		plexFetch:       newPlexFetcher(),
+		plexRetry:       make(map[string]*plexRetryState),
 	}
 }
 
@@ -237,6 +255,16 @@ func (d *Downloader) watchdog() {
 		d.svc.log.Warn("watchdog: reset stuck downloads", "count", n)
 	}
 
+	// Keep the reputation evidence bounded without hiding recent behaviour.
+	if d.lastAttemptPrune.IsZero() || time.Since(d.lastAttemptPrune) > 6*time.Hour {
+		d.lastAttemptPrune = time.Now()
+		if n, err := d.svc.db.PruneServerAttempts(90 * 24 * time.Hour); err != nil {
+			d.svc.log.Warn("watchdog: prune server attempts failed", "error", err)
+		} else if n > 0 {
+			d.svc.log.Info("watchdog: pruned server attempts", "rows", n)
+		}
+	}
+
 	pending, err := d.svc.db.PendingMedia()
 	if err != nil {
 		d.svc.log.Error("watchdog: query pending", "error", err)
@@ -276,6 +304,12 @@ func (d *Downloader) processItem(ctx context.Context, item database.QueueItem) {
 		if t, ok := d.ppRetryAfter[key]; ok && time.Now().Before(t) {
 			return
 		}
+	}
+
+	// A Plex download interrupted mid-transfer waits out its backoff before
+	// resuming; the watchdog re-enqueues it every 30s in the meantime.
+	if item.Source.Valid && item.Source.String == "plex" && d.plexBackoffActive(item) {
+		return
 	}
 
 	d.svc.log.Info("processing download", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "status", item.Status)
@@ -380,6 +414,12 @@ func (d *Downloader) processDownload(ctx context.Context, item database.QueueIte
 		item.Status = currentStatus
 	default:
 		return // no longer active or moved to post_processing
+	}
+
+	// A Plex download interrupted mid-transfer waits out its backoff before
+	// resuming; the watchdog re-enqueues it every 30s in the meantime.
+	if item.Source.Valid && item.Source.String == "plex" && d.plexBackoffActive(item) {
+		return
 	}
 
 	d.svc.log.Info("download worker: processing", "category", item.Category, "media_id", item.MediaID, "title", item.Title, "status", item.Status)
@@ -618,8 +658,152 @@ func checkDiskSpace(path string, requiredBytes int64, multiplier int) error {
 	return nil
 }
 
+// newPlexFetcher builds the transport used for Plex friend downloads.
+//
+// The retry budget is sized to the failure actually observed in production:
+// Stradivarius truncates most responses around 704 KiB, so a 2 MiB block
+// typically needs three or four requests. Allowing more attempts per block
+// than the default lets a block complete in one Run instead of leaving a
+// partial block for the next (30s-backoff) item attempt.
+func newPlexFetcher() *rangefetch.Fetcher {
+	f := rangefetch.New(&http.Client{Timeout: 10 * time.Minute})
+	f.Retry = rangefetch.RetryPolicy{
+		Attempts: 6,
+		Base:     500 * time.Millisecond,
+		Max:      15 * time.Second,
+	}
+	return f
+}
+
+// Plex download tuning.
+const (
+	// plexBlockSize is the verified-transfer granularity for Plex downloads; it
+	// matches the shadow cache so both share one transport.
+	plexBlockSize = rangefetch.DefaultBlockSize
+	// Consecutive interruptions of one download back off exponentially. A
+	// source that keeps closing the connection early is retried, but not
+	// forever: after maxPlexRetries without any new bytes the partial is
+	// discarded and the item fails so the scheduler can try another source.
+	plexRetryBase  = 30 * time.Second
+	plexRetryMax   = 30 * time.Minute
+	maxPlexRetries = 8
+)
+
+// plexRetryState tracks interruptions of one Plex download across attempts.
+type plexRetryState struct {
+	attempts int
+	best     int64     // most verified bytes seen across attempts
+	next     time.Time // earliest time to try again
+}
+
+func plexQueueKey(item database.QueueItem) string {
+	return item.Category + ":" + strconv.FormatInt(item.MediaID, 10)
+}
+
+// plexDownloadDir is the incomplete directory for a Plex download. It is
+// distinct from downloadDir() (Usenet) because the two pipelines never share
+// files.
+func (d *Downloader) plexDownloadDir(item database.QueueItem) string {
+	return filepath.Join(d.svc.cfg.Paths.Incomplete, fmt.Sprintf("plex-%s-%d", item.Category, item.MediaID))
+}
+
+// isPlexSource reports whether a queue item came from a Plex friend rather
+// than Usenet.
+func isPlexSource(item database.QueueItem) bool {
+	return item.Source.Valid && item.Source.String == "plex"
+}
+
+// plexServerName extracts the friend's server name from a Plex queue item.
+// The downloader carries it as the "nzb name" (e.g. "plex:Vader") because a
+// Plex download has no release title.
+func plexServerName(item database.QueueItem) string {
+	if !item.NzbName.Valid {
+		return ""
+	}
+	return strings.TrimPrefix(item.NzbName.String, "plex:")
+}
+
+// classifyPlexFailure decides whether a failure is the server's fault. Only
+// FailureTransport counts against a server's reputation — a friend hosting a
+// file that will not post-process, or one whose sharing is misconfigured, must
+// not be recorded as flaky.
+func classifyPlexFailure(err error) string {
+	if err == nil {
+		return ""
+	}
+	var he *rangefetch.HTTPError
+	if errors.As(err, &he) {
+		switch he.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return database.FailurePermission
+		case http.StatusNotFound, http.StatusGone:
+			return database.FailureMissing
+		}
+	}
+	switch {
+	case errors.Is(err, rangefetch.ErrResourceChanged),
+		errors.Is(err, rangefetch.ErrRangeBeyondEOF):
+		return database.FailureMissing
+	case errors.Is(err, rangefetch.ErrSizeMismatch):
+		return database.FailureContent
+	default:
+		return database.FailureTransport
+	}
+}
+
+// isDBClosedErr reports a write that failed only because the database was
+// already closed during shutdown. Such writes are best-effort: an interrupted
+// download's resume sidecar is on disk, and startup resets anything left in
+// 'downloading' back to 'queued', so this is not worth an operator's attention.
+func isDBClosedErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, sql.ErrConnDone) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "database is closed")
+}
+
+// recordPlexAttempt appends one server_attempts row. Failure to record is
+// logged but never returned: reputation is advisory.
+func (d *Downloader) recordPlexAttempt(item database.QueueItem, started time.Time, startBytes, endBytes, total int64, outcome, class, errMsg string) {
+	server := plexServerName(item)
+	if server == "" {
+		return
+	}
+	verified := endBytes - startBytes
+	if verified < 0 {
+		verified = 0
+	}
+	if err := d.svc.db.RecordServerAttempt(database.ServerAttempt{
+		Server:        server,
+		Category:      item.Category,
+		MediaID:       item.MediaID,
+		Title:         item.Title,
+		StartedAt:     started,
+		EndedAt:       time.Now(),
+		BytesVerified: verified,
+		BytesTotal:    total,
+		Outcome:       outcome,
+		FailureClass:  class,
+		Error:         errMsg,
+	}); err != nil {
+		if isDBClosedErr(err) {
+			d.svc.log.Debug("server attempt not recorded (daemon shutting down)", "server", server)
+			return
+		}
+		d.svc.log.Warn("failed to record server attempt", "server", server, "error", err)
+	}
+}
+
 // processPlexDownload handles downloads from Plex friends' servers.
-// Simple pipeline: HTTP stream → file → import to library.
+//
+// The transfer is a sequence of validated range requests written into a
+// persistent partial file. A source that closes the connection early (the
+// usual Stradivarius failure) costs at most the in-flight block: the next
+// attempt resumes from the last verified offset instead of restarting at byte
+// zero, which is what made these downloads burn bandwidth and grab budget.
 func (d *Downloader) processPlexDownload(ctx context.Context, item database.QueueItem) error {
 	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "downloading"); err != nil {
 		return fmt.Errorf("update status to downloading: %w", err)
@@ -636,94 +820,194 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 		return d.fail(item, "plex download has no URL")
 	}
 	dlURL := item.NzbURL.String
+	started := time.Now()
 
-	// Create a temporary file for the download.
-	downloadDir := filepath.Join(d.svc.cfg.Paths.Incomplete, fmt.Sprintf("plex-%s-%d", item.Category, item.MediaID))
+	downloadDir := d.plexDownloadDir(item)
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
 		return d.fail(item, fmt.Sprintf("create download dir: %v", err), downloadDir)
 	}
 
-	// Stream the file from the Plex server.
-	req, err := http.NewRequestWithContext(ctx, "GET", dlURL, nil)
+	res, err := d.plexResource(ctx, item, dlURL)
 	if err != nil {
-		return d.fail(item, fmt.Sprintf("create request: %v", err), downloadDir)
-	}
-
-	plexHTTP := &http.Client{Timeout: 30 * time.Minute} // large files
-	resp, err := plexHTTP.Do(req)
-	if err != nil {
+		outcome := database.OutcomeFailed
+		if rangefetch.Retryable(err) {
+			// The attempt itself still happened and still failed on transport;
+			// record it before deferring so the breaker can see a bad run.
+			d.recordPlexAttempt(item, started, 0, 0, 0, database.OutcomeInterrupted,
+				classifyPlexFailure(err), err.Error())
+			return d.deferPlexRetry(item, fmt.Sprintf("probe: %v", err))
+		}
+		d.recordPlexAttempt(item, started, 0, 0, 0, outcome, classifyPlexFailure(err), err.Error())
 		return d.fail(item, fmt.Sprintf("plex download: %v", err), downloadDir)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return d.fail(item, fmt.Sprintf("plex download: HTTP %d", resp.StatusCode), downloadDir)
+	// The stored size may be missing or stale; check against the origin's own
+	// total so a full disk is caught before any bytes are written.
+	if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, res.Size, 1); err != nil {
+		return d.fail(item, err.Error())
 	}
 
-	// Determine filename — use Content-Disposition or fall back to a generic name.
+	partPath := filepath.Join(downloadDir, "plex-download.part")
+	dl, err := rangefetch.Open(d.plexFetch, partPath, res, plexBlockSize)
+	if err != nil {
+		return d.fail(item, fmt.Sprintf("open download: %v", err), downloadDir)
+	}
+	defer func() { _ = dl.Close() }()
+
+	// A resumed transfer that starts further than any previous attempt is
+	// progress, so its interruption budget starts over.
+	startBytes := dl.Completed()
+	d.notePlexProgress(item, startBytes)
+	if startBytes > 0 {
+		d.svc.log.Info("plex download: resuming partial transfer",
+			"title", item.Title, "completed", startBytes, "total", res.Size)
+	}
+
+	lastPct := -1.0
+	err = dl.Run(ctx, func(completed, total int64) {
+		d.notePlexProgress(item, completed)
+		if total <= 0 {
+			return
+		}
+		pct := float64(completed) / float64(total) * 100
+		if pct-lastPct < 0.5 {
+			return
+		}
+		lastPct = pct
+		_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, pct, completed)
+	})
+	if err != nil {
+		class := classifyPlexFailure(err)
+		if rangefetch.Retryable(err) {
+			d.recordPlexAttempt(item, started, startBytes, dl.Completed(), res.Size,
+				database.OutcomeInterrupted, class, err.Error())
+			return d.deferPlexRetry(item, fmt.Sprintf("download: %v", err))
+		}
+		d.recordPlexAttempt(item, started, startBytes, dl.Completed(), res.Size,
+			database.OutcomeFailed, class, err.Error())
+		return d.fail(item, fmt.Sprintf("plex download: %v", err), downloadDir)
+	}
+	d.recordPlexAttempt(item, started, startBytes, dl.Completed(), res.Size,
+		database.OutcomeCompleted, "", "")
+
+	// Run only returns after the file holds exactly total bytes.
 	ext := ".mkv" // most common
-	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "mp4") {
+	if strings.Contains(dl.Resource().ContentType, "mp4") {
 		ext = ".mp4"
 	}
-	tmpPath := filepath.Join(downloadDir, fmt.Sprintf("plex-download%s.part", ext))
-	finalTmpPath := filepath.Join(downloadDir, fmt.Sprintf("plex-download%s", ext))
-
-	tmpFile, err := os.Create(tmpPath)
-	if err != nil {
-		return d.fail(item, fmt.Sprintf("create temp file: %v", err), downloadDir)
-	}
-
-	// Stream with progress updates.
-	var downloaded int64
-	totalSize := resp.ContentLength
-	buf := make([]byte, 256*1024) // 256KB chunks
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, writeErr := tmpFile.Write(buf[:n]); writeErr != nil {
-				tmpFile.Close()
-				return d.fail(item, fmt.Sprintf("write: %v", writeErr), downloadDir)
-			}
-			downloaded += int64(n)
-			if totalSize > 0 {
-				progress := float64(downloaded) / float64(totalSize) * 100
-				_ = d.svc.db.UpdateMediaProgress(item.Category, item.MediaID, progress, downloaded)
-			}
-		}
-		if readErr != nil {
-			if readErr.Error() == "EOF" || readErr == io.EOF {
-				break
-			}
-			tmpFile.Close()
-			return d.fail(item, fmt.Sprintf("read: %v", readErr), downloadDir)
-		}
-		// Some plex friend servers send the full body but keep the connection
-		// open instead of closing it, so Read() never returns EOF and the
-		// download would block until the 30-minute client timeout fails it.
-		// When Content-Length is known, having all bytes is completion.
-		if totalSize > 0 && downloaded >= totalSize {
-			break
-		}
-	}
-	tmpFile.Close()
-
-	// Atomic rename from .part to final.
-	if err := os.Rename(tmpPath, finalTmpPath); err != nil {
+	finalPath := filepath.Join(downloadDir, "plex-download"+ext)
+	if err := os.Rename(partPath, finalPath); err != nil {
 		return d.fail(item, fmt.Sprintf("rename: %v", err), downloadDir)
 	}
+	_ = os.Remove(partPath + ".meta.json")
 
-	// Import to library.
 	q := parser.Parse(item.Title).Quality
 	if q == 0 {
 		q = quality.WEBDL1080p // conservative default for Plex
 	}
 
-	dstPath, err := d.importToLibrary(ctx, item, finalTmpPath, nil, q)
+	dstPath, err := d.importToLibrary(ctx, item, finalPath, nil, q)
 	if err != nil {
 		return d.fail(item, err.Error(), downloadDir)
 	}
 
+	d.clearPlexRetry(item)
 	return d.completeDownload(item, q, dstPath, downloadDir)
+}
+
+// plexResource resolves the authoritative identity of a Plex download URL.
+// The size stored on the queue item is only a hint: the origin's own
+// Content-Range total wins, so a release that changed size is transferred
+// afresh rather than stitched onto stale bytes.
+func (d *Downloader) plexResource(ctx context.Context, item database.QueueItem, url string) (rangefetch.Resource, error) {
+	res, err := d.plexFetch.Probe(ctx, url)
+	if err != nil {
+		return res, err
+	}
+	if item.SizeBytes.Valid && item.SizeBytes.Int64 > 0 && item.SizeBytes.Int64 != res.Size {
+		d.svc.log.Warn("plex download: size differs from stored metadata",
+			"title", item.Title, "stored", item.SizeBytes.Int64, "origin", res.Size)
+	}
+	return res, nil
+}
+
+// deferPlexRetry keeps the verified partial download and schedules another
+// attempt after a backoff. It deliberately does not blocklist the release: the
+// failure was transport, not a bad candidate.
+func (d *Downloader) deferPlexRetry(item database.QueueItem, msg string) error {
+	key := plexQueueKey(item)
+
+	d.plexMu.Lock()
+	st := d.plexRetry[key]
+	if st == nil {
+		st = &plexRetryState{}
+		d.plexRetry[key] = st
+	}
+	st.attempts++
+	attempts := st.attempts
+	backoff := plexRetryBase << (attempts - 1)
+	if backoff > plexRetryMax || backoff <= 0 {
+		backoff = plexRetryMax
+	}
+	st.next = time.Now().Add(backoff)
+	d.plexMu.Unlock()
+
+	if attempts > maxPlexRetries {
+		d.clearPlexRetry(item)
+		return d.fail(item,
+			fmt.Sprintf("%s (gave up after %d interruptions)", msg, attempts),
+			d.plexDownloadDir(item))
+	}
+
+	// Back to 'queued' (with the URL intact) so the watchdog re-enqueues it and
+	// the next attempt opens the same partial file.
+	if err := d.svc.db.UpdateMediaDownloadStatus(item.Category, item.MediaID, "queued"); err != nil {
+		if isDBClosedErr(err) {
+			// Shutting down: the partial and its sidecar are on disk, and
+			// startup resets stale 'downloading' rows, so the resume survives.
+			d.svc.log.Debug("daemon shutting down, leaving interrupted download for resume",
+				"title", item.Title, "server", key)
+		} else {
+			d.svc.log.Error("plex retry: reset to queued failed", "title", item.Title, "error", err)
+		}
+	}
+	_ = d.svc.db.UpdateMediaPhaseLabel(item.Category, item.MediaID,
+		fmt.Sprintf("interrupted: %s (resuming in %s)", msg, backoff))
+
+	d.svc.log.Warn("plex download interrupted, partial kept for resume",
+		"title", item.Title, "attempt", attempts, "backoff", backoff.String(), "error", msg)
+	return nil
+}
+
+// plexBackoffActive reports whether a deferred Plex retry is still cooling down.
+func (d *Downloader) plexBackoffActive(item database.QueueItem) bool {
+	d.plexMu.Lock()
+	defer d.plexMu.Unlock()
+	st := d.plexRetry[plexQueueKey(item)]
+	return st != nil && time.Now().Before(st.next)
+}
+
+// notePlexProgress resets the interruption budget once a transfer gets further
+// than any previous attempt, so a slow but advancing source is never abandoned.
+func (d *Downloader) notePlexProgress(item database.QueueItem, completed int64) {
+	key := plexQueueKey(item)
+	d.plexMu.Lock()
+	defer d.plexMu.Unlock()
+	st := d.plexRetry[key]
+	if st == nil {
+		st = &plexRetryState{}
+		d.plexRetry[key] = st
+	}
+	if completed > st.best {
+		st.best = completed
+		st.attempts = 0
+	}
+}
+
+func (d *Downloader) clearPlexRetry(item database.QueueItem) {
+	d.plexMu.Lock()
+	delete(d.plexRetry, plexQueueKey(item))
+	d.plexMu.Unlock()
 }
 
 // processUsenetDownload handles downloads from Usenet via NZB/NNTP.
@@ -1088,11 +1372,15 @@ func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...str
 	if err := d.svc.db.AddHistory(item.Category, item.MediaID, item.Title, failEvent(msg), nzbName, ""); err != nil {
 		d.svc.log.Error("failed to record failure history", "title", item.Title, "error", err)
 	}
-	if nzbName != "" {
+	if nzbName != "" && !isPlexSource(item) {
 		if err := d.svc.db.AddBlocklist(item.Category, item.MediaID, nzbName, msg); err != nil {
 			d.svc.log.Error("failed to blocklist release", "title", item.Title, "release", nzbName, "error", err)
 		}
 	}
+	// A Plex item's "nzb name" is the friend's server name, not a release:
+	// blocklisting it would pollute the release blocklist and the Usenet retry
+	// budget (which counts blocklist rows per media). Server problems are
+	// recorded in server_attempts and acted on by the source breaker instead.
 
 	for _, dir := range cleanupDir {
 		if dir != "" {
@@ -1232,6 +1520,44 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 		}
 	}
 
+	// b2) Plex friend servers — derived reputation, so a flaky friend is
+	// visible before it burns an item's grab budget.
+	if db == nil {
+		// Partially constructed service (tests): no reputation evidence.
+	} else if scores, err := db.ServerScores(30*24*time.Hour, 50); err == nil {
+		now := time.Now()
+		names := make([]string, 0, len(scores))
+		for name := range scores {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			sc := scores[name]
+			status := "ok"
+			msg := fmt.Sprintf("%.0f%% success · %.1f MB/s · %d attempts (30d)",
+				sc.SuccessRate*100, sc.Mbps, sc.Attempts)
+			switch {
+			case serverCooling(sc, now):
+				status = "warning"
+				msg += fmt.Sprintf(" · cooling after %d transport failures", sc.ConsecutiveTransportFails)
+			case sc.Completed+sc.Failed >= 5 && sc.SuccessRate < 0.6:
+				status = "warning"
+				if sc.ConsecutiveTransportFails > 0 {
+					msg += fmt.Sprintf(" · %d transport failures in a row", sc.ConsecutiveTransportFails)
+				} else {
+					msg += " · low success rate"
+				}
+			}
+			checks = append(checks, HealthCheck{Name: "plex:" + name, Status: status, Message: msg})
+		}
+	} else {
+		checks = append(checks, HealthCheck{
+			Name:    "plex:reputation",
+			Status:  "warning",
+			Message: fmt.Sprintf("cannot read server attempts: %v", err),
+		})
+	}
+
 	// c) Disk space on configured paths.
 	diskPaths := map[string]string{}
 	if cfg != nil {
@@ -1333,13 +1659,33 @@ func (d *Downloader) HealthChecks() []HealthCheck {
 	return checks
 }
 
-// fetchNZB downloads the NZB file from the given URL with context cancellation.
-// Uses a 30s timeout and limits response to 50MB to prevent resource exhaustion.
+// maxNZBSize caps an NZB download; large season packs exceed the client's
+// default response limit.
+const maxNZBSize = 50 * 1024 * 1024
+
+// fetchNZB downloads the NZB file from the given URL with context cancellation,
+// limiting the response to 50MB to prevent resource exhaustion.
+//
+// The request carries the same User-Agent and per-indexer headers as the search
+// calls: NZBFinder answers Go's default user agent with HTTP 403 (a Cloudflare
+// block page), so a bare request made a valid API key look dead on the download
+// step even though search worked.
 func (d *Downloader) fetchNZB(ctx context.Context, nzbURL string) ([]byte, error) {
+	// Prefer the indexer that owns this URL: its client carries the default
+	// User-Agent and any per-indexer header overrides through one choke point.
+	if idx := d.indexerForURL(nzbURL); idx != nil {
+		return idx.FetchNZB(ctx, nzbURL, maxNZBSize)
+	}
+
+	// No configured indexer matches (e.g. a manually supplied URL). Still send
+	// the default user agent: a bare Go client is rejected with HTTP 403 by
+	// some hosts.
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, nzbURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build NZB request: %w", err)
 	}
+	req.Header.Set("User-Agent", newznab.DefaultUserAgent)
+
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -1351,12 +1697,50 @@ func (d *Downloader) fetchNZB(ctx context.Context, nzbURL string) ([]byte, error
 		return nil, fmt.Errorf("fetch NZB: HTTP %d", resp.StatusCode)
 	}
 
-	const maxNZBSize = 50 * 1024 * 1024 // 50MB
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxNZBSize))
 	if err != nil {
 		return nil, fmt.Errorf("read NZB body: %w", err)
 	}
 	return data, nil
+}
+
+// indexerForURL returns the configured indexer responsible for an NZB URL, so
+// its header overrides apply to the download too. Indexers commonly serve the
+// NZB from a different host than their API (dl.dognzb.cr for api.dognzb.cr),
+// so a base host with three or more labels also matches on its registrable
+// domain. Returns nil when nothing matches.
+func (d *Downloader) indexerForURL(rawURL string) *newznab.Client {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return nil
+	}
+	for _, idx := range d.indexers {
+		if idx == nil {
+			continue
+		}
+		base, err := url.Parse(idx.URL)
+		if err != nil {
+			continue
+		}
+		baseHost := strings.ToLower(base.Hostname())
+		if baseHost == "" {
+			continue
+		}
+		candidates := []string{baseHost}
+		if parts := strings.Split(baseHost, "."); len(parts) >= 3 {
+			candidates = append(candidates, strings.Join(parts[1:], "."))
+		}
+		for _, c := range candidates {
+			if host == c || strings.HasSuffix(host, "."+c) {
+				return idx
+			}
+		}
+	}
+	return nil
 }
 
 // segmentHealthFile is the filename used to persist segment failure count

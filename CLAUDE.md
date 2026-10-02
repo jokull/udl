@@ -32,6 +32,8 @@ codesign --force --sign "UDL" ~/bin/udl && launchctl load ~/Library/LaunchAgents
 - **Web UI** at `udl.plex.uno` (Caddy reverse proxy → localhost:9876), htmx + SSE
 - **Daemon** runs: episode search (air-date-driven, 2m tick), movie search sweep (6h), downloader (polls queue every 5s)
 - **Download pipeline:** fetch NZB → parse → NNTP segment download → yEnc decode → PAR2 verify/repair → RAR extract → cleanup → import to library
+- **Plex download pipeline:** probe → verified 2 MiB range blocks into a persistent `.part` (+ `.meta.json` resume sidecar) → exact-size check → rename → import. Interruptions resume from the last verified block; the partial is only discarded on terminal failures or after the retry budget is spent.
+- **Friend-server selection:** derived from `server_attempts` (Beta-smoothed success rate + measured MB/s over 30 days), ranked reliability-band first then speed, with a derived transport-failure circuit breaker and 10% exploration. `[[plex.servers]]` in config carries only deny/prefer/bias overrides.
 
 ## Package Map
 
@@ -53,6 +55,9 @@ internal/
   nzb/                    NZB XML parser
   parser/                 Release title parser (regex: title, year, S/E, quality, group)
   quality/                Quality tier enum (SDTV→Remux-2160p), profiles, ShouldGrab()
+  rangefetch/             Validated, resumable HTTP byte-range transport shared by
+                          shadow streaming and Plex downloads (strict 206/Content-Range
+                          checks, resource identity, per-block resume sidecar)
   organize/               File renaming + import (hardcoded Plex-compatible naming)
   par2/                   PAR2 binary parser (FileDesc packets, hash16k matching)
   postprocess/            PAR2 rename + verify (par2), RAR (rardecode), cleanup

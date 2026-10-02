@@ -344,6 +344,27 @@ would delete 2 items (22.9 GB), keep 2 — use --execute to apply
 
 Map every library section on your own and friends' Plex servers: media type, whether your account can download from it (offline sync), and — on request — which audio track languages appear in each library.
 
+### Which friend gets the download
+
+When several friends have an item, UDL picks between them by **derived reputation**, not by whoever answers first:
+
+- Every transfer attempt against a friend's server is recorded (outcome, failure class, bytes, duration) in the `server_attempts` table.
+- A server's score is its Beta-smoothed success rate over a 30-day window plus its measured throughput. Ranking is by reliability band first, then speed — a reliably slow friend beats a fast one that keeps dropping connections, and quality is never traded for reliability.
+- Only **transport** failures count against a server. A misconfigured share (`permission`), a vanished file (`missing`), or a file that will not post-process (`content`) is attributed to the cause, not the friend.
+- After consecutive transport failures a server is parked for 30 minutes (a derived circuit breaker that self-heals), and 10% of picks explore within the best band so a friend that improved is not starved by old data.
+- Existing history is backfilled once, so ranking is informed immediately rather than starting cold.
+
+`udl status` shows the current board:
+
+```
+plex:brunnur      84% success · 12.4 MB/s · 41 attempts (30d)
+plex:Stradivarius 43% success · 1.6 MB/s · 123 attempts (30d) · cooling after 4 transport failures
+```
+
+Use `[[plex.servers]]` in the config only for what observation cannot know — `deny` to retire a dead server, `prefer`/`bias` to favour one. A hand-maintained ranking is deliberately not the mechanism: friends change disks, ISPs and load, and a static order rots.
+
+The commands below map libraries:
+
 ```bash
 udl plex libraries                           # cheap: discovery + sections
 udl plex libraries --counts                  # + per-section item counts
@@ -450,6 +471,18 @@ apikey = "key"
 
 [plex]
 token = "your-plex-token"  # optional, enables friend library checking + cleanup
+
+# Optional per-server overrides. Reputation is derived automatically from
+# observed transfers (success rate and measured throughput); these entries are
+# only for what observation cannot know.
+[[plex.servers]]
+name = "SomeDeadServer"
+deny = true          # never use this server
+
+[[plex.servers]]
+name = "BestFriend"
+prefer = true        # tried ahead of servers without this flag
+bias = 25            # optional nudge, in percent of reliability
 
 [seerr]
 url = "https://requests.example.com"  # optional, Overseerr/Jellyseerr URL

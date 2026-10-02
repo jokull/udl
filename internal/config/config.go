@@ -35,6 +35,25 @@ type TMDBConfig struct {
 // before downloading.
 type PlexConfig struct {
 	Token string `toml:"token"`
+	// Servers are optional per-server overrides. Server reputation is derived
+	// from observed transfers (see server_attempts); these entries exist only
+	// for what observation cannot know — a friend to avoid, or one to favour.
+	Servers []PlexServerConfig `toml:"servers"`
+}
+
+// PlexServerConfig overrides how a friend server is treated when picking a
+// download source.
+//
+//	[[plex.servers]]
+//	name   = "Plex"      # as reported by plex.tv
+//	deny   = true        # never use this server
+//	prefer = true        # try it before servers without this flag
+//	bias   = 50          # additive nudge to its derived score
+type PlexServerConfig struct {
+	Name   string `toml:"name"`
+	Deny   bool   `toml:"deny"`
+	Prefer bool   `toml:"prefer"`
+	Bias   int    `toml:"bias"`
 }
 
 // Library holds the final media destination directories.

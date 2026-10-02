@@ -47,6 +47,7 @@ type Service struct {
 	// Test hooks for backpressure/concurrency integration tests.
 	searchWantedMoviesFn func() error
 	searchEpisodeFn      func(ep *database.Episode, tvdbID int) (bool, error)
+	rndFloat             func() float64 // exploration randomness; nil in production
 
 	searchSem            chan struct{}
 	searchAcquireTimeout time.Duration

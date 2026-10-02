@@ -136,10 +136,35 @@ CREATE TABLE IF NOT EXISTS blocklist (
     reason TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- One row per transfer attempt against a Plex friend server. This is the
+-- evidence a server's reputation is derived from: it is keyed by SOURCE, so a
+-- flaky friend shows up as a flaky friend instead of as an undownloadable
+-- media item. failure_class separates the server's fault (transport) from the
+-- release's (content) and from configuration problems (permission).
+CREATE TABLE IF NOT EXISTS server_attempts (
+    id INTEGER PRIMARY KEY,
+    server TEXT NOT NULL,
+    category TEXT NOT NULL,
+    media_id INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    started_at TIMESTAMP NOT NULL,
+    ended_at TIMESTAMP NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    bytes_verified INTEGER NOT NULL DEFAULT 0,
+    bytes_total INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT NOT NULL,                  -- completed | interrupted | failed
+    failure_class TEXT NOT NULL DEFAULT '', -- transport | permission | missing | content
+    error TEXT
+);
 `
 	_, err := db.Exec(schema)
 	if err != nil {
 		return err
+	}
+
+	if err := db.backfillServerAttempts(); err != nil {
+		return fmt.Errorf("backfill server attempts: %w", err)
 	}
 
 	for _, idx := range []string{
@@ -147,6 +172,7 @@ CREATE TABLE IF NOT EXISTS blocklist (
 		`CREATE INDEX IF NOT EXISTS idx_movies_status ON movies(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_blocklist_lookup ON blocklist(media_type, media_id, release_title)`,
 		`CREATE INDEX IF NOT EXISTS idx_history_lookup ON history(media_type, media_id, event)`,
+		`CREATE INDEX IF NOT EXISTS idx_server_attempts_server ON server_attempts(server, ended_at)`,
 	} {
 		if _, err := db.Exec(idx); err != nil {
 			return fmt.Errorf("create index: %w", err)

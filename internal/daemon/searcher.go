@@ -424,33 +424,76 @@ func (s *Service) GrabBest(releases []ScoredRelease, ctx GrabContext) (bool, err
 }
 
 // grabFromPlex checks Plex friends for the media and enqueues an HTTP download
-// from their server instead of going through Usenet. Returns true if a Plex
+// from the best server, instead of going through Usenet. Returns true if a Plex
 // download was enqueued.
+//
+// Servers are ranked by derived reputation (reliability band, then measured
+// throughput) with config overrides on top, rather than being taken as
+// whichever friend happened to answer first.
 func (s *Service) grabFromPlex(ctx GrabContext) (bool, error) {
-	var match *plex.MediaMatch
+	var candidates []plex.MediaMatch
 	var err error
 
 	switch ctx.Category {
 	case "movie":
-		var found bool
-		found, match, err = s.plex.HasMovie(ctx.Title, ctx.Year, ctx.ImdbID, ctx.TmdbID, s.cfg.Prefs.Min)
-		if err != nil || !found || match == nil {
-			return false, err
-		}
+		candidates, err = s.plex.FindMovie(ctx.Title, ctx.Year, ctx.ImdbID, ctx.TmdbID, s.cfg.Prefs.Min)
 	case "episode":
-		var found bool
-		found, match, err = s.plex.HasEpisode(ctx.Title, ctx.Season, ctx.Episode, s.cfg.Prefs.Min)
-		if err != nil || !found || match == nil {
-			return false, err
-		}
+		candidates, err = s.plex.FindEpisode(ctx.Title, ctx.Season, ctx.Episode, s.cfg.Prefs.Min)
 	default:
 		return false, nil
 	}
-
-	// Get the actual download URL from the server.
-	info, err := s.plex.GetDownloadInfo(*match)
 	if err != nil {
-		return false, fmt.Errorf("plex download info: %w", err)
+		return false, err
+	}
+	if len(candidates) == 0 {
+		return false, nil
+	}
+
+	policies := s.serverPolicies()
+	ranked := rankPlexCandidates(candidates, policies)
+	if len(ranked) == 0 {
+		s.log.Debug("every plex server offering this item is denied by config", "title", ctx.Title)
+		return false, nil
+	}
+
+	pick, ok := pickPlexIndex(ranked, policies, s.rand())
+	if !ok {
+		return false, nil
+	}
+
+	// A server can have the item and still fail to hand over a usable part, so
+	// walk the ranked candidates rather than giving up on the first failure.
+	order := make([]int, 0, len(ranked))
+	order = append(order, pick)
+	for i := range ranked {
+		if i != pick {
+			order = append(order, i)
+		}
+	}
+
+	var (
+		info   *plex.DownloadInfo
+		match  plex.MediaMatch
+		tries  int
+		policy serverPolicy
+	)
+	for _, i := range order {
+		if tries >= plexGrabTries {
+			break
+		}
+		tries++
+		m := ranked[i]
+		got, gerr := s.plex.GetDownloadInfo(m)
+		if gerr != nil {
+			s.log.Warn("plex download info failed, trying next server",
+				"title", ctx.Title, "server", m.ServerName, "error", gerr)
+			continue
+		}
+		info, match, policy = got, m, policies[m.ServerName]
+		break
+	}
+	if info == nil {
+		return false, fmt.Errorf("no plex server could provide %q", ctx.Title)
 	}
 
 	sourceName := fmt.Sprintf("plex:%s", match.ServerName)
@@ -467,11 +510,19 @@ func (s *Service) grabFromPlex(ctx GrabContext) (bool, error) {
 		s.log.Error("failed to record plex grab history", "error", err)
 	}
 
+	reliability, mbps := "unknown", 0.0
+	if policy.hasScore {
+		reliability = fmt.Sprintf("%.0f%%", policy.score.SuccessRate*100)
+		mbps = policy.score.Mbps
+	}
 	s.log.Info("grabbed from plex friend",
 		"title", ctx.Title,
 		"server", match.ServerName,
 		"quality", match.Quality,
 		"size_mb", info.Size/(1024*1024),
+		"candidates", len(ranked),
+		"reliability", reliability,
+		"mbps", mbps,
 	)
 
 	// Instant dispatch via channel if downloader is available.

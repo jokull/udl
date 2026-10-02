@@ -216,82 +216,84 @@ func (c *Client) discoverServersInternal() ([]Server, error) {
 	return servers, nil
 }
 
-// HasMovie checks all shared servers concurrently for a movie matching the
-// given criteria. Returns true and the first match at or above minQuality.
-func (c *Client) HasMovie(title string, year int, imdbID string, tmdbID int, minQuality quality.Quality) (bool, *MediaMatch, error) {
+// FindMovie searches every shared server concurrently and returns EVERY match
+// at or above minQuality.
+//
+// Server choice belongs to the caller: returning only the first responder (as
+// HasMovie does) makes selection a race, so a flaky-but-fast friend always
+// beats a solid one. Callers that rank servers need the whole candidate set.
+func (c *Client) FindMovie(title string, year int, imdbID string, tmdbID int, minQuality quality.Quality) ([]MediaMatch, error) {
 	servers, err := c.DiscoverServers()
 	if err != nil {
-		return false, nil, err
+		return nil, err
 	}
+	return c.fanOut(servers, func(srv Server) []MediaMatch {
+		matches, err := c.SearchMovie(srv, title, year, imdbID, tmdbID)
+		if err != nil {
+			return nil
+		}
+		return filterQuality(matches, minQuality)
+	}), nil
+}
 
-	type result struct {
-		match *MediaMatch
+// FindEpisode is FindMovie for a TV episode.
+func (c *Client) FindEpisode(seriesTitle string, season, episode int, minQuality quality.Quality) ([]MediaMatch, error) {
+	servers, err := c.DiscoverServers()
+	if err != nil {
+		return nil, err
 	}
-	ch := make(chan result, len(servers))
+	return c.fanOut(servers, func(srv Server) []MediaMatch {
+		matches, err := c.SearchEpisode(srv, seriesTitle, season, episode)
+		if err != nil {
+			return nil
+		}
+		return filterQuality(matches, minQuality)
+	}), nil
+}
+
+// fanOut queries every server concurrently and collects the matches.
+func (c *Client) fanOut(servers []Server, find func(Server) []MediaMatch) []MediaMatch {
+	ch := make(chan []MediaMatch, len(servers))
 	for _, srv := range servers {
-		go func(srv Server) {
-			matches, err := c.SearchMovie(srv, title, year, imdbID, tmdbID)
-			if err != nil {
-				ch <- result{}
-				return
-			}
-			for _, m := range matches {
-				if m.Quality >= minQuality {
-					m := m // copy
-					ch <- result{match: &m}
-					return
-				}
-			}
-			ch <- result{}
-		}(srv)
+		go func(srv Server) { ch <- find(srv) }(srv)
 	}
-
+	var all []MediaMatch
 	for range servers {
-		r := <-ch
-		if r.match != nil {
-			return true, r.match, nil
+		all = append(all, <-ch...)
+	}
+	return all
+}
+
+func filterQuality(matches []MediaMatch, min quality.Quality) []MediaMatch {
+	out := matches[:0:0]
+	for _, m := range matches {
+		if m.Quality >= min {
+			out = append(out, m)
 		}
 	}
-	return false, nil, nil
+	return out
+}
+
+// HasMovie checks all shared servers concurrently for a movie matching the
+// given criteria. Returns true and the first match at or above minQuality;
+// prefer FindMovie when the choice of server matters.
+func (c *Client) HasMovie(title string, year int, imdbID string, tmdbID int, minQuality quality.Quality) (bool, *MediaMatch, error) {
+	matches, err := c.FindMovie(title, year, imdbID, tmdbID, minQuality)
+	if err != nil || len(matches) == 0 {
+		return false, nil, err
+	}
+	return true, &matches[0], nil
 }
 
 // HasEpisode checks all shared servers concurrently for a specific TV episode.
-// Returns true and the first match at or above minQuality.
+// Returns true and the first match at or above minQuality; prefer FindEpisode
+// when the choice of server matters.
 func (c *Client) HasEpisode(seriesTitle string, season, episode int, minQuality quality.Quality) (bool, *MediaMatch, error) {
-	servers, err := c.DiscoverServers()
-	if err != nil {
+	matches, err := c.FindEpisode(seriesTitle, season, episode, minQuality)
+	if err != nil || len(matches) == 0 {
 		return false, nil, err
 	}
-
-	type result struct {
-		match *MediaMatch
-	}
-	ch := make(chan result, len(servers))
-	for _, srv := range servers {
-		go func(srv Server) {
-			matches, err := c.SearchEpisode(srv, seriesTitle, season, episode)
-			if err != nil {
-				ch <- result{}
-				return
-			}
-			for _, m := range matches {
-				if m.Quality >= minQuality {
-					m := m
-					ch <- result{match: &m}
-					return
-				}
-			}
-			ch <- result{}
-		}(srv)
-	}
-
-	for range servers {
-		r := <-ch
-		if r.match != nil {
-			return true, r.match, nil
-		}
-	}
-	return false, nil, nil
+	return true, &matches[0], nil
 }
 
 // SearchMovie searches a specific server for a movie by title/year, using IMDB

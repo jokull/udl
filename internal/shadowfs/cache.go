@@ -8,7 +8,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jokull/udl/internal/rangefetch"
 )
 
 // Fetcher supplies raw bytes for a range of a shadow item's remote URL.
@@ -30,11 +31,17 @@ type BlockCache struct {
 	dir       string
 	blockSize int64
 	maxBytes  int64
-	client    *http.Client
+	fetcher   *rangefetch.Fetcher
 
 	mu       sync.Mutex
 	inflight map[string]chan struct{} // block key -> completion signal
 	writes   int
+
+	// resources caches the probed identity (size, validators) of each remote
+	// URL so blocks can be validated against a known total; probing is
+	// single-flight so concurrent readers of one file issue one probe.
+	resources map[string]rangefetch.Resource
+	probing   map[string]chan struct{}
 
 	hits, misses, bytesServed atomic.Int64
 	freeWarned                atomic.Bool
@@ -65,8 +72,19 @@ func NewBlockCache(dir string, maxBytes int64) *BlockCache {
 		dir:       dir,
 		blockSize: defaultBlockSize,
 		maxBytes:  maxBytes,
-		client:    &http.Client{Timeout: 120 * time.Second},
+		fetcher:   rangefetch.New(&http.Client{Timeout: 120 * time.Second}),
 		inflight:  make(map[string]chan struct{}),
+		resources: make(map[string]rangefetch.Resource),
+		probing:   make(map[string]chan struct{}),
+	}
+	// Friend servers truncate responses in bursts — every response cut short
+	// for a while, then healthy again. Fill resumes inside the block, so extra
+	// attempts cost only a request and let a read survive a burst that ends
+	// within the budget. Without this a burst surfaces as an NFS read error.
+	c.fetcher.Retry = rangefetch.RetryPolicy{
+		Attempts: 8,
+		Base:     250 * time.Millisecond,
+		Max:      5 * time.Second,
 	}
 	// Trim an existing over-cap cache at startup, then re-check on a timer:
 	// eviction previously ran only on fetches, so a fully warm cache sat
@@ -168,21 +186,65 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 	}
 }
 
+// fetch pulls one block through the shared validated range transport. The
+// resource is probed once so the block is checked against a known total: a
+// short body (a server closing the connection early) is rejected rather than
+// cached as if it were the block, and a 200 response to a ranged request is an
+// error instead of silently caching the head of the file as this block.
+//
+// Fill retries inside the block, so an origin that truncates responses (most
+// of Stradivarius' responses stop around 704 KiB) still yields a complete
+// block without refetching the bytes already received.
 func (c *BlockCache) fetch(ctx context.Context, url string, off, size int64) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	res, err := c.resource(ctx, url)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("shadowfs: probe %s: %w", url, err)
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+size-1))
-	resp, err := c.client.Do(req)
+	buf := make([]byte, size)
+	n, _, err := c.fetcher.Fill(ctx, res, off, buf)
 	if err != nil {
 		return nil, fmt.Errorf("shadowfs: fetch block: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("shadowfs: fetch block: status %d", resp.StatusCode)
+	if int64(n) != size {
+		return nil, fmt.Errorf("shadowfs: fetch block: %w: wanted %d bytes, got %d", rangefetch.ErrShortRead, size, n)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, c.blockSize))
+	return buf, nil
+}
+
+// resource returns the probed identity of url, probing at most once (and at
+// most once concurrently) per URL. A failed probe is not cached: the next
+// reader retries it.
+func (c *BlockCache) resource(ctx context.Context, url string) (rangefetch.Resource, error) {
+	for {
+		c.mu.Lock()
+		if res, ok := c.resources[url]; ok {
+			c.mu.Unlock()
+			return res, nil
+		}
+		if ch, ok := c.probing[url]; ok {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue // re-check: cached now, or probe failed → probe it ourselves
+			case <-ctx.Done():
+				return rangefetch.Resource{URL: url}, ctx.Err()
+			}
+		}
+		ch := make(chan struct{})
+		c.probing[url] = ch
+		c.mu.Unlock()
+
+		res, err := c.fetcher.Probe(ctx, url)
+
+		c.mu.Lock()
+		delete(c.probing, url)
+		if err == nil {
+			c.resources[url] = res
+		}
+		c.mu.Unlock()
+		close(ch)
+		return res, err
+	}
 }
 
 // store writes a block atomically (temp + rename); cache write failures are

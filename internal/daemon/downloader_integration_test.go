@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -10,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -446,6 +449,7 @@ func TestPipeline_PlexServerKeepsConnectionOpen(t *testing.T) {
 
 	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", int64(len(data)), "plex")
 	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.plexFetch.Retry.Sleep = func(time.Duration) {}
 
 	done := make(chan struct{})
 	go func() {
@@ -499,6 +503,7 @@ func TestPipeline_PlexMP4ContentType(t *testing.T) {
 
 	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", 2048, "plex")
 	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.plexFetch.Retry.Sleep = func(time.Duration) {}
 	d.processItem(context.Background(), item)
 
 	movie, _ := db.GetMovie(movieID)
@@ -736,12 +741,15 @@ func TestPipeline_FailedPlexServer(t *testing.T) {
 
 	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", 2048, "plex")
 	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.plexFetch.Retry.Sleep = func(time.Duration) {}
 	d.processItem(context.Background(), item)
 
-	// Movie should be marked failed with error mentioning 500.
+	// A 5xx is a transient source failure, not a bad release: the item is put
+	// back in the queue with the error recorded, and retried after a backoff
+	// instead of being failed (and blocklisted) on the first hiccup.
 	movie, _ := db.GetMovie(movieID)
-	if movie.Status != "failed" {
-		t.Errorf("movie.status = %q, want failed", movie.Status)
+	if movie.Status != "queued" {
+		t.Errorf("movie.status = %q, want queued (deferred retry)", movie.Status)
 	}
 	// Check download_error via raw SQL since GetMovie doesn't scan download fields.
 	var errMsg sql.NullString
@@ -749,6 +757,223 @@ func TestPipeline_FailedPlexServer(t *testing.T) {
 	if !errMsg.Valid || !strings.Contains(errMsg.String, "500") {
 		t.Errorf("download_error = %v, should mention HTTP 500", errMsg)
 	}
+
+	// Once the interruption budget is spent the download fails for real so the
+	// scheduler can look for another source. Calling processPlexDownload
+	// directly bypasses the watchdog's backoff gate.
+	for i := 0; i <= maxPlexRetries && movie.Status != "failed"; i++ {
+		_ = d.processPlexDownload(context.Background(), item)
+		movie, _ = db.GetMovie(movieID)
+	}
+	if movie.Status != "failed" {
+		t.Errorf("movie.status = %q, want failed after %d interruptions", movie.Status, maxPlexRetries)
+	}
+}
+
+// TestPipeline_PlexResumesAfterInterruption proves the daemon wiring around the
+// resumable transfer: an interrupted Plex download keeps its verified partial
+// and stays queued, and the next attempt finishes it without refetching the
+// already-verified prefix.
+func TestPipeline_PlexResumesAfterInterruption(t *testing.T) {
+	cfg := testConfig(t)
+	db, err := database.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	movieID, err := db.AddMovie(55555, "tt5555555", "Sicario", 2015, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data := make([]byte, 9<<20+1234)
+	copy(data, mkvMagic)
+
+	var mu sync.Mutex
+	blockFetches := 0
+	truncating := true
+	var starts []int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := r.Header.Get("Range")
+		if h == "" {
+			w.Header().Set("Content-Type", "video/x-matroska")
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+			return
+		}
+		start, end, ok := parseTestRange(h, int64(len(data)))
+		if !ok {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		body := data[start : end+1]
+
+		mu.Lock()
+		probe := start == 0 && end == 0
+		if !probe {
+			blockFetches++
+			starts = append(starts, start)
+		}
+		truncate := truncating && !probe && blockFetches >= 3
+		mu.Unlock()
+
+		if truncate && len(body) > 4096 {
+			body = body[:4096] // connection closes mid-block
+		}
+		w.Header().Set("Content-Type", "video/x-matroska")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	item := enqueueItem(t, db, "movie", movieID, srv.URL, "plex:FriendServer", int64(len(data)), "plex")
+	d := NewDownloaderWithEngine(testSvc(cfg, db), &FakeEngine{})
+	d.plexFetch.Retry.Sleep = func(time.Duration) {}
+
+	// First attempt: interrupted after two verified blocks.
+	d.processItem(context.Background(), item)
+
+	movie, err := db.GetMovie(movieID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if movie.Status != "queued" {
+		t.Fatalf("movie.status = %q, want queued (deferred retry)", movie.Status)
+	}
+
+	// The interruption must be attributed to the source, with the failure
+	// class that decides whether it counts against the server.
+	attempts := loadAttempts(t, db, "FriendServer")
+	if len(attempts) != 1 {
+		t.Fatalf("recorded %d attempts after the interruption, want 1", len(attempts))
+	}
+	if attempts[0].Outcome != database.OutcomeInterrupted || attempts[0].FailureClass != database.FailureTransport {
+		t.Fatalf("interrupted attempt = %+v, want interrupted/transport", attempts[0])
+	}
+	if attempts[0].BytesVerified <= 0 {
+		t.Fatalf("interrupted attempt recorded no progress: %+v", attempts[0])
+	}
+
+	partPath := filepath.Join(cfg.Paths.Incomplete, fmt.Sprintf("plex-movie-%d", movieID), "plex-download.part")
+	partInfo, err := os.Stat(partPath)
+	if err != nil {
+		t.Fatalf("partial download missing after interruption: %v", err)
+	}
+	// Two full blocks plus whatever the truncated block delivered: verified
+	// progress counts partial blocks, so received bytes are never discarded.
+	verified := partInfo.Size()
+	if verified < 2*plexBlockSize || verified >= 3*plexBlockSize {
+		t.Fatalf("partial size = %d, want at least 2 blocks and less than 3", verified)
+	}
+
+	// Second attempt against a healthy server.
+	mu.Lock()
+	truncating = false
+	marker := len(starts)
+	mu.Unlock()
+
+	if err := d.processPlexDownload(context.Background(), item); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	movie, _ = db.GetMovie(movieID)
+	if movie.Status != "downloaded" {
+		t.Fatalf("movie.status = %q, want downloaded", movie.Status)
+	}
+
+	got, err := os.ReadFile(movie.FilePath.String)
+	if err != nil {
+		t.Fatalf("read imported file: %v", err)
+	}
+	if len(got) != len(data) {
+		t.Fatalf("imported size = %d, want %d", len(got), len(data))
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatal("imported content does not match the origin")
+	}
+
+	mu.Lock()
+	resumed := append([]int64(nil), starts[marker:]...)
+	mu.Unlock()
+	if len(resumed) == 0 {
+		t.Fatal("resume issued no requests")
+	}
+	for _, s := range resumed {
+		if s < verified {
+			t.Fatalf("resume refetched verified bytes: requested offset %d", s)
+		}
+	}
+
+	// The completed transfer is recorded with its measured throughput, which is
+	// what ranking uses to prefer a faster friend.
+	attempts = loadAttempts(t, db, "FriendServer")
+	if len(attempts) != 2 {
+		t.Fatalf("recorded %d attempts, want 2 (interrupted + completed)", len(attempts))
+	}
+	done := attempts[len(attempts)-1]
+	if done.Outcome != database.OutcomeCompleted || done.FailureClass != "" {
+		t.Fatalf("final attempt = %+v, want completed with no failure class", done)
+	}
+	if done.BytesVerified <= 0 || done.DurationMs <= 0 {
+		t.Fatalf("completed attempt recorded no throughput evidence: %+v", done)
+	}
+	if done.BytesTotal != int64(len(data)) {
+		t.Fatalf("completed attempt total = %d, want %d", done.BytesTotal, len(data))
+	}
+}
+
+// loadAttempts returns the recorded server attempts for a server, oldest first.
+func loadAttempts(t *testing.T, db *database.DB, server string) []database.ServerAttempt {
+	t.Helper()
+	rows, err := db.Query(`
+		SELECT server, category, media_id, title, duration_ms, bytes_verified, bytes_total,
+		       outcome, failure_class, COALESCE(error, '')
+		FROM server_attempts WHERE server = ? ORDER BY id`, server)
+	if err != nil {
+		t.Fatalf("load attempts: %v", err)
+	}
+	defer rows.Close()
+	var out []database.ServerAttempt
+	for rows.Next() {
+		var a database.ServerAttempt
+		if err := rows.Scan(&a.Server, &a.Category, &a.MediaID, &a.Title, &a.DurationMs,
+			&a.BytesVerified, &a.BytesTotal, &a.Outcome, &a.FailureClass, &a.Error); err != nil {
+			t.Fatalf("scan attempt: %v", err)
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// parseTestRange resolves a single "bytes=a-b" header against total.
+func parseTestRange(header string, total int64) (int64, int64, bool) {
+	spec, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return 0, 0, false
+	}
+	a, b, ok := strings.Cut(spec, "-")
+	if !ok {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(a, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	end, err := strconv.ParseInt(b, 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if end >= total {
+		end = total - 1
+	}
+	if start < 0 || start > end {
+		return 0, 0, false
+	}
+	return start, end, true
 }
 
 // Empty NZB URL -- should fail cleanly, not panic.

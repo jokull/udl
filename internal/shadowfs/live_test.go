@@ -57,7 +57,10 @@ func TestLiveNFS(t *testing.T) {
 	for _, e := range root {
 		names[e.Name()] = true
 	}
+	// The union serves macOS NFD names (see normalizeName), so expectations
+	// must be decomposed too.
 	for _, want := range []string{"Aladdin (1992).mkv", "Pókahontas (1995).mkv", "Frosinn (2013).mkv"} {
+		want = normalizeName(want)
 		if !names[want] {
 			t.Fatalf("root missing %q; got %v", want, keys(names))
 		}

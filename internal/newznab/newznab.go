@@ -20,10 +20,12 @@ import (
 // maxResponseSize limits indexer response bodies to 10MB.
 const maxResponseSize = 10 * 1024 * 1024
 
-// defaultUserAgent is sent on every indexer request unless overridden via
+// DefaultUserAgent is sent on every indexer request unless overridden via
 // per-indexer Headers. Some indexers (e.g. NZBFinder) reject Go's default
-// "Go-http-client/1.1" user agent with HTTP 403.
-const defaultUserAgent = "udl/1.0 (+https://github.com/jokull/udl)"
+// "Go-http-client/1.1" user agent with HTTP 403, making a valid API key look
+// dead — including on the NZB download endpoint, which is fetched outside this
+// package.
+const DefaultUserAgent = "udl/1.0 (+https://github.com/jokull/udl)"
 
 // Client talks to a single Newznab-compatible indexer.
 type Client struct {
@@ -54,7 +56,7 @@ func New(name, baseURL, apiKey string) *Client {
 		Name:    name,
 		URL:     strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
-		Headers: map[string]string{"User-Agent": defaultUserAgent},
+		Headers: map[string]string{"User-Agent": DefaultUserAgent},
 		http:    &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -218,17 +220,34 @@ func (c *Client) DownloadNZBContext(ctx context.Context, release Release) ([]byt
 		dlURL = u.String()
 	}
 
-	resp, err := c.doGet(ctx, c.http, dlURL)
+	return c.FetchNZB(ctx, dlURL, maxResponseSize)
+}
+
+// FetchNZB downloads an NZB by URL through this client's single request choke
+// point, so the default User-Agent and any per-indexer header overrides apply.
+// Callers outside this package must use it rather than a bare HTTP request:
+// indexers such as NZBFinder answer Go's default user agent with HTTP 403, and
+// a hand-rolled request silently loses the headers configured here.
+//
+// maxBytes caps the response; values <= 0 use the package default.
+func (c *Client) FetchNZB(ctx context.Context, rawURL string, maxBytes int64) ([]byte, error) {
+	if rawURL == "" {
+		return nil, WrapInvalid("download_nzb", fmt.Errorf("empty NZB URL"))
+	}
+	if maxBytes <= 0 {
+		maxBytes = maxResponseSize
+	}
+	resp, err := c.doGet(ctx, c.http, rawURL)
 	if err != nil {
-		return nil, classifyTransportError("download_nzb", dlURL, err)
+		return nil, classifyTransportError("download_nzb", rawURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, classifyStatusError("download_nzb", dlURL, resp.StatusCode)
+		return nil, classifyStatusError("download_nzb", rawURL, resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
 	if err != nil {
 		return nil, WrapRetryable("download_nzb", fmt.Errorf("read body: %w", err))
 	}
