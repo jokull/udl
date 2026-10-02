@@ -8,6 +8,7 @@ import (
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/failure"
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/quality"
@@ -34,7 +35,7 @@ func TestBlocklist_AddAndCheck(t *testing.T) {
 	}
 
 	// Add to blocklist.
-	if err := db.AddBlocklist("movie", 1, "Bad.Movie.2024.WEBDL-1080p", "PAR2 repair failed"); err != nil {
+	if err := db.AddBlocklist("movie", 1, "Bad.Movie.2024.WEBDL-1080p", "PAR2 repair failed", failure.Content); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,8 +74,8 @@ func TestBlocklist_ListAndClear(t *testing.T) {
 	}
 	defer db.Close()
 
-	db.AddBlocklist("movie", 1, "Release.A", "failed")
-	db.AddBlocklist("episode", 2, "Release.B", "corrupt")
+	db.AddBlocklist("movie", 1, "Release.A", "failed", failure.Content)
+	db.AddBlocklist("episode", 2, "Release.B", "corrupt", failure.Content)
 
 	entries, err := db.ListBlocklist()
 	if err != nil {
@@ -105,8 +106,8 @@ func TestBlocklist_Remove(t *testing.T) {
 	}
 	defer db.Close()
 
-	db.AddBlocklist("movie", 1, "Release.A", "failed")
-	db.AddBlocklist("movie", 1, "Release.B", "corrupt")
+	db.AddBlocklist("movie", 1, "Release.A", "failed", failure.Content)
+	db.AddBlocklist("movie", 1, "Release.B", "corrupt", failure.Content)
 
 	entries, _ := db.ListBlocklist()
 	if len(entries) != 2 {
@@ -174,7 +175,7 @@ func TestGrabBest_SkipsBlocklisted(t *testing.T) {
 	}
 
 	// Blocklist the high-score release.
-	db.AddBlocklist("movie", movieID, "Test.Movie.2024.Bluray-1080p-GROUP1", "PAR2 failed")
+	db.AddBlocklist("movie", movieID, "Test.Movie.2024.Bluray-1080p-GROUP1", "PAR2 failed", failure.Content)
 
 	grabbed, err := svc.GrabBest(releases, GrabContext{
 		Category: "movie",
@@ -229,7 +230,7 @@ func TestGrabBest_AllBlocklisted(t *testing.T) {
 	}
 
 	// Blocklist the only release.
-	db.AddBlocklist("movie", movieID, "Test.Movie.2024.WEBDL-1080p-GROUP1", "corrupt")
+	db.AddBlocklist("movie", movieID, "Test.Movie.2024.WEBDL-1080p-GROUP1", "corrupt", failure.Content)
 
 	grabbed, err := svc.GrabBest(releases, GrabContext{
 		Category: "movie",
@@ -293,4 +294,3 @@ func TestFail_AutoBlocklists(t *testing.T) {
 		t.Error("blocklist entry should have a reason")
 	}
 }
-

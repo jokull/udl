@@ -3,9 +3,9 @@ package daemon
 import (
 	"log/slog"
 	"net"
+	"net/rpc"
 	"os"
 	"path/filepath"
-	"net/rpc"
 	"testing"
 
 	"github.com/jokull/udl/internal/config"

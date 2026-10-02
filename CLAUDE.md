@@ -33,6 +33,13 @@ codesign --force --sign "UDL" ~/bin/udl && launchctl load ~/Library/LaunchAgents
 - **Daemon** runs: episode search (air-date-driven, 2m tick), movie search sweep (6h), downloader (polls queue every 5s)
 - **Download pipeline:** fetch NZB → parse → NNTP segment download → yEnc decode → PAR2 verify/repair → RAR extract → cleanup → import to library
 - **Plex download pipeline:** probe → verified 2 MiB range blocks into a persistent `.part` (+ `.meta.json` resume sidecar) → exact-size check → rename → import. Interruptions resume from the last verified block; the partial is only discarded on terminal failures or after the retry budget is spent.
+- **Failure taxonomy (`internal/failure`):** every failure carries a class — `content`,
+  `manual`, `missing`, `transport`, `permission`, `local`, `client`, `unknown`. Only
+  `content`/`manual` block a release permanently; `local`/`client` record nothing at all
+  (our fault is not the release's), and the rest cool down and lapse. `BlamesSource()`
+  decides whether a failure counts against a friend, `BlamesUs()` whether it spends the
+  retry budget. Classify from typed errors (`rangefetch.HTTPError`, `newznab.Error.Kind`,
+  `nntp.IsArticleNotFound`), never from message text.
 - **Friend-server selection:** derived from `server_attempts` (Beta-smoothed success rate + measured MB/s over 30 days), ranked reliability-band first then speed, with a derived transport-failure circuit breaker and 10% exploration. `[[plex.servers]]` in config carries only deny/prefer/bias overrides.
 
 ## Package Map
@@ -47,6 +54,12 @@ internal/
     downloader.go         Download queue processor
     scheduler.go          Air-date-driven episode search + movie search sweep
     searcher.go           Release scoring, cleanTitle() for movie matching, year validation
+    serverrank.go         Plex friend ranking (reliability band, speed, exploration, breaker)
+    doctor.go             `udl doctor` — health checks plus parked/partial/log findings
+    plexprobe.go          `udl plex probe` — measures each friend through the real transport
+  failure/                Failure classes and what each one justifies (blocking, cooldown,
+                          whose fault) — shared by blocklist, retry budget and reputation
+  logging/                Log rotation: truncate-in-place, because launchd holds the fd
   newznab/                Newznab API client (search, NZB fetch)
   nntp/
     conn.go               NNTP protocol (connect, auth, body fetch)
@@ -79,7 +92,9 @@ internal/
 - **Binary:** `~/bin/udl`, LaunchAgent `com.udl.daemon.plist`
 - **Library:** `/Users/jokull/Plex/media/{tv,movies}`
 - **Downloads:** `/Volumes/Plex/downloads/` (external exFAT volume)
-- **Logs:** `~/Library/Logs/udl.log`
+- **Logs:** `~/Library/Logs/udl.log` (bounded: the daemon truncates it past 64 MiB every
+  15 min, keeping an 8 MiB `.1`. launchd owns the descriptor, so rotation truncates in
+  place — a rename would leave launchd appending to the rotated file)
 - **Old Sonarr/Radarr/NZBGet:** unloaded, configs preserved at `~/mediaserver/.config/{radarr,sonarr}/`
 - See [CURRENT-SETUP.md](CURRENT-SETUP.md) for API keys and legacy setup details
 
@@ -97,6 +112,32 @@ TCC grants persist across rebuilds (ad-hoc `--sign -` pins to CDHash which chang
 The codesign step requires Keychain access to the private key which triggers a macOS dialog —
 this cannot be automated from Claude Code's sandbox without storing the login password in
 plaintext (`security set-key-partition-list`), which we don't do.
+
+## Diagnosing a live install
+
+`udl doctor` runs everything below and attaches the fix to each finding. By hand:
+
+```bash
+udl status                 # daemon, queue, failed (24h), blocklisted (active), parked
+udl doctor                 # all checks + parked items, partials, cooling friends, log size
+udl queue                  # downloads, including failed ones with their error
+udl blocklist              # blocks in force (--all includes lapsed cooldowns)
+udl plex probe             # measure friends now instead of waiting for traffic
+tail -f ~/Library/Logs/udl.log
+```
+
+Traps this codebase has already fallen into, worth remembering:
+
+- **The HTTP User-Agent.** NZBFinder answers Go's default `Go-http-client/1.1` with a
+  Cloudflare 403 that looks like a dead release. Every outbound request goes through
+  `internal/httpclient` (or `newznab.Client`, which is the indexer choke point).
+- **Timestamp types.** `modernc.org/sqlite` decodes a direct `TIMESTAMP` column reference
+  as `time.Time`, but an aggregate like `MAX(created_at)` as text. Scan the first into
+  `sql.NullTime` and the second into a string; parsing the wrong rendering fails silently
+  because callers ignore the error.
+- **Never delete what you did not create.** `library prune-incomplete` only removes
+  directories whose name parses as one of the daemon's own layouts, and reports anything
+  else instead of removing it.
 
 ## Conventions
 

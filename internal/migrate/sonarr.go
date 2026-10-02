@@ -3,6 +3,7 @@ package migrate
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/jokull/udl/internal/httpclient"
 	"io"
 	"log/slog"
 	"net/http"
@@ -28,21 +29,21 @@ type sonarrSeries struct {
 
 // sonarrEpisode is the subset of Sonarr's /api/v3/episode response we need.
 type sonarrEpisode struct {
-	ID             int    `json:"id"`
-	SeasonNumber   int    `json:"seasonNumber"`
-	EpisodeNumber  int    `json:"episodeNumber"`
-	Title          string `json:"title"`
-	AirDateUtc     string `json:"airDateUtc"`
-	HasFile        bool   `json:"hasFile"`
-	Monitored      bool   `json:"monitored"`
-	EpisodeFileID  int    `json:"episodeFileId"`
+	ID            int    `json:"id"`
+	SeasonNumber  int    `json:"seasonNumber"`
+	EpisodeNumber int    `json:"episodeNumber"`
+	Title         string `json:"title"`
+	AirDateUtc    string `json:"airDateUtc"`
+	HasFile       bool   `json:"hasFile"`
+	Monitored     bool   `json:"monitored"`
+	EpisodeFileID int    `json:"episodeFileId"`
 }
 
 // sonarrEpisodeFile is the subset of Sonarr's /api/v3/episodefile response we need.
 type sonarrEpisodeFile struct {
-	ID           int                 `json:"id"`
-	RelativePath string              `json:"relativePath"`
-	Quality      sonarrQualityWrap   `json:"quality"`
+	ID           int               `json:"id"`
+	RelativePath string            `json:"relativePath"`
+	Quality      sonarrQualityWrap `json:"quality"`
 }
 
 type sonarrQualityWrap struct {
@@ -216,6 +217,7 @@ func sonarrGet[T any](baseURL, apiKey, path string) (T, error) {
 		return zero, fmt.Errorf("sonarr: build request: %w", err)
 	}
 	req.Header.Set("X-Api-Key", apiKey)
+	httpclient.Set(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

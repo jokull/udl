@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"github.com/jokull/udl/internal/httpclient"
 	"io"
 	"net"
 	"net/http"
@@ -25,7 +26,7 @@ const maxResponseSize = 10 * 1024 * 1024
 // "Go-http-client/1.1" user agent with HTTP 403, making a valid API key look
 // dead — including on the NZB download endpoint, which is fetched outside this
 // package.
-const DefaultUserAgent = "udl/1.0 (+https://github.com/jokull/udl)"
+const DefaultUserAgent = httpclient.UserAgent
 
 // Client talks to a single Newznab-compatible indexer.
 type Client struct {

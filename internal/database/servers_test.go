@@ -3,9 +3,11 @@ package database
 import (
 	"testing"
 	"time"
+
+	"github.com/jokull/udl/internal/failure"
 )
 
-func attempt(server, outcome, class string, ended time.Time, bytes int64, durationMs int64) ServerAttempt {
+func attempt(server, outcome string, class failure.Class, ended time.Time, bytes int64, durationMs int64) ServerAttempt {
 	return ServerAttempt{
 		Server:        server,
 		Category:      "movie",
@@ -33,13 +35,13 @@ func TestRecordAndScoreServerAttempts(t *testing.T) {
 		// oldest first
 		attempt("solid", OutcomeCompleted, "", now.Add(-3*time.Hour), 10_000_000, 1000), // 10 MB/s
 		attempt("solid", OutcomeCompleted, "", now.Add(-2*time.Hour), 20_000_000, 2000), // 10 MB/s
-		attempt("solid", OutcomeFailed, FailureTransport, now.Add(-1*time.Hour), 0, 500),
-		attempt("flaky", OutcomeFailed, FailureTransport, now.Add(-2*time.Hour), 0, 100),
-		attempt("flaky", OutcomeFailed, FailureTransport, now.Add(-1*time.Hour), 0, 100),
-		attempt("flaky", OutcomeInterrupted, FailureTransport, now.Add(-30*time.Minute), 500, 100),
+		attempt("solid", OutcomeFailed, failure.Transport, now.Add(-1*time.Hour), 0, 500),
+		attempt("flaky", OutcomeFailed, failure.Transport, now.Add(-2*time.Hour), 0, 100),
+		attempt("flaky", OutcomeFailed, failure.Transport, now.Add(-1*time.Hour), 0, 100),
+		attempt("flaky", OutcomeInterrupted, failure.Transport, now.Add(-30*time.Minute), 500, 100),
 		attempt("flaky", OutcomeCompleted, "", now.Add(-10*time.Minute), 1_000_000, 1000),
-		attempt("misconfigured", OutcomeFailed, FailurePermission, now.Add(-1*time.Hour), 0, 10),
-		attempt("misconfigured", OutcomeFailed, FailurePermission, now.Add(-30*time.Minute), 0, 10),
+		attempt("misconfigured", OutcomeFailed, failure.Permission, now.Add(-1*time.Hour), 0, 10),
+		attempt("misconfigured", OutcomeFailed, failure.Permission, now.Add(-30*time.Minute), 0, 10),
 	}
 	for _, r := range rows {
 		if err := db.RecordServerAttempt(r); err != nil {
@@ -97,12 +99,12 @@ func TestConsecutiveTransportFailsCountsTrailingRun(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	for _, r := range []ServerAttempt{
 		attempt("s", OutcomeCompleted, "", now.Add(-5*time.Hour), 1, 1000),
-		attempt("s", OutcomeFailed, FailureTransport, now.Add(-4*time.Hour), 0, 10),
-		attempt("s", OutcomeInterrupted, FailureTransport, now.Add(-3*time.Hour), 0, 10),
-		attempt("s", OutcomeFailed, FailureTransport, now.Add(-2*time.Hour), 0, 10),
+		attempt("s", OutcomeFailed, failure.Transport, now.Add(-4*time.Hour), 0, 10),
+		attempt("s", OutcomeInterrupted, failure.Transport, now.Add(-3*time.Hour), 0, 10),
+		attempt("s", OutcomeFailed, failure.Transport, now.Add(-2*time.Hour), 0, 10),
 		// A content failure is not transport evidence; the run keeps counting
 		// the transport failures but is not extended by this one.
-		attempt("s", OutcomeFailed, FailureContent, now.Add(-1*time.Hour), 0, 10),
+		attempt("s", OutcomeFailed, failure.Content, now.Add(-1*time.Hour), 0, 10),
 	} {
 		if err := db.RecordServerAttempt(r); err != nil {
 			t.Fatal(err)

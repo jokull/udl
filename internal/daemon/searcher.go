@@ -626,16 +626,21 @@ func (s *Service) SearchWantedMovies() error {
 		if err != nil {
 			s.log.Error("movie sweep: grab count query failed", "title", m.Title, "error", err)
 		} else if grabbedCount >= grabAttemptLimit {
-			if err := s.db.MarkGrabLimitReached("movie", m.ID, grabbedCount); err != nil {
-				s.log.Error("movie sweep: mark grab limit reached failed", "title", m.Title, "error", err)
+			if s.rearmGrabCap("movie", m.ID) {
+				s.log.Info("movie grab cap re-armed after park window",
+					"title", m.Title, "previous_grabs", grabbedCount)
+			} else {
+				if err := s.db.MarkGrabLimitReached("movie", m.ID, grabbedCount); err != nil {
+					s.log.Error("movie sweep: mark grab limit reached failed", "title", m.Title, "error", err)
+				}
+				s.log.Warn("movie grab limit reached, marking failed", "title", m.Title, "grabs", grabbedCount)
+				continue
 			}
-			s.log.Warn("movie grab limit reached, marking failed", "title", m.Title, "grabs", grabbedCount)
-			continue
 		}
 
 		// Grab cooldown: skip movies grabbed recently without completing.
 		if last, err := s.db.LastGrabSinceCompleted("movie", m.ID); err == nil && last != "" {
-			if t, err := time.Parse("2006-01-02 15:04:05", last); err == nil && time.Since(t) < grabCooldown {
+			if t, err := time.Parse(dbTimeLayout, last); err == nil && time.Since(t) < grabCooldown {
 				s.log.Debug("movie sweep: skipping movie in grab cooldown", "title", m.Title, "last_grab", last)
 				continue
 			}
@@ -672,6 +677,37 @@ const grabAttemptLimit = 10
 // grabCooldown is the minimum time between grab attempts for a media item that
 // has not completed. Mirrors database.GrabCooldown for Go-side checks.
 const grabCooldown = 6 * time.Hour
+
+// grabParkWindow is how long an item parked by the grab cap stays parked before
+// the cap half-opens and it gets another chance.
+//
+// The cap exists to stop an item churning against indexers forever, not to make
+// it permanently undownloadable. The reason it filled up usually changes within
+// a week — a new release gets posted, a friend's server comes back, a bug in the
+// client gets fixed — and a parked item is invisible to every automatic retry,
+// so the decision to give up has to expire like any other verdict.
+const grabParkWindow = 7 * 24 * time.Hour
+
+// dbTimeLayout is the shape database.LastGrabSinceCompleted returns.
+const dbTimeLayout = "2006-01-02 15:04:05"
+
+// rearmGrabCap reports whether an item that burned the grab cap has been parked
+// long enough to deserve another attempt, resetting its counter if so.
+func (s *Service) rearmGrabCap(category string, mediaID int64) bool {
+	last, err := s.db.LastGrabSinceCompleted(category, mediaID)
+	if err != nil || last == "" {
+		return false
+	}
+	t, err := time.Parse(dbTimeLayout, last)
+	if err != nil || time.Since(t) < grabParkWindow {
+		return false
+	}
+	if err := s.db.ResetGrabCounter(category, mediaID); err != nil {
+		s.log.Error("re-arm grab cap: reset failed", "category", category, "media_id", mediaID, "error", err)
+		return false
+	}
+	return true
+}
 
 // rawDiscRe matches release titles for raw Bluray disc images (not playable media files).
 var rawDiscRe = regexp.MustCompile(`(?i)\b(COMPLETE\.?BLURAY|AVC\.?REMUX|BDREMUX|DISC\d*|ISO|BDISO)\b`)

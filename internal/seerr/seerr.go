@@ -5,6 +5,7 @@ package seerr
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/jokull/udl/internal/httpclient"
 	"io"
 	"net/http"
 	"strings"
@@ -71,6 +72,7 @@ func (c *Client) requests(filter string) ([]Request, error) {
 			return nil, fmt.Errorf("seerr: %w", err)
 		}
 		req.Header.Set("X-Api-Key", c.apiKey)
+		httpclient.Set(req)
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {

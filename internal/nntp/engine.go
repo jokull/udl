@@ -416,8 +416,10 @@ func (e *Engine) downloadSegment(ctx context.Context, preferredPool *Pool, messa
 	return nil, fmt.Errorf("segment %s: all providers failed: %w", messageID, err)
 }
 
-// isArticleNotFound returns true for permanent NNTP 430 "no such article" errors.
-func isArticleNotFound(err error) bool {
+// IsArticleNotFound reports whether err is the permanent NNTP 430 "no such
+// article" response. Exported so the downloader can classify the failure as a
+// missing release rather than a transport fault.
+func IsArticleNotFound(err error) bool {
 	return strings.Contains(err.Error(), "430")
 }
 
@@ -445,7 +447,7 @@ func (e *Engine) fetchFromPool(ctx context.Context, pool *Pool, messageID string
 			// Connection may be broken; discard it.
 			pool.Return(conn)
 			lastErr = err
-			if isArticleNotFound(err) {
+			if IsArticleNotFound(err) {
 				break // permanent error, don't retry
 			}
 			continue // transient error, retry with new connection

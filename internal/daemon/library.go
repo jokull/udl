@@ -71,11 +71,11 @@ type CleanupFinding struct {
 
 // LibraryCleanupReply contains the reply for the LibraryCleanup RPC method.
 type LibraryCleanupReply struct {
-	Findings        []CleanupFinding
-	Scanned         int
-	Orphans         int
-	Misnamed        int
-	Missing         int
+	Findings         []CleanupFinding
+	Scanned          int
+	Orphans          int
+	Misnamed         int
+	Missing          int
 	EmptyDirsRemoved int
 }
 
@@ -868,8 +868,31 @@ type PruneIncompleteReply struct {
 	PrunedDirs int
 }
 
+// parseIncompleteDirName recognises the layouts the daemon creates under the
+// incomplete directory: "{category}-{id}" for Usenet downloads and
+// "plex-{category}-{id}" for Plex friend downloads. Anything else returns
+// ok=false, which callers must treat as "not ours, do not delete": an
+// unrecognized layout is never evidence that a directory is disposable.
+func parseIncompleteDirName(name string) (category string, mediaID int64, ok bool) {
+	rest := strings.TrimPrefix(name, "plex-")
+	category, idPart, found := strings.Cut(rest, "-")
+	if !found || (category != "movie" && category != "episode") {
+		return "", 0, false
+	}
+	id, err := strconv.ParseInt(idPart, 10, 64)
+	if err != nil || id <= 0 {
+		return "", 0, false
+	}
+	return category, id, true
+}
+
 // LibraryPruneIncomplete scans the incomplete directory for orphan download dirs
 // whose corresponding download has completed, failed, or doesn't exist.
+//
+// Only directories whose name parses as one of the daemon's own layouts are
+// candidates for removal, and an unrecognized name is never removed: this has
+// to be safe to run against a live box, where a wrong guess destroys an active
+// download (see issue #4).
 func (s *Service) LibraryPruneIncomplete(args *PruneIncompleteArgs, reply *PruneIncompleteReply) error {
 	incDir := s.cfg.Paths.Incomplete
 	if incDir == "" {
@@ -892,63 +915,31 @@ func (s *Service) LibraryPruneIncomplete(args *PruneIncompleteArgs, reply *Prune
 		dirName := entry.Name()
 		dirPath := filepath.Join(incDir, dirName)
 
-		// Parse dir name as "{category}-{mediaID}" (e.g. "movie-42", "episode-17").
-		parts := strings.SplitN(dirName, "-", 2)
-		if len(parts) != 2 || (parts[0] != "movie" && parts[0] != "episode") {
-			// Unrecognized dir — could be a manual leftover.
-			size := dirSize(dirPath)
-			finding := PruneIncompleteFinding{
-				Dir:    dirPath,
-				Reason: "unknown",
-				Size:   size,
-			}
-			if args.Execute {
-				if err := os.RemoveAll(dirPath); err == nil {
-					finding.Pruned = true
-					reply.PrunedDirs++
-				}
-			}
-			reply.Findings = append(reply.Findings, finding)
-			reply.TotalSize += size
-			reply.TotalDirs++
-			continue
-		}
-		category := parts[0]
-		mediaID, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			size := dirSize(dirPath)
-			finding := PruneIncompleteFinding{Dir: dirPath, Reason: "unknown", Size: size}
-			if args.Execute {
-				if err := os.RemoveAll(dirPath); err == nil {
-					finding.Pruned = true
-					reply.PrunedDirs++
-				}
-			}
-			reply.Findings = append(reply.Findings, finding)
-			reply.TotalSize += size
-			reply.TotalDirs++
-			continue
-		}
+		category, mediaID, recognized := parseIncompleteDirName(dirName)
 
-		// Look up the media item's status directly.
-		var status string
-		table := "movies"
-		if category == "episode" {
-			table = "episodes"
-		}
-		err = s.db.QueryRow(fmt.Sprintf(`SELECT status FROM %s WHERE id = ?`, table), mediaID).Scan(&status)
 		var reason string
-		if err != nil {
+		prunable := false
+		if !recognized {
+			// Could be a manual leftover, a sample dir, or a layout we don't
+			// know about. Report it, never delete it.
 			reason = "unknown"
 		} else {
-			switch status {
-			case "downloaded":
-				reason = "completed"
-			case "failed":
-				reason = "failed"
-			case "queued", "downloading", "post_processing":
-				// Active download — skip.
-				continue
+			table := "movies"
+			if category == "episode" {
+				table = "episodes"
+			}
+			var status string
+			err := s.db.QueryRow(fmt.Sprintf(`SELECT status FROM %s WHERE id = ?`, table), mediaID).Scan(&status)
+			switch {
+			case err != nil:
+				// Our naming, but no such media: a genuine orphan.
+				reason, prunable = "orphan", true
+			case status == "downloaded":
+				reason, prunable = "completed", true
+			case status == "failed":
+				reason, prunable = "failed", true
+			case status == "queued", status == "downloading", status == "post_processing":
+				continue // active download — not an orphan
 			default:
 				reason = status
 			}
@@ -960,7 +951,7 @@ func (s *Service) LibraryPruneIncomplete(args *PruneIncompleteArgs, reply *Prune
 			Reason: reason,
 			Size:   size,
 		}
-		if args.Execute {
+		if args.Execute && prunable {
 			if err := os.RemoveAll(dirPath); err == nil {
 				finding.Pruned = true
 				reply.PrunedDirs++
@@ -1113,4 +1104,3 @@ func seriesTitleFromPath(filePath, tvRoot string) string {
 	}
 	return folder
 }
-

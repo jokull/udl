@@ -102,12 +102,18 @@ func (s *Scheduler) runEpisodeSearch() {
 		if err != nil {
 			s.svc.log.Error("episode search: grab count query failed", "episode_id", ep.ID, "error", err)
 		} else if grabbedCount >= grabAttemptLimit {
-			if err := s.svc.db.MarkGrabLimitReached("episode", ep.ID, grabbedCount); err != nil {
-				s.svc.log.Error("episode search: mark grab limit reached failed", "episode_id", ep.ID, "error", err)
+			if s.svc.rearmGrabCap("episode", ep.ID) {
+				s.svc.log.Info("episode grab cap re-armed after park window",
+					"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode,
+					"previous_grabs", grabbedCount)
+			} else {
+				if err := s.svc.db.MarkGrabLimitReached("episode", ep.ID, grabbedCount); err != nil {
+					s.svc.log.Error("episode search: mark grab limit reached failed", "episode_id", ep.ID, "error", err)
+				}
+				s.svc.log.Warn("episode grab limit reached, marking failed",
+					"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "grabs", grabbedCount)
+				continue
 			}
-			s.svc.log.Warn("episode grab limit reached, marking failed",
-				"series", ep.SeriesTitle, "season", ep.Season, "episode", ep.Episode, "grabs", grabbedCount)
-			continue
 		}
 
 		tvdbID := 0

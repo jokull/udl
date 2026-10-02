@@ -1,11 +1,14 @@
 package daemon
 
 import (
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/failure"
+	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/quality"
 	"github.com/jokull/udl/internal/rangefetch"
@@ -227,18 +230,45 @@ func TestClassifyPlexFailureSeparatesServerFromContent(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
-		want string
+		want failure.Class
 	}{
-		{"short read is transport", rangefetch.ErrShortRead, database.FailureTransport},
-		{"permission", &rangefetch.HTTPError{StatusCode: 403}, database.FailurePermission},
-		{"missing", &rangefetch.HTTPError{StatusCode: 404}, database.FailureMissing},
-		{"server error is transport", &rangefetch.HTTPError{StatusCode: 503}, database.FailureTransport},
-		{"size mismatch is content", rangefetch.ErrSizeMismatch, database.FailureContent},
-		{"resource changed is missing", rangefetch.ErrResourceChanged, database.FailureMissing},
+		{"short read is transport", rangefetch.ErrShortRead, failure.Transport},
+		{"permission", &rangefetch.HTTPError{StatusCode: 403}, failure.Permission},
+		{"missing", &rangefetch.HTTPError{StatusCode: 404}, failure.Missing},
+		{"server error is transport", &rangefetch.HTTPError{StatusCode: 503}, failure.Transport},
+		{"size mismatch is content", rangefetch.ErrSizeMismatch, failure.Content},
+		{"resource changed is missing", rangefetch.ErrResourceChanged, failure.Missing},
 	}
 	for _, tc := range cases {
 		if got := classifyPlexFailure(tc.err); got != tc.want {
 			t.Errorf("%s: classifyPlexFailure = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The Usenet side classifies from the kinds the lower layers already return, so
+// that a refusl from the indexer is never mistaken for a bad release. The
+// "HTTP 403" case is the one that blocklisted five healthy releases on a live
+// box when the daemon sent no User-Agent.
+func TestClassifyError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want failure.Class
+	}{
+		{"indexer refuses our request", newznab.WrapInvalid("download_nzb", errors.New("status 403")), failure.Permission},
+		{"indexer hiccup", newznab.WrapRetryable("query", errors.New("status 503")), failure.Transport},
+		{"release is gone", newznab.WrapPermanent("download_nzb", errors.New("status 404")), failure.Missing},
+		{"malformed url", newznab.WrapInvalid("build_request", errors.New("bad url")), failure.Permission},
+		{"article not found", errors.New("segment x: all providers failed: 430 no such article"), failure.Missing},
+		{"connection reset", errors.New("read: connection reset by peer"), failure.Unknown},
+		{"range not honoured", rangefetch.ErrRangeIgnored, failure.Transport},
+		{"resource changed", rangefetch.ErrResourceChanged, failure.Missing},
+		{"nil", nil, failure.Unknown},
+	}
+	for _, tc := range cases {
+		if got := classifyError(tc.err); got != tc.want {
+			t.Errorf("%s: classifyError = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }

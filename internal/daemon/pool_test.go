@@ -1,4 +1,3 @@
-
 package daemon
 
 import (
@@ -23,9 +22,9 @@ import (
 // downloads are in flight concurrently. Used to prove the worker pool
 // processes items in parallel (a single-worker design would serialize them).
 type gateEngine struct {
-	started  chan struct{} // signal when a download starts
-	release  chan struct{} // close to unblock all in-flight downloads
-	mu       sync.Mutex
+	started     chan struct{} // signal when a download starts
+	release     chan struct{} // close to unblock all in-flight downloads
+	mu          sync.Mutex
 	maxInFlight int
 	curInFlight int
 }

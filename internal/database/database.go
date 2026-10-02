@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jokull/udl/internal/failure"
 	_ "modernc.org/sqlite"
 )
 
@@ -134,7 +135,12 @@ CREATE TABLE IF NOT EXISTS blocklist (
     media_id INTEGER NOT NULL,
     release_title TEXT NOT NULL,
     reason TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Why the release was blocked, and when the block lapses. A NULL expiry
+    -- means permanent: only a release that arrived wrong, or that the user
+    -- rejected, is remembered forever.
+    failure_class TEXT,
+    expires_at TIMESTAMP
 );
 
 -- One row per transfer attempt against a Plex friend server. This is the
@@ -200,6 +206,19 @@ CREATE TABLE IF NOT EXISTS server_attempts (
 		return fmt.Errorf("add series original_language column: %w", err)
 	}
 
+	// Add failure class and expiry to blocklist (idempotent).
+	_, err = db.Exec(`ALTER TABLE blocklist ADD COLUMN failure_class TEXT`)
+	if err != nil && !isAlterDuplicate(err) {
+		return fmt.Errorf("add blocklist failure_class column: %w", err)
+	}
+	_, err = db.Exec(`ALTER TABLE blocklist ADD COLUMN expires_at TIMESTAMP`)
+	if err != nil && !isAlterDuplicate(err) {
+		return fmt.Errorf("add blocklist expires_at column: %w", err)
+	}
+	if err := db.backfillBlocklistClasses(); err != nil {
+		return fmt.Errorf("backfill blocklist classes: %w", err)
+	}
+
 	// Add poster_path column to movies and series (idempotent).
 	_, err = db.Exec(`ALTER TABLE movies ADD COLUMN poster_path TEXT`)
 	if err != nil && !isAlterDuplicate(err) {
@@ -210,6 +229,72 @@ CREATE TABLE IF NOT EXISTS server_attempts (
 		return fmt.Errorf("add series poster_path column: %w", err)
 	}
 
+	return nil
+}
+
+// backfillBlocklistClasses assigns a failure class to rows written before the
+// class was recorded, so that old transient failures stop being permanent.
+//
+// It also deletes rows that were never releases. Before Plex server faults were
+// recorded in server_attempts, a friend's server name was written into the
+// release blocklist ("plex:Stradivarius"). Such a row can never match a
+// candidate — it is not a release title — but it inflated the blocklist count
+// and, because the Usenet retry budget counts blocklist rows per media item, it
+// permanently burned the retry budget of whatever item it was attached to.
+//
+// Idempotent: it only touches rows with no class, and the delete is by pattern.
+func (db *DB) backfillBlocklistClasses() error {
+	if _, err := db.Exec(`DELETE FROM blocklist WHERE release_title LIKE 'plex:%'`); err != nil {
+		return err
+	}
+
+	rows, err := db.Query(`SELECT id, COALESCE(reason, ''), created_at FROM blocklist
+		WHERE failure_class IS NULL OR failure_class = ''`)
+	if err != nil {
+		return err
+	}
+	type pending struct {
+		id        int64
+		class     failure.Class
+		expiresAt sql.NullString
+	}
+	var work []pending
+	for rows.Next() {
+		var (
+			id        int64
+			reason    string
+			createdAt sql.NullTime
+		)
+		if err := rows.Scan(&id, &reason, &createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		p := pending{id: id, class: failure.ClassifyReason(reason)}
+		if !p.class.Permanent() {
+			// Anchor the cooldown at the row's own age, so a failure that was
+			// already old when this migration ran is expired immediately
+			// instead of blocking for another full cooldown.
+			base := time.Now()
+			if createdAt.Valid {
+				base = createdAt.Time
+			}
+			if d := p.class.Cooldown(); d > 0 {
+				p.expiresAt = sql.NullString{String: base.Add(d).UTC().Format(tsLayout), Valid: true}
+			}
+		}
+		work = append(work, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, p := range work {
+		if _, err := db.Exec(`UPDATE blocklist SET failure_class = ?, expires_at = ? WHERE id = ?`,
+			string(p.class), p.expiresAt, p.id); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1133,6 +1218,7 @@ func (db *DB) ListHistoryForSeries(seriesID int64, limit int) ([]History, error)
 func (db *DB) ListBlocklistForMedia(mediaType string, mediaID int64) ([]BlocklistEntry, error) {
 	rows, err := db.Query(`
 		SELECT b.id, b.media_type, b.media_id, b.release_title, b.reason, b.created_at,
+		       COALESCE(b.failure_class, ''), b.expires_at, `+activeBlockClause+` AS active,
 		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
 		       COALESCE(e.season, 0),
 		       COALESCE(e.episode, 0)
@@ -1151,7 +1237,7 @@ func (db *DB) ListBlocklistForMedia(mediaType string, mediaID int64) ([]Blocklis
 	for rows.Next() {
 		var e BlocklistEntry
 		if err := rows.Scan(&e.ID, &e.MediaType, &e.MediaID, &e.ReleaseTitle, &e.Reason, &e.CreatedAt,
-			&e.TmdbID, &e.Season, &e.EpisodeNum); err != nil {
+			&e.FailureClass, &e.ExpiresAt, &e.Active, &e.TmdbID, &e.Season, &e.EpisodeNum); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
@@ -1190,20 +1276,50 @@ func (db *DB) SeriesEpisodeCounts() (map[int64][3]int, error) {
 // Blocklist CRUD
 // ---------------------------------------------------------------------------
 
-// AddBlocklist adds a release title to the blocklist for a specific media item.
-func (db *DB) AddBlocklist(mediaType string, mediaID int64, releaseTitle, reason string) error {
+// activeBlockClause matches blocklist rows whose block has not lapsed. A row
+// with a NULL expiry is permanent.
+const activeBlockClause = `(expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`
+
+// AddBlocklist records that a release is not to be tried again for this media
+// item. The failure class decides how long that lasts: only a release that
+// arrived wrong, or that the user rejected, is blocked permanently. Everything
+// else lapses, because a failed transfer is usually about the moment rather
+// than about the release — and a blocklist entry is the one decision that
+// cannot be walked back by waiting.
+func (db *DB) AddBlocklist(mediaType string, mediaID int64, releaseTitle, reason string, class failure.Class) error {
+	if class.BlamesUs() {
+		// Nothing about the release may be concluded from our own fault, and
+		// parking it would only delay the retry that will work once the
+		// condition clears.
+		return nil
+	}
+	var expiresAt sql.NullString
+	if !class.Permanent() {
+		cooldown := class.Cooldown()
+		if cooldown == 0 {
+			// The failure says nothing about the release, so there is nothing
+			// worth remembering.
+			return nil
+		}
+		expiresAt = sql.NullString{
+			String: time.Now().Add(cooldown).UTC().Format(tsLayout),
+			Valid:  true,
+		}
+	}
 	_, err := db.Exec(
-		`INSERT INTO blocklist (media_type, media_id, release_title, reason) VALUES (?, ?, ?, ?)`,
-		mediaType, mediaID, releaseTitle, reason,
+		`INSERT INTO blocklist (media_type, media_id, release_title, reason, failure_class, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		mediaType, mediaID, releaseTitle, reason, string(class), expiresAt,
 	)
 	return err
 }
 
-// IsBlocklisted returns true if the release title is blocklisted for the given media item.
+// IsBlocklisted returns true if the release title is currently blocklisted for
+// the given media item. Lapsed cooldowns count as not blocklisted.
 func (db *DB) IsBlocklisted(mediaType string, mediaID int64, releaseTitle string) (bool, error) {
 	var count int
 	err := db.QueryRow(
-		`SELECT COUNT(*) FROM blocklist WHERE media_type = ? AND media_id = ? AND release_title = ?`,
+		`SELECT COUNT(*) FROM blocklist WHERE media_type = ? AND media_id = ? AND release_title = ? AND `+activeBlockClause,
 		mediaType, mediaID, releaseTitle,
 	).Scan(&count)
 	if err != nil {
@@ -1212,10 +1328,42 @@ func (db *DB) IsBlocklisted(mediaType string, mediaID int64, releaseTitle string
 	return count > 0, nil
 }
 
+// RemoveBlocklistWhere deletes blocklist entries matching the given filters and
+// returns how many were removed. Empty filters match everything, so at least
+// one must be supplied. This exists so that repairing a mistaken block — for
+// example the releases blocked by a client-side bug — does not require knowing
+// every row id or clearing the whole list.
+func (db *DB) RemoveBlocklistWhere(mediaType string, mediaID int64, reasonContains string) (int64, error) {
+	query := `DELETE FROM blocklist WHERE 1 = 1`
+	var args []any
+	if mediaType != "" {
+		query += ` AND media_type = ?`
+		args = append(args, mediaType)
+	}
+	if mediaID != 0 {
+		query += ` AND media_id = ?`
+		args = append(args, mediaID)
+	}
+	if reasonContains != "" {
+		query += ` AND (LOWER(reason) LIKE ? OR LOWER(release_title) LIKE ?)`
+		like := "%" + strings.ToLower(reasonContains) + "%"
+		args = append(args, like, like)
+	}
+	if len(args) == 0 {
+		return 0, fmt.Errorf("refusing to remove every blocklist entry; use ClearBlocklist")
+	}
+	res, err := db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ListBlocklist returns all blocklist entries, most recent first.
 func (db *DB) ListBlocklist() ([]BlocklistEntry, error) {
 	rows, err := db.Query(`
 		SELECT b.id, b.media_type, b.media_id, b.release_title, b.reason, b.created_at,
+		       COALESCE(b.failure_class, ''), b.expires_at, ` + activeBlockClause + ` AS active,
 		       COALESCE(m.tmdb_id, s.tmdb_id, 0),
 		       COALESCE(e.season, 0),
 		       COALESCE(e.episode, 0)
@@ -1234,7 +1382,7 @@ func (db *DB) ListBlocklist() ([]BlocklistEntry, error) {
 	for rows.Next() {
 		var e BlocklistEntry
 		if err := rows.Scan(&e.ID, &e.MediaType, &e.MediaID, &e.ReleaseTitle, &e.Reason, &e.CreatedAt,
-			&e.TmdbID, &e.Season, &e.EpisodeNum); err != nil {
+			&e.FailureClass, &e.ExpiresAt, &e.Active, &e.TmdbID, &e.Season, &e.EpisodeNum); err != nil {
 			return nil, err
 		}
 		entries = append(entries, e)
@@ -1608,10 +1756,83 @@ func (db *DB) UnmonitoredDownloadedEpisodes() ([]Episode, error) {
 	return episodes, rows.Err()
 }
 
-// BlocklistCount returns the total number of blocklist entries.
+// ActiveBlocklistByClass counts blocks still in force, grouped by failure
+// class. This is the actionable view: a bare lifetime total says nothing about
+// whether anything is actually being held back.
+func (db *DB) ActiveBlocklistByClass() (map[failure.Class]int, error) {
+	rows, err := db.Query(`SELECT COALESCE(failure_class, ?), COUNT(*) FROM blocklist WHERE `+activeBlockClause+` GROUP BY 1`, string(failure.Unknown))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[failure.Class]int{}
+	for rows.Next() {
+		var class failure.Class
+		var n int
+		if err := rows.Scan(&class, &n); err != nil {
+			return nil, err
+		}
+		out[class] = n
+	}
+	return out, rows.Err()
+}
+
+// BlocklistCount returns the total number of blocklist entries, including
+// rows whose cooldown has lapsed.
 func (db *DB) BlocklistCount() (int, error) {
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM blocklist`).Scan(&count)
+	return count, err
+}
+
+// ActiveBlocklistCount returns the number of entries still in force. This is
+// the number that means something to an operator: a high lifetime count is
+// history, not a health problem.
+func (db *DB) ActiveBlocklistCount() (int, error) {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM blocklist WHERE ` + activeBlockClause).Scan(&count)
+	return count, err
+}
+
+// ShadowMoviesForProbe returns movies that a friend is known to have: ours are
+// deliberately not stored locally (status "shadow"), so asking Plex about them
+// is a reliable way to find something to sample per server.
+func (db *DB) ShadowMoviesForProbe(limit int) ([]Movie, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+	rows, err := db.Query(`
+		SELECT id, tmdb_id, imdb_id, title, year
+		FROM movies WHERE status = 'shadow' AND tmdb_id > 0
+		ORDER BY id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Movie
+	for rows.Next() {
+		var m Movie
+		if err := rows.Scan(&m.ID, &m.TmdbID, &m.ImdbID, &m.Title, &m.Year); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ParkedCount returns how many media items are parked because they burned the
+// grab cap. Such items are deliberately excluded from the failed-in-24h count
+// (the park path clears download_started_at so the scheduler will not resurrect
+// them), which also makes them invisible in a health summary — but they are not
+// going to fix themselves before the park window, so an operator should be able
+// to see them and decide.
+func (db *DB) ParkedCount() (int, error) {
+	var count int
+	err := db.QueryRow(`
+		SELECT (SELECT COUNT(*) FROM movies   WHERE status = 'failed' AND download_error LIKE 'grab limit reached%')
+		     + (SELECT COUNT(*) FROM episodes WHERE status = 'failed' AND download_error LIKE 'grab limit reached%')`).Scan(&count)
 	return count, err
 }
 
@@ -1619,11 +1840,16 @@ func (db *DB) BlocklistCount() (int, error) {
 // specific media item created within the given duration. Used by failAndRetry
 // to determine retry budget without in-memory state.
 func (db *DB) RecentBlocklistCountForMedia(mediaType string, mediaID int64, since time.Duration) (int, error) {
-	threshold := time.Now().Add(-since).UTC().Format("2006-01-02 15:04:05")
+	threshold := time.Now().Add(-since).UTC().Format(tsLayout)
 	var count int
+	// Failures that were our own doing do not consume the budget: the release
+	// was never given a fair chance, so counting it would retire the item for a
+	// reason that has nothing to do with its availability.
 	err := db.QueryRow(
-		`SELECT COUNT(*) FROM blocklist WHERE media_type = ? AND media_id = ? AND created_at > ?`,
-		mediaType, mediaID, threshold,
+		`SELECT COUNT(*) FROM blocklist
+		 WHERE media_type = ? AND media_id = ? AND created_at > ? AND `+activeBlockClause+`
+		   AND COALESCE(failure_class, '') NOT IN (?, ?)`,
+		mediaType, mediaID, threshold, string(failure.Local), string(failure.Client),
 	).Scan(&count)
 	return count, err
 }

@@ -12,12 +12,14 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/failure"
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/nntp"
 	"github.com/jokull/udl/internal/nzb"
@@ -335,7 +337,13 @@ type StatusReply struct {
 	LibraryTV     string
 	Checks        []HealthCheck
 	FailedCount   int // failed downloads in last 24h
-	BlockedCount  int // blocklist size
+	BlockedCount  int // blocklist size, including lapsed cooldowns
+	// BlockedActiveCount is the blocklist as an operator cares about it: entries
+	// still in force. The lifetime total is history, not a health signal.
+	BlockedActiveCount int
+	// ParkedCount is the number of items the grab cap has parked. They are
+	// waiting either for the cap to half-open or for a person to retry them.
+	ParkedCount int
 }
 
 // --- Remove types ---
@@ -1112,7 +1120,7 @@ func (s *Service) MovieDelete(args *MovieDeleteArgs, reply *MovieDeleteReply) er
 		// Blocklist old NZB if present, then re-search.
 		if args.Search {
 			if movie.NzbName.Valid && movie.NzbName.String != "" {
-				s.db.AddBlocklist("movie", movie.ID, movie.NzbName.String, "manually deleted for re-download")
+				s.db.AddBlocklist("movie", movie.ID, movie.NzbName.String, "manually deleted for re-download", failure.Manual)
 				s.log.Info("MovieDelete: blocklisted release", "name", movie.NzbName.String)
 			}
 			s.retryMedia("movie", movie.ID)
@@ -1443,6 +1451,12 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	if n, err := s.db.BlocklistCount(); err == nil {
 		reply.BlockedCount = n
 	}
+	if n, err := s.db.ActiveBlocklistCount(); err == nil {
+		reply.BlockedActiveCount = n
+	}
+	if n, err := s.db.ParkedCount(); err == nil {
+		reply.ParkedCount = n
+	}
 
 	return nil
 }
@@ -1663,8 +1677,11 @@ type BlocklistReply struct {
 }
 
 // BlocklistRemoveArgs contains arguments for the BlocklistRemove RPC method.
+// Either ID, or a combination of Media and Reason, identifies what to remove.
 type BlocklistRemoveArgs struct {
-	ID int64
+	ID     int64
+	Media  string // e.g. "movie:1419406"
+	Reason string // substring match against reason and release title
 }
 
 // BlocklistClearReply contains the reply for the BlocklistClear RPC method.
@@ -1789,7 +1806,36 @@ func (s *Service) Blocklist(args *Empty, reply *BlocklistReply) error {
 
 // BlocklistRemove removes a single blocklist entry by ID.
 func (s *Service) BlocklistRemove(args *BlocklistRemoveArgs, reply *Empty) error {
-	return s.db.RemoveBlocklist(args.ID)
+	if args.ID != 0 {
+		return s.db.RemoveBlocklist(args.ID)
+	}
+	mediaType, mediaID, err := splitMediaTag(args.Media)
+	if err != nil {
+		return err
+	}
+	n, err := s.db.RemoveBlocklistWhere(mediaType, mediaID, args.Reason)
+	if err != nil {
+		return fmt.Errorf("BlocklistRemove: %w", err)
+	}
+	s.log.Info("removed blocklist entries", "count", n, "media", args.Media, "reason", args.Reason)
+	return nil
+}
+
+// splitMediaTag parses "movie:1419406" / "episode:8703", returning empty values
+// for an empty tag.
+func splitMediaTag(tag string) (string, int64, error) {
+	if tag == "" {
+		return "", 0, nil
+	}
+	kind, idPart, found := strings.Cut(tag, ":")
+	if !found || (kind != "movie" && kind != "episode") {
+		return "", 0, fmt.Errorf("invalid media %q, want movie:<id> or episode:<id>", tag)
+	}
+	id, err := strconv.ParseInt(idPart, 10, 64)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid media id in %q: %w", tag, err)
+	}
+	return kind, id, nil
 }
 
 // BlocklistClear removes all blocklist entries.
@@ -2541,7 +2587,7 @@ func (s *Service) TVDelete(args *TVDeleteArgs, reply *TVDeleteReply) error {
 			// Blocklist old NZB and re-search if requested.
 			if args.Search && item.Deleted {
 				if ep.NzbName.Valid && ep.NzbName.String != "" {
-					s.db.AddBlocklist("episode", ep.ID, ep.NzbName.String, "manually deleted for re-download")
+					s.db.AddBlocklist("episode", ep.ID, ep.NzbName.String, "manually deleted for re-download", failure.Manual)
 					s.log.Info("TVDelete: blocklisted release", "name", ep.NzbName.String)
 				}
 				s.retryMedia("episode", ep.ID)
@@ -3109,6 +3155,8 @@ func ServeWithContext(ctx context.Context, cfg *config.Config, db *database.DB, 
 				Downloading:   reply.Downloading,
 				FailedCount:   reply.FailedCount,
 				BlockedCount:  reply.BlockedCount,
+				BlockedActive: reply.BlockedActiveCount,
+				Parked:        reply.ParkedCount,
 				IndexerCount:  reply.IndexerCount,
 				MovieCount:    reply.MovieCount,
 				SeriesCount:   reply.SeriesCount,

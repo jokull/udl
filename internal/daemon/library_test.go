@@ -542,7 +542,7 @@ func TestPruneIncomplete_DetectsOrphans(t *testing.T) {
 	// Dir names use new "{category}-{mediaID}" format.
 	dir1 := fmt.Sprintf("movie-%d", movieID1) // downloaded -> completed
 	dir2 := fmt.Sprintf("movie-%d", movieID2) // failed
-	dir3 := "orphan-dir"                       // unknown (no matching record)
+	dir3 := "orphan-dir"                      // unknown (no matching record)
 
 	for _, name := range []string{dir1, dir2, dir3} {
 		dir := filepath.Join(svc.cfg.Paths.Incomplete, name)
@@ -646,7 +646,7 @@ func TestPruneIncomplete_PlexDirs(t *testing.T) {
 	movieID, _ := db.AddMovie(10001, "tt1000100", "Plex Movie", 2024, "", "")
 	db.UpdateMovieStatus(movieID, "downloaded", "WEBDL-1080p", "/lib/plex_movie.mkv")
 
-	dirName := fmt.Sprintf("movie-%d", movieID)
+	dirName := fmt.Sprintf("plex-movie-%d", movieID)
 	dir := filepath.Join(svc.cfg.Paths.Incomplete, dirName)
 	os.MkdirAll(dir, 0o755)
 	os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 1024), 0o644)
@@ -661,6 +661,119 @@ func TestPruneIncomplete_PlexDirs(t *testing.T) {
 	}
 	if reply.PrunedDirs != 1 {
 		t.Errorf("pruned_dirs = %d, want 1", reply.PrunedDirs)
+	}
+	if len(reply.Findings) == 1 && reply.Findings[0].Reason != "completed" {
+		t.Errorf("reason = %q, want completed", reply.Findings[0].Reason)
+	}
+}
+
+// An active Plex download directory must survive --execute. Regression test for
+// issue #4: the name "plex-movie-189" used to parse as category "plex", land in
+// the unknown bucket, and be deleted mid-download.
+func TestPruneIncomplete_PlexActiveNotPruned(t *testing.T) {
+	svc, db := testService(t)
+
+	movieID, _ := db.AddMovie(10001, "tt1000100", "Active Plex Movie", 2024, "", "")
+	db.UpdateMediaDownloadStatus("movie", movieID, "downloading")
+
+	dirName := fmt.Sprintf("plex-movie-%d", movieID)
+	dir := filepath.Join(svc.cfg.Paths.Incomplete, dirName)
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "plex-download.part"), make([]byte, 4096), 0o644)
+
+	var reply PruneIncompleteReply
+	if err := svc.LibraryPruneIncomplete(&PruneIncompleteArgs{Execute: true}, &reply); err != nil {
+		t.Fatal(err)
+	}
+
+	if reply.PrunedDirs != 0 {
+		t.Errorf("pruned_dirs = %d, want 0 (active download must not be pruned)", reply.PrunedDirs)
+	}
+	if reply.TotalDirs != 0 {
+		t.Errorf("total_dirs = %d, want 0 (an active dir is not an orphan)", reply.TotalDirs)
+	}
+	if !fileExists(dir) {
+		t.Fatal("active Plex download dir was deleted by --execute")
+	}
+	if !fileExists(filepath.Join(dir, "plex-download.part")) {
+		t.Error("partial file was deleted")
+	}
+}
+
+// A directory whose name we don't recognize is reported but never removed, even
+// with --execute: an unknown layout is not evidence that the data is disposable.
+func TestPruneIncomplete_UnknownNeverPruned(t *testing.T) {
+	svc, _ := testService(t)
+
+	for _, name := range []string{"some-sample-dir", "plex-feature-9", "movie-notanumber"} {
+		dir := filepath.Join(svc.cfg.Paths.Incomplete, name)
+		os.MkdirAll(dir, 0o755)
+		os.WriteFile(filepath.Join(dir, "data.bin"), make([]byte, 1024), 0o644)
+	}
+
+	var reply PruneIncompleteReply
+	if err := svc.LibraryPruneIncomplete(&PruneIncompleteArgs{Execute: true}, &reply); err != nil {
+		t.Fatal(err)
+	}
+
+	if reply.PrunedDirs != 0 {
+		t.Errorf("pruned_dirs = %d, want 0", reply.PrunedDirs)
+	}
+	for _, name := range []string{"some-sample-dir", "plex-feature-9", "movie-notanumber"} {
+		if !fileExists(filepath.Join(svc.cfg.Paths.Incomplete, name)) {
+			t.Errorf("unrecognized dir %s was removed", name)
+		}
+	}
+}
+
+func TestPruneIncomplete_PlexOrphanPruned(t *testing.T) {
+	svc, _ := testService(t)
+
+	// No DB row for id 99999, but the name is one the daemon writes: an orphan.
+	dir := filepath.Join(svc.cfg.Paths.Incomplete, "plex-episode-99999")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "plex-download.part"), make([]byte, 2048), 0o644)
+
+	var reply PruneIncompleteReply
+	if err := svc.LibraryPruneIncomplete(&PruneIncompleteArgs{Execute: true}, &reply); err != nil {
+		t.Fatal(err)
+	}
+
+	if reply.PrunedDirs != 1 {
+		t.Errorf("pruned_dirs = %d, want 1", reply.PrunedDirs)
+	}
+	if len(reply.Findings) == 1 && reply.Findings[0].Reason != "orphan" {
+		t.Errorf("reason = %q, want orphan", reply.Findings[0].Reason)
+	}
+	if fileExists(dir) {
+		t.Error("orphan dir should have been removed")
+	}
+}
+
+func TestParseIncompleteDirName(t *testing.T) {
+	cases := []struct {
+		name     string
+		category string
+		id       int64
+		ok       bool
+	}{
+		{"movie-42", "movie", 42, true},
+		{"episode-17", "episode", 17, true},
+		{"plex-movie-189", "movie", 189, true},
+		{"plex-episode-8703", "episode", 8703, true},
+		{"plex-feature-9", "", 0, false},  // not a category we write
+		{"some-sample-dir", "", 0, false}, // arbitrary junk
+		{"movie-notanumber", "", 0, false},
+		{"movie-0", "", 0, false}, // ids start at 1
+		{"plex-movie-", "", 0, false},
+		{"movi", "", 0, false},
+	}
+	for _, tc := range cases {
+		category, id, ok := parseIncompleteDirName(tc.name)
+		if ok != tc.ok || category != tc.category || id != tc.id {
+			t.Errorf("parseIncompleteDirName(%q) = (%q, %d, %v), want (%q, %d, %v)",
+				tc.name, category, id, ok, tc.category, tc.id, tc.ok)
+		}
 	}
 }
 

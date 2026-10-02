@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/failure"
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/nntp"
 	"github.com/jokull/udl/internal/nzb"
@@ -463,7 +464,7 @@ func (d *Downloader) processPostProcessing(ctx context.Context, item database.Qu
 
 	// Check if directory was deleted between enqueue and processing.
 	if _, err := os.Stat(dlDir); os.IsNotExist(err) {
-		if err := d.fail(item, "post-process: download directory missing"); err != nil {
+		if err := d.failAs(item, failure.Local, "post-process: download directory missing"); err != nil {
 			d.svc.log.Error("post-processing failed", "title", item.Title, "error", err)
 		}
 		return
@@ -516,25 +517,25 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 	// 2. Check disk space before starting.
 	if item.SizeBytes.Valid {
 		if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, item.SizeBytes.Int64, 2); err != nil {
-			return d.fail(item, err.Error())
+			return d.failAs(item, failure.Local, err.Error())
 		}
 	}
 
 	// 3. Fetch NZB bytes from the item's nzb_url.
 	if !item.NzbURL.Valid || item.NzbURL.String == "" {
-		return d.fail(item, "download has no NZB URL")
+		return d.failAs(item, failure.Client, "download has no NZB URL")
 	}
 	nzbURL := item.NzbURL.String
 
 	nzbData, err := d.fetchNZB(ctx, nzbURL)
 	if err != nil {
-		return d.failAndRetry(item, fmt.Sprintf("fetch NZB: %v", err))
+		return d.failAndRetryAs(item, classifyError(err), fmt.Sprintf("fetch NZB: %v", err))
 	}
 
 	// 4. Parse NZB XML.
 	parsed, err := nzb.Parse(bytes.NewReader(nzbData))
 	if err != nil {
-		return d.failAndRetry(item, fmt.Sprintf("parse NZB: %v", err))
+		return d.failAndRetryAs(item, failure.Content, fmt.Sprintf("parse NZB: %v", err))
 	}
 	d.svc.log.Info("usenet: starting NNTP download", "title", item.Title, "files", len(parsed.Files))
 
@@ -545,7 +546,7 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 	d.cleanStaleDownloadDir(dlDir, nzbData)
 
 	if err := os.MkdirAll(dlDir, 0o755); err != nil {
-		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
+		return d.failAs(item, failure.Local, fmt.Sprintf("create download dir: %v", err), dlDir)
 	}
 
 	// Extract password from NZB metadata (if present).
@@ -580,13 +581,13 @@ func (d *Downloader) processUsenetDownloadOnly(ctx context.Context, item databas
 
 	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
 	if healthAborted {
-		return d.failAndRetry(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
+		return d.failAndRetryAs(item, failure.Missing, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
 	}
 	if err != nil {
 		if strings.Contains(err.Error(), "segments failed") {
 			d.svc.log.Warn("some segments failed, proceeding to PAR2 repair", "title", item.Title, "error", err)
 		} else {
-			return d.failAndRetry(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
+			return d.failAndRetryAs(item, classifyError(err), fmt.Sprintf("NNTP download: %v", err), dlDir)
 		}
 	}
 
@@ -727,28 +728,85 @@ func plexServerName(item database.QueueItem) string {
 // FailureTransport counts against a server's reputation — a friend hosting a
 // file that will not post-process, or one whose sharing is misconfigured, must
 // not be recorded as flaky.
-func classifyPlexFailure(err error) string {
+func classifyPlexFailure(err error) failure.Class {
 	if err == nil {
-		return ""
+		return failure.Unknown
 	}
 	var he *rangefetch.HTTPError
 	if errors.As(err, &he) {
 		switch he.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
-			return database.FailurePermission
+			return failure.Permission
 		case http.StatusNotFound, http.StatusGone:
-			return database.FailureMissing
+			return failure.Missing
 		}
 	}
 	switch {
 	case errors.Is(err, rangefetch.ErrResourceChanged),
 		errors.Is(err, rangefetch.ErrRangeBeyondEOF):
-		return database.FailureMissing
+		return failure.Missing
 	case errors.Is(err, rangefetch.ErrSizeMismatch):
-		return database.FailureContent
+		return failure.Content
 	default:
-		return database.FailureTransport
+		return failure.Transport
 	}
+}
+
+// classifyError maps a download-side error onto the shared failure taxonomy.
+//
+// It reads the typed errors the lower layers already return (rangefetch's
+// HTTPError, newznab's retryable/invalid/permanent kinds, the nntp engine's
+// article-not-found) rather than matching on message text, so that a change of
+// wording cannot silently move a failure into the wrong bucket.
+func classifyError(err error) failure.Class {
+	if err == nil {
+		return failure.Unknown
+	}
+
+	var he *rangefetch.HTTPError
+	if errors.As(err, &he) {
+		switch {
+		case he.StatusCode == http.StatusUnauthorized, he.StatusCode == http.StatusForbidden:
+			return failure.Permission
+		case he.StatusCode == http.StatusNotFound, he.StatusCode == http.StatusGone:
+			return failure.Missing
+		case he.StatusCode == http.StatusTooManyRequests, he.StatusCode >= 500:
+			return failure.Transport
+		case he.StatusCode >= 400:
+			return failure.Client
+		}
+	}
+
+	var ne *newznab.Error
+	if errors.As(err, &ne) {
+		switch ne.Kind {
+		case newznab.Retryable:
+			// The indexer or the network hiccuped; the release is not implicated.
+			return failure.Transport
+		case newznab.Invalid:
+			// The server refused our request — credentials, headers, or a URL
+			// we built wrong. Never the release's fault.
+			return failure.Permission
+		case newznab.Permanent:
+			return failure.Missing
+		}
+	}
+
+	if nntp.IsArticleNotFound(err) {
+		return failure.Missing
+	}
+
+	switch {
+	case errors.Is(err, rangefetch.ErrResourceChanged), errors.Is(err, rangefetch.ErrRangeBeyondEOF):
+		return failure.Missing
+	case errors.Is(err, rangefetch.ErrSizeMismatch):
+		return failure.Content
+	case errors.Is(err, rangefetch.ErrShortRead), errors.Is(err, rangefetch.ErrUnknownSize),
+		errors.Is(err, rangefetch.ErrRangeIgnored), errors.Is(err, rangefetch.ErrMalformedContentRange),
+		errors.Is(err, rangefetch.ErrRangeMismatch):
+		return failure.Transport
+	}
+	return failure.Unknown
 }
 
 // isDBClosedErr reports a write that failed only because the database was
@@ -767,7 +825,7 @@ func isDBClosedErr(err error) bool {
 
 // recordPlexAttempt appends one server_attempts row. Failure to record is
 // logged but never returned: reputation is advisory.
-func (d *Downloader) recordPlexAttempt(item database.QueueItem, started time.Time, startBytes, endBytes, total int64, outcome, class, errMsg string) {
+func (d *Downloader) recordPlexAttempt(item database.QueueItem, started time.Time, startBytes, endBytes, total int64, outcome string, class failure.Class, errMsg string) {
 	server := plexServerName(item)
 	if server == "" {
 		return
@@ -812,19 +870,19 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 	// Check disk space before starting. Plex needs 1x size (stream + library copy on same volume).
 	if item.SizeBytes.Valid {
 		if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, item.SizeBytes.Int64, 1); err != nil {
-			return d.fail(item, err.Error())
+			return d.failAs(item, failure.Local, err.Error())
 		}
 	}
 
 	if !item.NzbURL.Valid || item.NzbURL.String == "" {
-		return d.fail(item, "plex download has no URL")
+		return d.failAs(item, failure.Client, "plex download has no URL")
 	}
 	dlURL := item.NzbURL.String
 	started := time.Now()
 
 	downloadDir := d.plexDownloadDir(item)
 	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
-		return d.fail(item, fmt.Sprintf("create download dir: %v", err), downloadDir)
+		return d.failAs(item, failure.Local, fmt.Sprintf("create download dir: %v", err), downloadDir)
 	}
 
 	res, err := d.plexResource(ctx, item, dlURL)
@@ -838,19 +896,19 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 			return d.deferPlexRetry(item, fmt.Sprintf("probe: %v", err))
 		}
 		d.recordPlexAttempt(item, started, 0, 0, 0, outcome, classifyPlexFailure(err), err.Error())
-		return d.fail(item, fmt.Sprintf("plex download: %v", err), downloadDir)
+		return d.failAs(item, classifyPlexFailure(err), fmt.Sprintf("plex download: %v", err), downloadDir)
 	}
 
 	// The stored size may be missing or stale; check against the origin's own
 	// total so a full disk is caught before any bytes are written.
 	if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, res.Size, 1); err != nil {
-		return d.fail(item, err.Error())
+		return d.failAs(item, failure.Local, err.Error())
 	}
 
 	partPath := filepath.Join(downloadDir, "plex-download.part")
 	dl, err := rangefetch.Open(d.plexFetch, partPath, res, plexBlockSize)
 	if err != nil {
-		return d.fail(item, fmt.Sprintf("open download: %v", err), downloadDir)
+		return d.failAs(item, failure.Local, fmt.Sprintf("open download: %v", err), downloadDir)
 	}
 	defer func() { _ = dl.Close() }()
 
@@ -885,7 +943,7 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 		}
 		d.recordPlexAttempt(item, started, startBytes, dl.Completed(), res.Size,
 			database.OutcomeFailed, class, err.Error())
-		return d.fail(item, fmt.Sprintf("plex download: %v", err), downloadDir)
+		return d.failAs(item, class, fmt.Sprintf("plex download: %v", err), downloadDir)
 	}
 	d.recordPlexAttempt(item, started, startBytes, dl.Completed(), res.Size,
 		database.OutcomeCompleted, "", "")
@@ -897,7 +955,7 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 	}
 	finalPath := filepath.Join(downloadDir, "plex-download"+ext)
 	if err := os.Rename(partPath, finalPath); err != nil {
-		return d.fail(item, fmt.Sprintf("rename: %v", err), downloadDir)
+		return d.failAs(item, failure.Local, fmt.Sprintf("rename: %v", err), downloadDir)
 	}
 	_ = os.Remove(partPath + ".meta.json")
 
@@ -908,7 +966,7 @@ func (d *Downloader) processPlexDownload(ctx context.Context, item database.Queu
 
 	dstPath, err := d.importToLibrary(ctx, item, finalPath, nil, q)
 	if err != nil {
-		return d.fail(item, err.Error(), downloadDir)
+		return d.failAs(item, failure.Local, err.Error(), downloadDir)
 	}
 
 	d.clearPlexRetry(item)
@@ -954,7 +1012,7 @@ func (d *Downloader) deferPlexRetry(item database.QueueItem, msg string) error {
 
 	if attempts > maxPlexRetries {
 		d.clearPlexRetry(item)
-		return d.fail(item,
+		return d.failAs(item, failure.Transport,
 			fmt.Sprintf("%s (gave up after %d interruptions)", msg, attempts),
 			d.plexDownloadDir(item))
 	}
@@ -1021,25 +1079,25 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 	// 2. Check disk space before starting.
 	if item.SizeBytes.Valid {
 		if err := checkDiskSpace(d.svc.cfg.Paths.Incomplete, item.SizeBytes.Int64, 2); err != nil {
-			return d.fail(item, err.Error())
+			return d.failAs(item, failure.Local, err.Error())
 		}
 	}
 
 	// 3. Fetch NZB bytes from the item's nzb_url.
 	if !item.NzbURL.Valid || item.NzbURL.String == "" {
-		return d.fail(item, "download has no NZB URL")
+		return d.failAs(item, failure.Client, "download has no NZB URL")
 	}
 	nzbURL := item.NzbURL.String
 
 	nzbData, err := d.fetchNZB(ctx, nzbURL)
 	if err != nil {
-		return d.failAndRetry(item, fmt.Sprintf("fetch NZB: %v", err))
+		return d.failAndRetryAs(item, classifyError(err), fmt.Sprintf("fetch NZB: %v", err))
 	}
 
 	// 3. Parse NZB XML.
 	parsed, err := nzb.Parse(bytes.NewReader(nzbData))
 	if err != nil {
-		return d.failAndRetry(item, fmt.Sprintf("parse NZB: %v", err))
+		return d.failAndRetryAs(item, failure.Content, fmt.Sprintf("parse NZB: %v", err))
 	}
 	d.svc.log.Info("usenet: starting NNTP download", "title", item.Title, "files", len(parsed.Files))
 
@@ -1050,7 +1108,7 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 	d.cleanStaleDownloadDir(dlDir, nzbData)
 
 	if err := os.MkdirAll(dlDir, 0o755); err != nil {
-		return d.fail(item, fmt.Sprintf("create download dir: %v", err), dlDir)
+		return d.failAs(item, failure.Local, fmt.Sprintf("create download dir: %v", err), dlDir)
 	}
 
 	// Extract password from NZB metadata (if present).
@@ -1085,14 +1143,14 @@ func (d *Downloader) processUsenetDownload(ctx context.Context, item database.Qu
 
 	_, err = d.engine.Download(ctx, parsed, dlDir, progressFn)
 	if healthAborted {
-		return d.failAndRetry(item, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
+		return d.failAndRetryAs(item, failure.Missing, fmt.Sprintf("health abort: %d%% segments expired", 100), dlDir)
 	}
 	if err != nil {
 		// Segment failures are expected — PAR2 can repair up to ~10-15% missing data.
 		if strings.Contains(err.Error(), "segments failed") {
 			d.svc.log.Warn("some segments failed, proceeding to PAR2 repair", "title", item.Title, "error", err)
 		} else {
-			return d.failAndRetry(item, fmt.Sprintf("NNTP download: %v", err), dlDir)
+			return d.failAndRetryAs(item, classifyError(err), fmt.Sprintf("NNTP download: %v", err), dlDir)
 		}
 	}
 
@@ -1130,7 +1188,7 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 		if postprocess.IsPermanent(err) {
 			// Permanent post-processing error (bad RAR, encrypted, etc.) — this NZB is
 			// definitively bad. Blocklist it and immediately try an alternative release.
-			return d.failAndRetry(item, fmt.Sprintf("post-processing: %v", err), downloadDir)
+			return d.failAndRetryAs(item, failure.Content, fmt.Sprintf("post-processing: %v", err), downloadDir)
 		}
 		// Transient error — leave in post_processing status for retry.
 		// Checkpoints ensure completed stages won't re-run.
@@ -1141,10 +1199,10 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 		return err
 	}
 	if !result.Success {
-		return d.failAndRetry(item, fmt.Sprintf("post-processing failed: %s", result.Error), downloadDir)
+		return d.failAndRetryAs(item, failure.Content, fmt.Sprintf("post-processing failed: %s", result.Error), downloadDir)
 	}
 	if len(result.MediaFiles) == 0 {
-		return d.failAndRetry(item, "no media files found after post-processing", downloadDir)
+		return d.failAndRetryAs(item, failure.Content, "no media files found after post-processing", downloadDir)
 	}
 
 	mainMedia := result.MediaFiles[0]
@@ -1158,7 +1216,7 @@ func (d *Downloader) postProcessImportComplete(ctx context.Context, item databas
 
 	dstPath, err := d.importToLibrary(ctx, item, mainMedia, result.SubtitleFiles, q)
 	if err != nil {
-		return d.fail(item, err.Error(), downloadDir)
+		return d.failAs(item, failure.Local, err.Error(), downloadDir)
 	}
 
 	return d.completeDownload(item, q, dstPath, downloadDir)
@@ -1265,7 +1323,7 @@ func (d *Downloader) resumePostProcessing(ctx context.Context, item database.Que
 
 	// Edge case: directory was deleted between crash and restart.
 	if _, err := os.Stat(dlDir); os.IsNotExist(err) {
-		return d.fail(item, "resume: download directory missing")
+		return d.failAs(item, failure.Local, "resume: download directory missing")
 	}
 
 	// Check if file was already imported to library.
@@ -1359,6 +1417,14 @@ const maxAutoRetries = 5
 // This is the low-level failure handler — callers that want automatic retry should
 // use failAndRetry() instead.
 func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...string) error {
+	return d.failAs(item, failure.Unknown, msg, cleanupDir...)
+}
+
+// failAs is fail() with an explicit failure class. The class decides whether the
+// release is remembered at all (only a release that arrived wrong, or that the
+// user rejected, is remembered permanently) and how long the item waits before
+// trying again.
+func (d *Downloader) failAs(item database.QueueItem, class failure.Class, msg string, cleanupDir ...string) error {
 	if err := d.svc.db.SetMediaDownloadError(item.Category, item.MediaID, msg); err != nil {
 		d.svc.log.Error("failed to set download error", "title", item.Title, "error", err)
 	}
@@ -1372,10 +1438,14 @@ func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...str
 	if err := d.svc.db.AddHistory(item.Category, item.MediaID, item.Title, failEvent(msg), nzbName, ""); err != nil {
 		d.svc.log.Error("failed to record failure history", "title", item.Title, "error", err)
 	}
-	if nzbName != "" && !isPlexSource(item) {
-		if err := d.svc.db.AddBlocklist(item.Category, item.MediaID, nzbName, msg); err != nil {
+	if nzbName != "" && !isPlexSource(item) && !class.BlamesUs() {
+		if err := d.svc.db.AddBlocklist(item.Category, item.MediaID, nzbName, msg, class); err != nil {
 			d.svc.log.Error("failed to blocklist release", "title", item.Title, "release", nzbName, "error", err)
 		}
+	} else if class.BlamesUs() {
+		// Our own fault: say so, and do not hold the release responsible.
+		d.svc.log.Warn("failure was local, release not blocklisted",
+			"title", item.Title, "release", nzbName, "class", class.String())
 	}
 	// A Plex item's "nzb name" is the friend's server name, not a release:
 	// blocklisting it would pollute the release blocklist and the Usenet retry
@@ -1402,7 +1472,12 @@ func (d *Downloader) fail(item database.QueueItem, msg string, cleanupDir ...str
 // resets an item to 'wanted' (2h episodes, 6h movies), the 1-hour window means
 // the retry budget is fresh for the next failure chain.
 func (d *Downloader) failAndRetry(item database.QueueItem, msg string, cleanupDir ...string) error {
-	failErr := d.fail(item, msg, cleanupDir...)
+	return d.failAndRetryAs(item, failure.Unknown, msg, cleanupDir...)
+}
+
+// failAndRetryAs is failAndRetry() with an explicit failure class.
+func (d *Downloader) failAndRetryAs(item database.QueueItem, class failure.Class, msg string, cleanupDir ...string) error {
+	failErr := d.failAs(item, class, msg, cleanupDir...)
 
 	// Use recent blocklist entries as a persistent retry budget.
 	tried, _ := d.svc.db.RecentBlocklistCountForMedia(item.Category, item.MediaID, 1*time.Hour)
@@ -1689,12 +1764,13 @@ func (d *Downloader) fetchNZB(ctx context.Context, nzbURL string) ([]byte, error
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetch NZB: %w", err)
+		// The transport error already names the URL; the caller adds the phase.
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch NZB: HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(resp.Body, maxNZBSize))

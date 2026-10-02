@@ -8,6 +8,7 @@ import (
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/failure"
 	"github.com/jokull/udl/internal/nntp"
 	"github.com/jokull/udl/internal/postprocess"
 )
@@ -246,7 +247,7 @@ func TestDBHealthStats(t *testing.T) {
 		t.Errorf("initial blocklist count %d, want 0", bcount)
 	}
 
-	db.AddBlocklist("movie", 1, "Bad.Release", "test")
+	db.AddBlocklist("movie", 1, "Bad.Release", "test", failure.Content)
 	bcount, err = db.BlocklistCount()
 	if err != nil {
 		t.Fatal(err)

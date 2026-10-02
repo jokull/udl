@@ -100,6 +100,8 @@ type StatusData struct {
 	Downloading   int
 	FailedCount   int
 	BlockedCount  int
+	BlockedActive int
+	Parked        int
 	IndexerCount  int
 	MovieCount    int
 	SeriesCount   int

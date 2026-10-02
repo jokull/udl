@@ -106,9 +106,9 @@ func (p Prefs) ShouldGrab(release Quality, existing Quality) bool {
 
 // Profile is a named quality preset.
 type Profile struct {
-	Name         string
-	Description  string
-	Prefs        Prefs
+	Name        string
+	Description string
+	Prefs       Prefs
 }
 
 // Built-in profiles. Opinionated defaults — pick one and go.

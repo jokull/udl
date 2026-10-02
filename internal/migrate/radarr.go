@@ -3,6 +3,7 @@ package migrate
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/jokull/udl/internal/httpclient"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,13 +22,13 @@ type radarrMovie struct {
 	Path    string `json:"path"` // Absolute path to movie folder on disk.
 	HasFile bool   `json:"hasFile"`
 	// Monitored indicates whether Radarr is actively tracking this movie.
-	Monitored bool `json:"monitored"`
+	Monitored bool             `json:"monitored"`
 	MovieFile *radarrMovieFile `json:"movieFile"`
 }
 
 type radarrMovieFile struct {
-	RelativePath string              `json:"relativePath"`
-	Quality      radarrQualityWrap   `json:"quality"`
+	RelativePath string            `json:"relativePath"`
+	Quality      radarrQualityWrap `json:"quality"`
 }
 
 type radarrQualityWrap struct {
@@ -123,6 +124,7 @@ func fetchRadarrMovies(baseURL, apiKey string) ([]radarrMovie, error) {
 		return nil, fmt.Errorf("radarr: build request: %w", err)
 	}
 	req.Header.Set("X-Api-Key", apiKey)
+	httpclient.Set(req)
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

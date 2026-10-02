@@ -19,6 +19,7 @@ import (
 
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/failure"
 	"github.com/jokull/udl/internal/nntp"
 	"github.com/jokull/udl/internal/nzb"
 )
@@ -852,7 +853,7 @@ func TestPipeline_PlexResumesAfterInterruption(t *testing.T) {
 	if len(attempts) != 1 {
 		t.Fatalf("recorded %d attempts after the interruption, want 1", len(attempts))
 	}
-	if attempts[0].Outcome != database.OutcomeInterrupted || attempts[0].FailureClass != database.FailureTransport {
+	if attempts[0].Outcome != database.OutcomeInterrupted || attempts[0].FailureClass != failure.Transport {
 		t.Fatalf("interrupted attempt = %+v, want interrupted/transport", attempts[0])
 	}
 	if attempts[0].BytesVerified <= 0 {

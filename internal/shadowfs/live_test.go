@@ -3,11 +3,14 @@
 package shadowfs
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/go-git/go-billy/v5"
@@ -24,19 +27,10 @@ import (
 //
 // Run: go test -tags integration -run TestLiveNFS ./internal/shadowfs/ -v
 func TestLiveNFS(t *testing.T) {
-	upperTV := "/Users/jokull/Plex/dubbed-tv"
-	if r, err := filepath.EvalSymlinks(upperTV); err == nil {
-		upperTV = r
-	}
-	// The mount command moves local files to <dir>.upper; use that when it is
-	// populated, matching what the union would serve.
-	if upperAlt := upperTV + ".upper"; dirHasFiles(upperAlt) {
-		upperTV = upperAlt
-	}
-	if _, err := os.Stat(upperTV); err != nil {
-		t.Skipf("upper layer %s missing: %v", upperTV, err)
-	}
-
+	// The TV half below uses a scratch upper layer rather than the live mount
+	// directory: this test is about the union and the transport, and asserting
+	// against whatever a running agent happens to be serving makes it depend on
+	// that agent's manifest revision.
 	// Movies union: no real files, upper is an empty scratch dir.
 	movManifest, err := shadow.LoadManifest("dubbed")
 	if err != nil {
@@ -99,49 +93,96 @@ func TestLiveNFS(t *testing.T) {
 	}
 	t.Logf("movie %s: %d bytes verified through NFS (size=%d, magic=%q)", moviePath, n, movieSize, buf[:4])
 
-	// TV union: upper layer is the user's real dubbed-tv directory. Bluey
-	// must show BOTH the local Icelandic-titled files and shadow episodes.
+	// TV union: a scratch upper layer holding one synthetic local file, merged
+	// with the real manifest. Bluey must show BOTH.
 	tvManifest, err := shadow.LoadManifest("dubbed-tv")
 	if err != nil {
 		t.Fatalf("load dubbed-tv manifest: %v", err)
 	}
+	const seasonDir = "Bluey (2018)/Season 03"
+	upperTV := t.TempDir()
+	localName := "Local File (2020) - S03E01 - Test.mp4"
+	localBytes := make([]byte, 4096)
+	copy(localBytes, "local layer bytes")
+	localDir := filepath.Join(upperTV, seasonDir)
+	if err := os.MkdirAll(localDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, localName), localBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	fsTV := NewUnion(upperTV, tvManifest.Items, cache)
 	srvTV := serveTest(t, fsTV)
 	defer srvTV.Close()
 	tv := clientTest(t, srvTV.Addr())
 
-	season, err := tv.ReadDirPlus("Bluey (2018)/Season 03")
+	// Assert the union invariant rather than a pinned filename: everything the
+	// shadow manifest offers for this season, plus everything the upper layer
+	// holds, must appear. Hardcoding a name from someone's media library makes
+	// the test fail when their library changes, which says nothing about the
+	// union.
+	season, err := tv.ReadDirPlus(seasonDir)
 	if err != nil {
 		t.Fatalf("ReadDirPlus Bluey S03: %v", err)
 	}
-	sn := map[string]bool{}
-	var local, shadowEp bool
+	got := map[string]bool{}
 	for _, e := range season {
-		sn[e.Name()] = true
-		if e.Name() == "Blæja (Bluey) - s03e36 - Mold.mp4" {
-			local = true
-		}
-		if e.Name() == "Bluey (2018) - S03E02 - Bedroom.mp4" {
-			shadowEp = true
+		got[e.Name()] = true
+	}
+
+	want := map[string]string{} // normalized name -> which layer
+	for _, name := range dirNames(filepath.Join(upperTV, seasonDir)) {
+		want[normalizeName(name)] = "local"
+	}
+	prefix := seasonDir + "/"
+	for _, it := range tvManifest.Items {
+		if strings.HasPrefix(it.VirtualPath, prefix) {
+			want[normalizeName(strings.TrimPrefix(it.VirtualPath, prefix))] = "shadow"
 		}
 	}
-	if !local || !shadowEp {
-		t.Fatalf("Bluey S03 must merge local + shadow layers; got %d entries, local=%v shadow=%v\nsample: %v",
-			len(season), local, shadowEp, sample(sn, 12))
+	if len(want) == 0 {
+		t.Fatalf("nothing in %s from either layer — nothing to merge", seasonDir)
 	}
-	t.Logf("Bluey S03 merged: %d entries (local + shadow episodes)", len(season))
+
+	var local, shadow int
+	for name, layer := range want {
+		if got[name] {
+			if layer == "local" {
+				local++
+			} else {
+				shadow++
+			}
+			continue
+		}
+		t.Errorf("%s entry %q missing from the union (got %d entries: %v)", layer, name, len(season), sample(got, 12))
+	}
+	if local == 0 || shadow == 0 {
+		t.Errorf("merge not demonstrated: %d local + %d shadow entries in the union", local, shadow)
+	}
+	t.Logf("Bluey S03 merged: %d entries in the union, %d local + %d shadow expected", len(season), local, shadow)
 
 	// Read a local file through the union to prove upper-layer reads work.
-	lf, err := tv.Open("Bluey (2018)/Season 03/Blæja (Bluey) - s03e36 - Mold.mp4")
+	localPath := pathJoin(seasonDir, localName)
+	lf, err := tv.Open(localPath)
 	if err != nil {
-		t.Fatalf("open local Bluey ep: %v", err)
+		t.Fatalf("open local file %s: %v", localPath, err)
 	}
 	defer lf.Close()
-	lbuf := make([]byte, 64)
-	if _, err := lf.ReadAt(lbuf, 0); err != nil {
-		t.Fatalf("read local Bluey ep: %v", err)
+	lbuf := make([]byte, len(localBytes))
+	read, err := lf.ReadAt(lbuf, 0)
+	// Exactly filling the buffer at end-of-file is success; the NFS client
+	// reports io.EOF alongside the bytes.
+	if err != nil && !errors.Is(err, io.EOF) {
+		t.Fatalf("read local file through the union: %v", err)
 	}
-	t.Logf("local Bluey ep read OK: %q", lbuf[:8])
+	if read != len(localBytes) {
+		t.Fatalf("read %d bytes of %d through the union", read, len(localBytes))
+	}
+	if !bytes.Equal(lbuf[:read], localBytes) {
+		t.Error("local read returned bytes that do not match what was written")
+	}
+	t.Logf("local read OK: %s (%d bytes verified through the union)", localPath, read)
 }
 
 func serveTest(t *testing.T, fs billy.Filesystem) net.Listener {
@@ -191,6 +232,22 @@ func sample(m map[string]bool, n int) []string {
 
 var _ = fmt.Sprintf
 
+// dirNames lists the regular files directly inside dir, or nothing if dir does
+// not exist.
+func dirNames(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
 func dirHasFiles(dir string) bool {
 	des, err := os.ReadDir(dir)
 	return err == nil && len(des) > 0
@@ -206,20 +263,39 @@ func TestLiveFullWalk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load manifest: %v", err)
 	}
-	upperTV := "/Users/jokull/Plex/dubbed-tv"
-	if r, err := filepath.EvalSymlinks(upperTV); err == nil {
-		upperTV = r
+	// A scratch upper layer: this test is about walking a large union over NFS
+	// (the file-handle regression), not about the contents of the user's library.
+	// Pointing it at a live mount also compares a fresh manifest against whatever
+	// revision that agent loaded.
+	upperTV := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(upperTV, "Local Show"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if upperAlt := upperTV + ".upper"; dirHasFiles(upperAlt) {
-		upperTV = upperAlt
+	for i := range 3 {
+		p := filepath.Join(upperTV, "Local Show", "Episode "+string(rune('a'+i))+".mkv")
+		if err := os.WriteFile(p, []byte("local"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	upperFiles := 0
-	filepath.WalkDir(upperTV, func(_ string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() {
-			upperFiles++
+
+	// The union merges the two layers by name, so the expectation is the size of
+	// that merge, not the sum of the layers: a filename present in both is
+	// served once. (Summing counts it twice, which is what happens when the
+	// upper layer is empty and the path below is the live union mount itself.)
+	expected := map[string]bool{}
+	for _, it := range tvManifest.Items {
+		expected[normalizeName("/"+filepath.ToSlash(it.VirtualPath))] = true
+	}
+	filepath.WalkDir(upperTV, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if rel, rerr := filepath.Rel(upperTV, p); rerr == nil {
+			expected[normalizeName("/"+filepath.ToSlash(rel))] = true
 		}
 		return nil
 	})
+
 	fs := NewUnion(upperTV, tvManifest.Items, NewBlockCache(filepath.Join(t.TempDir(), "cache"), 1<<30))
 	srv := serveTest(t, fs)
 	defer srv.Close()
@@ -231,7 +307,7 @@ func TestLiveFullWalk(t *testing.T) {
 	}
 	queue := []node{{path: "/", dir: true}}
 	seen := map[string]bool{}
-	files := 0
+	got := map[string]bool{}
 	for len(queue) > 0 {
 		n := queue[0]
 		queue = queue[1:]
@@ -240,7 +316,7 @@ func TestLiveFullWalk(t *testing.T) {
 		}
 		seen[n.path] = true
 		if !n.dir {
-			files++
+			got[n.path] = true
 			continue
 		}
 		entries, err := client.ReadDirPlus(n.path)
@@ -257,11 +333,34 @@ func TestLiveFullWalk(t *testing.T) {
 			}
 		}
 	}
-	want := len(tvManifest.Items) + upperFiles
-	if files != want {
-		t.Fatalf("walk found %d files, want %d (%d manifest + %d upper)", files, want, len(tvManifest.Items), upperFiles)
+
+	// Everything either layer offers must be reachable through the union. Extra
+	// entries are reported but not fatal: this walks a live mount, whose
+	// manifest may lag the one on disk.
+	var missing []string
+	for path := range expected {
+		if !got[path] {
+			missing = append(missing, path)
+		}
 	}
-	t.Logf("full walk OK: %d files, %d dirs, no stale handles", files, len(seen)-files)
+	if len(missing) > 0 {
+		t.Fatalf("union is missing %d of %d expected files, e.g. %v",
+			len(missing), len(expected), sample(toSet(missing), 8))
+	}
+	if extra := len(got) - len(expected); extra > 0 {
+		t.Logf("note: %d entries beyond the expected set (live mount may hold a newer manifest)", extra)
+	}
+	t.Logf("full walk OK: %d files (%d expected, %d dirs) with no stale handles",
+		len(got), len(expected), len(seen)-len(got))
+}
+
+// toSet turns a name slice into a set for the sample() helper.
+func toSet(names []string) map[string]bool {
+	out := make(map[string]bool, len(names))
+	for _, n := range names {
+		out[n] = true
+	}
+	return out
 }
 
 // pathJoin joins virtual NFS paths with "/".

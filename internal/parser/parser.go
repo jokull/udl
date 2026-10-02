@@ -39,8 +39,8 @@ var (
 	yearPattern = regexp.MustCompile(`\b((?:19|20)\d{2})\b`)
 
 	// Resolution — includes "UHD" as an alias for 2160p
-	resPattern  = regexp.MustCompile(`(?i)\b(2160|1080|720|480)p\b`)
-	uhdPattern  = regexp.MustCompile(`(?i)\bUHD\b`)
+	resPattern = regexp.MustCompile(`(?i)\b(2160|1080|720|480)p\b`)
+	uhdPattern = regexp.MustCompile(`(?i)\bUHD\b`)
 
 	// Source keywords (order matters for matching)
 	sourcePattern = regexp.MustCompile(`(?i)\b(?:WEB[\.\-]?DL|WEB[\.\-]?Rip|WEBRip|BluRay|Blu[\.\-]?Ray|HDTV|DVDRip|DVD|REMUX)\b`)

@@ -264,9 +264,13 @@ udl queue pause                              # pause all downloads
 udl queue resume                             # resume all downloads
 udl queue clear                              # clear all queued entries
 udl history                                  # show download history
-udl blocklist                                # show blocklisted releases
+udl doctor                                   # check everything, say what to do
+udl blocklist                                # show blocks in force
+udl blocklist --all                          # include lapsed cooldowns
+udl blocklist remove <id>                    # remove a specific entry
+udl blocklist remove --media movie:1419406   # remove every entry for one item
+udl blocklist remove --reason 'HTTP 403'     # remove entries by cause (e.g. a bug)
 udl blocklist clear                          # clear all blocklist entries
-udl blocklist remove <id>                    # remove specific entry
 
 # Library management
 udl library import <dir>              # identify and import media (dry-run)
@@ -281,6 +285,8 @@ udl plex libraries           # map all libraries: type, download access, audio l
 udl plex cleanup             # delete candidates: unwatched, older than 90 days (read-only)
 udl plex cleanup --days 30   # shorter age threshold
 udl plex cleanup --verbose   # also show kept items with reasons
+udl plex probe               # measure each friend's speed and reliability
+udl plex probe --server kari --mb 8   # one friend, larger sample
 
 # Shadows — virtual NFS libraries of friends' Plex media
 udl shadow list              # list shadows (dubbed, dubbed-tv, movies)
@@ -362,6 +368,37 @@ plex:Stradivarius 43% success · 1.6 MB/s · 123 attempts (30d) · cooling after
 ```
 
 Use `[[plex.servers]]` in the config only for what observation cannot know — `deny` to retire a dead server, `prefer`/`bias` to favour one. A hand-maintained ranking is deliberately not the mechanism: friends change disks, ISPs and load, and a static order rots.
+
+`udl doctor` pairs every failing check with the command that fixes it, and reports the
+operational facts a status line hides: parked items, reclaimable partials, cooling
+friends, and logs that rotation is not keeping up with.
+
+`udl plex probe` exists because reputation is learned from real transfers, so a friend
+that is never chosen is never measured. It reads a 2 MiB window from the middle of a
+file each friend is known to have, through the same transport downloads use, and
+reports the speed. Readings are not recorded as attempts — they are a snapshot, not
+evidence.
+
+### What gets remembered
+
+Blocks are classified by **why** the attempt failed, and only a release that arrived
+wrong is blocked permanently:
+
+| Class | Meaning | Effect |
+|---|---|---|
+| `content` | Corrupt, passworded, failed repair or unpack | **Permanent** block |
+| `manual` | You deleted a file to force a different release | **Permanent** block |
+| `missing` | 404/410, expired articles, resource changed | 24 h |
+| `transport` | Short read, EOF, 5xx, timeout | 6 h |
+| `permission` | 401/403 — the source refused the request | 1 h |
+| `local` | Full disk, unwritable path, closed database | **no entry** |
+| `client` | Our own request or bookkeeping was wrong | **no entry** |
+
+The rule that matters: *never block a release for a failure that was ours.* A full disk
+or a malformed request says nothing about the release, so no entry is written and the
+retry budget is not spent. Every non-permanent block lapses, because a failed transfer
+is usually about the moment — and a blocklist entry is the one decision that cannot be
+walked back by waiting.
 
 The commands below map libraries:
 

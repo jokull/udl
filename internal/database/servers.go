@@ -1,8 +1,11 @@
 package database
 
 import (
+	"database/sql"
 	"fmt"
 	"time"
+
+	"github.com/jokull/udl/internal/failure"
 )
 
 // Server attempt outcomes.
@@ -10,15 +13,6 @@ const (
 	OutcomeCompleted   = "completed"
 	OutcomeInterrupted = "interrupted" // partial transfer kept for resume
 	OutcomeFailed      = "failed"
-)
-
-// Failure classes. Only FailureTransport is the server's fault; the rest must
-// not count against a server's reliability.
-const (
-	FailureTransport  = "transport"  // short read, EOF, 5xx, 429, timeout
-	FailurePermission = "permission" // 401/403 — server misconfigured, not flaky
-	FailureMissing    = "missing"    // 404/410, resource changed or vanished
-	FailureContent    = "content"    // transferred fine, then failed post-processing
 )
 
 // ServerAttempt is one transfer attempt against one Plex friend server.
@@ -33,7 +27,7 @@ type ServerAttempt struct {
 	BytesVerified int64
 	BytesTotal    int64
 	Outcome       string
-	FailureClass  string
+	FailureClass  failure.Class
 	Error         string
 }
 
@@ -92,6 +86,14 @@ func (db *DB) RecordServerAttempt(a ServerAttempt) error {
 	return err
 }
 
+// tsLayout is the wall-clock shape used for timestamps written by this package.
+//
+// Note that the driver's return type for a timestamp depends on the expression:
+// a direct column reference on a TIMESTAMP column arrives as time.Time, while an
+// aggregate such as MAX(created_at) arrives as text in this layout. Scan a
+// direct column into sql.NullTime and an aggregate into a string; mixing them up
+// fails silently, because parsing the wrong rendering just returns an error that
+// callers were ignoring.
 const tsLayout = "2006-01-02 15:04:05"
 
 // ServerScores derives per-server reputation from attempts within the window.
@@ -118,10 +120,10 @@ func (db *DB) ServerScores(since time.Duration, trailing int) (map[string]Server
 
 	type sample struct {
 		outcome  string
-		class    string
+		class    failure.Class
 		duration int64
 		bytes    int64
-		ended    string
+		ended    sql.NullTime
 	}
 	byServer := map[string][]sample{}
 	for rows.Next() {
@@ -143,7 +145,10 @@ func (db *DB) ServerScores(since time.Duration, trailing int) (map[string]Server
 
 		runStopped := false
 		for i, s := range samples {
-			if ts, err := time.Parse(tsLayout, s.ended); err == nil {
+			if s.ended.Valid {
+				// The driver decodes TIMESTAMP columns as time.Time, so use the
+				// value directly rather than re-parsing its rendering.
+				ts := s.ended.Time
 				if i == 0 {
 					sc.LastAttempt = ts
 				}
@@ -155,7 +160,7 @@ func (db *DB) ServerScores(since time.Duration, trailing int) (map[string]Server
 				switch {
 				case s.outcome == OutcomeCompleted:
 					runStopped = true
-				case s.class == FailureTransport:
+				case s.class == failure.Transport:
 					sc.ConsecutiveTransportFails++
 				default:
 					// A permission/missing/content failure is not transport

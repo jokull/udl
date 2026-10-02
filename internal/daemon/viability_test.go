@@ -204,10 +204,10 @@ const (
 
 func TestSizeAcceptable_MovieRanges(t *testing.T) {
 	cases := []struct {
-		name     string
-		quality  quality.Quality
-		size     int64
-		wantOK   bool
+		name    string
+		quality quality.Quality
+		size    int64
+		wantOK  bool
 	}{
 		{"1080p movie in range", quality.WEBDL1080p, 3 * gb, true},
 		{"1080p movie too small", quality.WEBDL1080p, 500 * mb, false},

@@ -2,6 +2,8 @@ package database
 
 import (
 	"database/sql"
+
+	"github.com/jokull/udl/internal/failure"
 )
 
 // Movie represents a movie tracked by the system.
@@ -18,13 +20,13 @@ type Movie struct {
 	FilePath         sql.NullString
 	AddedAt          sql.NullString
 	// Download fields (populated when status is queued/downloading/post_processing/failed).
-	NzbURL          sql.NullString
-	NzbName         sql.NullString
-	DownloadProgress float64
-	DownloadSize    sql.NullInt64
-	DownloadBytes   int64
-	DownloadError   sql.NullString
-	DownloadSource  sql.NullString
+	NzbURL            sql.NullString
+	NzbName           sql.NullString
+	DownloadProgress  float64
+	DownloadSize      sql.NullInt64
+	DownloadBytes     int64
+	DownloadError     sql.NullString
+	DownloadSource    sql.NullString
 	DownloadStartedAt sql.NullString
 }
 
@@ -84,12 +86,12 @@ type Episode struct {
 // Populated by a UNION query across movies and episodes tables.
 type QueueItem struct {
 	MediaID         int64
-	TmdbID          int            // TMDB ID: movie tmdb_id or series tmdb_id (for episodes)
-	SeriesID        int64          // series_id for episodes, 0 for movies
-	Category        string         // "movie" or "episode"
-	Title           string         // display title (computed in query)
-	Season          int            // episode season (0 for movies)
-	EpisodeNum      int            // episode number (0 for movies)
+	TmdbID          int    // TMDB ID: movie tmdb_id or series tmdb_id (for episodes)
+	SeriesID        int64  // series_id for episodes, 0 for movies
+	Category        string // "movie" or "episode"
+	Title           string // display title (computed in query)
+	Season          int    // episode season (0 for movies)
+	EpisodeNum      int    // episode number (0 for movies)
 	Status          string
 	NzbURL          sql.NullString
 	NzbName         sql.NullString
@@ -119,7 +121,7 @@ type History struct {
 	Title     string
 	Event     string
 	Source    sql.NullString
-	Quality  sql.NullString
+	Quality   sql.NullString
 	CreatedAt sql.NullString
 	// Populated by joins — not stored in history table.
 	TmdbID     int   // movie tmdb_id or series tmdb_id (for episodes)
@@ -131,7 +133,7 @@ type History struct {
 // WantedItem is a unified view of a wanted movie or episode.
 // Populated by a UNION query across movies and episodes tables.
 type WantedItem struct {
-	Category       string         // "movie" or "episode"
+	Category       string // "movie" or "episode"
 	MediaID        int64
 	TmdbID         int
 	SeriesID       int64          // series_id for episodes, 0 for movies
@@ -150,6 +152,13 @@ type BlocklistEntry struct {
 	ReleaseTitle string
 	Reason       string
 	CreatedAt    sql.NullString
+	FailureClass failure.Class
+	// ExpiresAt is NULL for a permanent block; otherwise the moment the
+	// cooldown lapses and the release becomes a candidate again.
+	ExpiresAt sql.NullString
+	// Active reports whether the block is still in force. Computed in SQL so
+	// the comparison uses the database's own clock rather than Go's.
+	Active bool
 	// Populated by joins — not stored in blocklist table.
 	TmdbID     int // movie tmdb_id or series tmdb_id (for episodes)
 	Season     int // episode season (0 for movies)

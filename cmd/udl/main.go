@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/daemon"
 	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/logging"
 	"github.com/jokull/udl/internal/migrate"
 	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/shadow"
@@ -52,6 +54,58 @@ var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "Show daemon status",
 	RunE:  runStatus,
+}
+
+var doctorCmd = &cobra.Command{
+	Use:   "doctor",
+	Short: "Check the whole install and say what to do about anything wrong",
+	Long: "Runs every health check plus the operational ones that a status summary\n" +
+		"hides — parked items, reclaimable partials, cooling friends, oversized\n" +
+		"logs — and pairs each problem with the command that addresses it.",
+	RunE: runDoctor,
+}
+
+func runDoctor(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	var reply daemon.DoctorReply
+	if err := client.Call("Service.Doctor", &daemon.Empty{}, &reply); err != nil {
+		return err
+	}
+	if len(reply.Findings) == 0 {
+		fmt.Println("nothing to check")
+		return nil
+	}
+
+	for _, f := range reply.Findings {
+		mark := "✓"
+		switch f.Status {
+		case "error":
+			mark = "✗"
+		case "warning":
+			mark = "!"
+		}
+		fmt.Printf("  %s %s — %s\n", mark, f.Name, f.Message)
+		if f.Hint != "" && f.Status != "ok" {
+			for _, line := range strings.Split(f.Hint, "\n") {
+				fmt.Printf("      %s\n", strings.TrimSpace(line))
+			}
+		}
+	}
+	fmt.Println()
+	switch {
+	case reply.Errors > 0:
+		fmt.Printf("%d error(s), %d warning(s), %d ok\n", reply.Errors, reply.Warnings, reply.Healthy)
+	case reply.Warnings > 0:
+		fmt.Printf("%d warning(s), %d ok\n", reply.Warnings, reply.Healthy)
+	default:
+		fmt.Printf("all %d checks ok\n", reply.Healthy)
+	}
+	return nil
 }
 
 var movieCmd = &cobra.Command{
@@ -195,6 +249,59 @@ var queueRetryCmd = &cobra.Command{
 	Short: "Retry failed downloads (all or by category:id)",
 	Args:  cobra.RangeArgs(0, 1),
 	RunE:  runQueueRetry,
+}
+
+var plexProbeCmd = &cobra.Command{
+	Use:   "probe",
+	Short: "Measure each Plex friend's current speed and reliability",
+	Long: "Reads a small range from a file each friend is known to have, through the\n" +
+		"same transport downloads use. Reputation is otherwise learned only from\n" +
+		"traffic, so a friend that is never chosen is never measured.",
+	RunE: runPlexProbe,
+}
+
+func runPlexProbe(cmd *cobra.Command, args []string) error {
+	client, err := daemon.Dial()
+	if err != nil {
+		return fmt.Errorf("cannot connect to daemon: %w", err)
+	}
+	defer client.Close()
+
+	server, _ := cmd.Flags().GetString("server")
+	mb, _ := cmd.Flags().GetInt("mb")
+
+	rpcArgs := &daemon.PlexProbeArgs{Server: server}
+	if mb > 0 {
+		rpcArgs.Bytes = int64(mb) << 20
+	}
+	var reply daemon.PlexProbeReply
+	if err := client.Call("Service.PlexProbe", rpcArgs, &reply); err != nil {
+		return err
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "SERVER\tRESULT\tSPEED\tSAMPLE\tRELIABILITY")
+	for _, r := range reply.Results {
+		speed := "—"
+		if r.OK && r.MBps > 0 {
+			speed = fmt.Sprintf("%.1f MB/s", r.MBps)
+		}
+		result := "ok"
+		if !r.OK {
+			result = "FAILED: " + r.Failed
+		}
+		reliability := "no history"
+		if r.Attempts > 0 {
+			reliability = fmt.Sprintf("%d%% of %d", r.Success, r.Attempts)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Server, result, speed, r.Sample, reliability)
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println("readings are not recorded as attempts; ranking learns from real transfers")
+	return nil
 }
 
 var queueEvictCmd = &cobra.Command{
@@ -402,9 +509,13 @@ var blocklistClearCmd = &cobra.Command{
 
 var blocklistRemoveCmd = &cobra.Command{
 	Use:   "remove [id]",
-	Short: "Remove a specific blocklist entry",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runBlocklistRemove,
+	Short: "Remove blocklist entries by id, media, or reason",
+	Long: "Removes one entry by id, or every matching entry by filter.\n\n" +
+		"  udl blocklist remove 518\n" +
+		"  udl blocklist remove --media movie:1419406\n" +
+		"  udl blocklist remove --reason 'HTTP 403'",
+	Args: cobra.MaximumNArgs(1),
+	RunE: runBlocklistRemove,
 }
 
 var historyCmd = &cobra.Command{
@@ -634,7 +745,9 @@ func init() {
 	plexCheckCmd.Flags().IntP("episode", "e", 0, "Filter TV results to a specific episode")
 	plexCleanupCmd.Flags().Int("days", 90, "Minimum days since added to consider for cleanup")
 	plexCleanupCmd.Flags().Bool("verbose", false, "Also show items that would be kept")
-	plexCmd.AddCommand(plexServersCmd, plexCheckCmd, plexCleanupCmd)
+	plexCmd.AddCommand(plexServersCmd, plexCheckCmd, plexCleanupCmd, plexProbeCmd)
+	plexProbeCmd.Flags().String("server", "", "Probe only this friend")
+	plexProbeCmd.Flags().Int("mb", 0, "Sample size in MiB per friend (default 2)")
 	plexLibrariesCmd.Flags().Bool("counts", false, "Fetch per-section item counts (1 request per section)")
 	plexLibrariesCmd.Flags().Bool("probe", false, "Verify real file fetch per section (ranged GET on first item)")
 	plexLibrariesCmd.Flags().Bool("audio", false, "Scan audio track languages per section (rate-limited, 1 request per item)")
@@ -653,9 +766,14 @@ func init() {
 	shadowMountCmd.Flags().Int("cache-size", 50, "block cache size in GiB")
 	shadowMountCmd.Flags().Bool("no-tuning", false, "skip disabling Plex preview thumbnails")
 	shadowMountCmd.Flags().Bool("daemon", false, "run as a root daemon: serve only, no mount (for launchd + automount)")
+	shadowMountCmd.Flags().String("log-file", "", "Log file to keep bounded (set by the generated agent)")
 	shadowEnableCmd.Flags().String("port", "", "fixed NFS port for the serve daemon (default: first free from 2055)")
 	shadowCmd.AddCommand(shadowCreateCmd, shadowAddCmd, shadowListCmd, shadowSourcesCmd, shadowManifestCmd, shadowMountCmd, shadowUnmountCmd, shadowEnableCmd, shadowDisableCmd, shadowCoveredCmd)
 	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
+	blocklistCmd.Flags().Bool("all", false, "Include blocks whose cooldown has lapsed")
+	blocklistRemoveCmd.Flags().String("media", "", "Remove entries for a media item, e.g. movie:1419406")
+	blocklistRemoveCmd.Flags().String("reason", "", "Remove entries whose reason or release contains this text")
+	daemonCmd.Flags().String("log-file", "", "Log file to keep bounded (default ~/Library/Logs/udl.log)")
 	configCmd.AddCommand(configCheckCmd, configPathCmd, configShowCmd)
 
 	migrateRadarrCmd.Flags().String("url", "", "Radarr base URL (e.g. http://localhost:7878)")
@@ -686,7 +804,7 @@ func init() {
 	nzbGrabCmd.Flags().StringP("output", "o", ".", "Output directory for downloaded files")
 	nzbCmd.AddCommand(nzbSearchCmd, nzbGrabCmd)
 
-	rootCmd.AddCommand(daemonCmd, statusCmd, movieCmd, tvCmd, queueCmd, plexCmd, shadowCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd, initCmd, nzbCmd)
+	rootCmd.AddCommand(daemonCmd, statusCmd, doctorCmd, movieCmd, tvCmd, queueCmd, plexCmd, shadowCmd, historyCmd, blocklistCmd, libraryCmd, migrateCmd, configCmd, wantedCmd, scheduleCmd, searchTriggerCmd, versionCmd, initCmd, nzbCmd)
 }
 
 var versionCmd = &cobra.Command{
@@ -704,6 +822,16 @@ func main() {
 }
 
 // --- Daemon ---
+
+// defaultLogPath is where launchd redirects the daemon's output, and therefore
+// the file that must be kept from growing without bound.
+func defaultLogPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "Library", "Logs", "udl.log")
+}
 
 func runDaemon(cmd *cobra.Command, args []string) error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -744,6 +872,21 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Keep the log file bounded. launchd holds it open (the plist redirects
+	// stdout and stderr here), so it is truncated in place rather than renamed —
+	// see internal/logging for why that distinction matters.
+	logPath, _ := cmd.Flags().GetString("log-file")
+	if logPath == "" {
+		logPath = defaultLogPath()
+	}
+	rotator := &logging.Rotator{
+		Path: logPath,
+		Notify: func(backup string) {
+			log.Info("rotated log file", "path", logPath, "backup", backup)
+		},
+	}
+	go rotator.Run(ctx)
+
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -781,8 +924,12 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	fmt.Printf("indexers: %d   movies: %d   series: %d\n", reply.IndexerCount, reply.MovieCount, reply.SeriesCount)
 	fmt.Printf("library: %s, %s\n", reply.LibraryMovies, reply.LibraryTV)
 
-	if reply.FailedCount > 0 || reply.BlockedCount > 0 {
-		fmt.Printf("failed (24h): %d   blocklisted: %d\n", reply.FailedCount, reply.BlockedCount)
+	if reply.FailedCount > 0 || reply.BlockedActiveCount > 0 || reply.ParkedCount > 0 {
+		fmt.Printf("failed (24h): %d   blocklisted: %d active   parked: %d\n",
+			reply.FailedCount, reply.BlockedActiveCount, reply.ParkedCount)
+		if reply.ParkedCount > 0 {
+			fmt.Printf("parked items burned the grab cap; see 'udl queue' or retry with 'udl queue retry'\n")
+		}
 	}
 
 	if len(reply.Checks) > 0 {
@@ -1244,29 +1391,72 @@ func runBlocklist(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if len(reply.Entries) == 0 {
-		fmt.Println("blocklist empty")
+	showAll, _ := cmd.Flags().GetBool("all")
+
+	var shown []database.BlocklistEntry
+	for _, e := range reply.Entries {
+		if e.Active || showAll {
+			shown = append(shown, e)
+		}
+	}
+	if len(shown) == 0 {
+		if len(reply.Entries) == 0 {
+			fmt.Println("blocklist empty")
+		} else {
+			fmt.Printf("no active blocks (%d lapsed; use --all to see them)\n", len(reply.Entries))
+		}
 		return nil
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tMEDIA\tRELEASE\tREASON\tTIME")
-	for _, e := range reply.Entries {
+	fmt.Fprintln(w, "ID\tMEDIA\tRELEASE\tCLASS\tUNTIL\tREASON\tTIME")
+	lapsed := 0
+	for _, e := range shown {
 		reason := e.Reason
-		if len(reason) > 60 {
-			reason = reason[:60] + "..."
+		if len(reason) > 48 {
+			reason = reason[:48] + "..."
 		}
 		media := mediaTag(e.MediaType, e.TmdbID, e.Season, e.EpisodeNum, e.MediaID)
-		createdAt := "—"
-		if e.CreatedAt.Valid {
-			createdAt = e.CreatedAt.String
-			if len(createdAt) > 16 {
-				createdAt = createdAt[:16]
+		createdAt := shortTime(e.CreatedAt)
+		class := string(e.FailureClass)
+		if class == "" {
+			class = "—"
+		}
+		until := "permanent"
+		if e.ExpiresAt.Valid {
+			until = shortTime(e.ExpiresAt)
+			if !e.Active {
+				until = "lapsed " + until
+				lapsed++
 			}
 		}
-		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", e.ID, media, e.ReleaseTitle, reason, createdAt)
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\n", e.ID, media, e.ReleaseTitle, class, until, reason, createdAt)
 	}
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	active := len(shown) - lapsed
+	fmt.Printf("%d active block(s)", active)
+	if lapsed > 0 {
+		fmt.Printf(", %d lapsed", lapsed)
+	}
+	fmt.Println()
+	return nil
+}
+
+// shortTime renders a database timestamp for a table cell.
+func shortTime(ts sql.NullString) string {
+	if !ts.Valid || ts.String == "" {
+		return "—"
+	}
+	out := ts.String
+	if t, err := time.Parse(time.RFC3339, out); err == nil {
+		return t.UTC().Format("2006-01-02 15:04")
+	}
+	if len(out) > 16 {
+		return out[:16]
+	}
+	return out
 }
 
 func runBlocklistClear(cmd *cobra.Command, args []string) error {
@@ -1291,16 +1481,30 @@ func runBlocklistRemove(cmd *cobra.Command, args []string) error {
 	}
 	defer client.Close()
 
-	id, err := strconv.ParseInt(args[0], 10, 64)
-	if err != nil {
-		return fmt.Errorf("invalid blocklist ID %q: %w", args[0], err)
+	media, _ := cmd.Flags().GetString("media")
+	reason, _ := cmd.Flags().GetString("reason")
+
+	if len(args) == 0 && media == "" && reason == "" {
+		return fmt.Errorf("give an id, or one of --media/--reason")
 	}
 
-	rpcArgs := &daemon.BlocklistRemoveArgs{ID: id}
+	rpcArgs := &daemon.BlocklistRemoveArgs{Media: media, Reason: reason}
+	if len(args) > 0 {
+		id, err := strconv.ParseInt(args[0], 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid blocklist ID %q: %w", args[0], err)
+		}
+		rpcArgs.ID = id
+	}
 	if err := client.Call("Service.BlocklistRemove", rpcArgs, &daemon.Empty{}); err != nil {
 		return err
 	}
-	fmt.Printf("removed blocklist entry %d\n", id)
+	switch {
+	case rpcArgs.ID != 0:
+		fmt.Printf("removed blocklist entry %d\n", rpcArgs.ID)
+	case media != "" || reason != "":
+		fmt.Printf("removed blocklist entries matching media=%q reason=%q\n", media, reason)
+	}
 	return nil
 }
 
@@ -2248,6 +2452,13 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	fmt.Printf("shadow %s (%s): %d items, %s\n", def.Name, m.Type, len(m.Items), formatSize(totalSize))
 
 	daemon, _ := cmd.Flags().GetBool("daemon")
+
+	// Keep this shadow's log bounded. The agent's plist redirects stdout and
+	// stderr to the same file and holds it open, so the rotator truncates in
+	// place; see internal/logging.
+	if logPath, _ := cmd.Flags().GetString("log-file"); logPath != "" {
+		go (&logging.Rotator{Path: logPath}).Run(cmd.Context())
+	}
 	// Resolve the real mountpoint (following symlinks like media/dubbed-tv).
 	// A mount whose server died (Ctrl-C'd foreground process, crash) becomes
 	// an orphan: every stat/readdir hangs on RPC timeouts. Only the mount
@@ -2511,6 +2722,8 @@ func shadowPlist(label, exe, name, home string) string {
 		<string>mount</string>
 		<string>%s</string>
 		<string>--daemon</string>
+		<string>--log-file</string>
+		<string>%s</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -2525,7 +2738,7 @@ func shadowPlist(label, exe, name, home string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, label, exe, name, logPath, logPath)
+`, label, exe, name, logPath, logPath, logPath)
 }
 
 func runShadowEnable(cmd *cobra.Command, args []string) error {
@@ -3833,6 +4046,19 @@ func runLibraryPruneIncomplete(cmd *cobra.Command, args []string) error {
 		mode = fmt.Sprintf("removed %d of %d dirs", reply.PrunedDirs, reply.TotalDirs)
 	}
 	fmt.Printf("%d orphan dirs (%.1f MB) — %s\n", reply.TotalDirs, totalMB, mode)
+
+	// Directories whose name doesn't match a layout the daemon writes are
+	// reported but never removed, so say so rather than leaving the user to
+	// wonder why --execute skipped them.
+	unknown := 0
+	for _, f := range reply.Findings {
+		if f.Reason == "unknown" {
+			unknown++
+		}
+	}
+	if unknown > 0 {
+		fmt.Printf("%d dir(s) with an unrecognized name were left in place; remove them by hand if you are sure\n", unknown)
+	}
 	return nil
 }
 
