@@ -126,13 +126,24 @@ UDL runs as a LaunchAgent for always-on background operation. The binary needs c
 ### Updating
 
 ```bash
-launchctl kickstart -k gui/$(id -u)/com.udl.daemon
-go build -o ~/bin/udl ./cmd/udl
-codesign --force --sign "UDL" -i udl ~/bin/udl
-launchctl kickstart -k gui/$(id -u)/com.udl.daemon
+./scripts/deploy.sh build      # builds ~/bin/udl.new
+codesign --force --sign "UDL" ~/bin/udl.new   # prompts for Keychain access
+./scripts/deploy.sh activate   # swaps it in, restarts the daemon, checks health
 ```
 
-The `codesign` step prompts for Keychain access to the signing key.
+Do **not** build straight onto `~/bin/udl`. That path is shared: the daemon runs
+it, and so does every shadow agent serving an NFS mount to Plex. Building there
+leaves an unsigned (or, worse, ad-hoc signed) binary on a path that launchd's
+`KeepAlive` may re-exec at any moment — and an ad-hoc signature does not carry
+the TCC grant for `/Volumes/Plex`, so a shadow that restarted in that window
+would come up denied and playback over the mount would fail.
+
+`scripts/deploy.sh build` stages the build at `~/bin/udl.new` instead, so the
+live path keeps a valid signed binary the whole time; `activate` refuses to
+install anything ad-hoc signed, and swaps the file in with a rename, which is
+atomic. `./scripts/deploy.sh status` reports the daemon, each shadow mount
+(with a timeout, so a hung mount cannot stall it), and whether the installed
+binary is properly signed.
 ### Why the signing identity matters (TCC)
 
 macOS gates removable-volume access (`/Volumes/…`) behind TCC. TCC does **not**

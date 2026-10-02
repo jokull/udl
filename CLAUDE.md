@@ -104,10 +104,23 @@ The binary accesses `/Volumes/Plex` (removable volume) which requires macOS TCC 
 A self-signed "UDL" certificate in the login keychain provides a stable signing identity so
 TCC grants persist across rebuilds (ad-hoc `--sign -` pins to CDHash which changes every build).
 
-**Deploy flow — Claude builds & unloads, human signs & loads:**
-1. Claude: `launchctl unload ~/Library/LaunchAgents/com.udl.daemon.plist`
-2. Claude: `go build -o ~/bin/udl ./cmd/udl`
-3. **Human runs in terminal:** `codesign --force --sign "UDL" ~/bin/udl && launchctl load ~/Library/LaunchAgents/com.udl.daemon.plist`
+**Deploy flow — Claude stages, human signs, Claude activates:**
+1. Claude: `./scripts/deploy.sh build` (builds `~/bin/udl.new`, never the live path)
+2. **Human runs in terminal:** `codesign --force --sign "UDL" ~/bin/udl.new`
+3. Claude: `./scripts/deploy.sh activate` (atomic swap + restart + health check)
+
+**Never build directly onto `~/bin/udl`.** That path is shared by the daemon and
+every shadow agent serving an NFS mount to Plex. A build there leaves an
+unsigned/ad-hoc binary where a `KeepAlive` restart can exec it, and an ad-hoc
+signature has lost the TCC grant for `/Volumes/Plex` — the shadow would come up
+denied and break playback. `activate` refuses to install an ad-hoc binary for
+the same reason.
+
+Checking on the box (`./scripts/deploy.sh status` does all of this, with
+timeouts so a hung mount cannot stall you):
+- Note that `timeout` is a shell function in an interactive session, **not** a
+  program: a script that execs it fails with 127 and misreports. Use
+  `/usr/bin/perl -e 'alarm N; exec @ARGV'` inside scripts.
 
 The codesign step requires Keychain access to the private key which triggers a macOS dialog —
 this cannot be automated from Claude Code's sandbox without storing the login password in
