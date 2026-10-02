@@ -89,7 +89,7 @@ cmd_status() {
         [[ -n "$m" ]] || continue
         any=1
         if probe_path "$m"; then
-            echo "shadow:  $m responsive"
+            echo "shadow:  $m responsive$(in_use_note "$m")"
         else
             echo "shadow:  $m NOT RESPONDING"
         fi
@@ -108,20 +108,42 @@ nfs_mounts() {
     mount | awk '/\(nfs/ && $1 ~ /^127\.0\.0\.1:/ { print $3 }'
 }
 
+# in_use_note reports whether anything has a file open under a mount, which is
+# what decides whether restarting that shadow is disruptive. A restart gives the
+# server a fresh, empty handle table, and go-nfs hands out a random UUID per
+# path, so every handle a client already holds turns into ESTALE — a stream
+# reading from the mount fails. Scoping lsof to the mount keeps this to a few
+# hundred milliseconds; an unscoped lsof takes tens of seconds.
+in_use_note() {
+    local n
+    n=$(bounded 8 lsof -n "$1" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
+    n=${n:-0}
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    if [[ "$n" -gt 0 ]]; then
+        echo "  ⚠ $n open file(s) — restarting this shadow would disrupt them"
+    else
+        echo "  (nothing has it open: safe to restart)"
+    fi
+}
+
+# bounded runs a command under a wall-clock alarm and returns its status, so a
+# hung mount cannot stall this script.
+bounded() {
+    local secs="$1"
+    shift
+    if [[ -x /usr/bin/perl ]]; then
+        /usr/bin/perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+        return $?
+    fi
+    "$@"
+}
+
 # probe_path reports whether a path answers within a few seconds, so that a hung
 # mount cannot stall this script. It must not rely on `timeout`: that is a shell
 # function in an interactive session, not a program a script can exec, so a
 # child shell fails with 127 and every mount looks dead.
 probe_path() {
-    if command -v timeout >/dev/null 2>&1 && [[ -x "$(command -v timeout)" ]]; then
-        timeout 5 ls "$1" >/dev/null 2>&1
-        return $?
-    fi
-    if [[ -x /usr/bin/perl ]]; then
-        /usr/bin/perl -e 'alarm shift; exec @ARGV' 5 ls "$1" >/dev/null 2>&1
-        return $?
-    fi
-    ls "$1" >/dev/null 2>&1
+    bounded 5 ls "$1" >/dev/null 2>&1
 }
 
 case "${1:-}" in
