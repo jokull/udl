@@ -66,7 +66,29 @@ func (s *Service) PlexProbe(args *PlexProbeArgs, reply *PlexProbeReply) error {
 		size = DefaultProbeBytes
 	}
 
-	samples, err := s.probeSamples()
+	policies := s.serverPolicies()
+	scores, err := s.db.ServerScores(30*24*time.Hour, 3)
+	if err != nil {
+		return fmt.Errorf("PlexProbe: server scores: %w", err)
+	}
+
+	// Which friends to measure. Everything below is bounded by this set: the
+	// sample search stops as soon as each of them has something to read.
+	want := map[string]bool{}
+	for name, p := range policies {
+		if p.deny {
+			continue
+		}
+		if args.Server != "" && name != args.Server {
+			continue
+		}
+		want[name] = true
+	}
+	if len(want) == 0 {
+		return fmt.Errorf("PlexProbe: no friend matched %q (see 'udl plex server list')", args.Server)
+	}
+
+	samples, err := s.probeSamples(want)
 	if err != nil {
 		return err
 	}
@@ -74,64 +96,75 @@ func (s *Service) PlexProbe(args *PlexProbeArgs, reply *PlexProbeReply) error {
 		return fmt.Errorf("PlexProbe: no friend is offering an item to sample (needs a movie with status 'shadow')")
 	}
 
-	policies := s.serverPolicies()
-	scores, err := s.db.ServerScores(30*24*time.Hour, 3)
-	if err != nil {
-		return fmt.Errorf("PlexProbe: server scores: %w", err)
-	}
-
 	names := make([]string, 0, len(samples))
 	for name := range samples {
-		if args.Server != "" && name != args.Server {
-			continue
-		}
-		if p, ok := policies[name]; ok && p.deny {
-			continue
-		}
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	if len(names) == 0 {
-		return fmt.Errorf("PlexProbe: no friend matched %q (see 'udl plex server list')", args.Server)
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(len(names))*90*time.Second)
 	defer cancel()
 
 	for _, name := range names {
-		sc := scores[name]
-		reply.Results = append(reply.Results, s.probeServer(ctx, name, samples[name], size, sc))
+		reply.Results = append(reply.Results, s.probeServer(ctx, name, samples[name], size, scores[name]))
 	}
 	return nil
 }
 
-// probeSamples finds, for each friend, one item it is known to have. It asks
-// about movies we deliberately do not store ourselves (status "shadow"): by
-// definition a friend has those, and Plex tells us which friend.
-func (s *Service) probeSamples() (map[string]plexProbeSample, error) {
-	movies, err := s.db.ShadowMoviesForProbe(25)
-	if err != nil {
-		return nil, fmt.Errorf("PlexProbe: list shadow movies: %w", err)
-	}
+// maxSampleLookups bounds the search for something to read. Each lookup asks
+// every friend at once, and a friend that is down costs a timeout, so this is
+// the difference between a five-second command and a five-minute one.
+const maxSampleLookups = 10
 
+// matchFinder resolves candidate matches for one title.
+type matchFinder func(title string, year int, imdbID string, tmdbID int) ([]plex.MediaMatch, error)
+
+// pickSamples chooses one thing to read per wanted friend, stopping as soon as
+// every one of them is covered — there is no reason to keep asking once the
+// question is answered. It returns the samples and how many lookups it used.
+func pickSamples(movies []database.Movie, want map[string]bool, find matchFinder, maxLookups int) (map[string]plexProbeSample, int) {
 	out := map[string]plexProbeSample{}
+	lookups := 0
 	for _, m := range movies {
+		if len(out) >= len(want) || lookups >= maxLookups {
+			break
+		}
 		imdbID := ""
 		if m.ImdbID.Valid {
 			imdbID = m.ImdbID.String
 		}
-		matches, err := s.plex.FindMovie(m.Title, m.Year, imdbID, m.TmdbID, 0)
+		lookups++
+		matches, err := find(m.Title, m.Year, imdbID, m.TmdbID)
 		if err != nil {
 			continue
 		}
 		for _, match := range matches {
+			if !want[match.ServerName] {
+				continue
+			}
 			if _, seen := out[match.ServerName]; seen {
 				continue
 			}
 			out[match.ServerName] = plexProbeSample{match: match, title: m.Title}
 		}
 	}
-	return out, nil
+	return out, lookups
+}
+
+// probeSamples finds, for each wanted friend, one item it is known to have. It
+// asks about movies we deliberately do not store ourselves (status "shadow"):
+// by definition a friend has those, and Plex tells us which friend.
+func (s *Service) probeSamples(want map[string]bool) (map[string]plexProbeSample, error) {
+	movies, err := s.db.ShadowMoviesForProbe(25)
+	if err != nil {
+		return nil, fmt.Errorf("PlexProbe: list shadow movies: %w", err)
+	}
+	samples, lookups := pickSamples(movies, want, func(title string, year int, imdbID string, tmdbID int) ([]plex.MediaMatch, error) {
+		return s.plex.FindMovie(title, year, imdbID, tmdbID, 0)
+	}, maxSampleLookups)
+	s.log.Info("plex probe: sample search complete",
+		"friends", len(samples), "wanted", len(want), "lookups", lookups)
+	return samples, nil
 }
 
 // probeServer resolves the sample's download URL and reads a window from the

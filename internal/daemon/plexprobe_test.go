@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jokull/udl/internal/database"
+	"github.com/jokull/udl/internal/plex"
 	"github.com/jokull/udl/internal/rangefetch"
 )
 
@@ -28,7 +30,6 @@ func TestMeasureReadsFromTheMiddle(t *testing.T) {
 	var sawRange string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		sawRange = r.Header.Get("Range")
-		// Advertise a length, then answer a real 206 for any range.
 		if r.Header.Get("Range") == "" {
 			w.Header().Set("Content-Length", strconv.Itoa(total))
 			w.WriteHeader(http.StatusOK)
@@ -54,8 +55,6 @@ func TestMeasureReadsFromTheMiddle(t *testing.T) {
 	if elapsed <= 0 {
 		t.Error("elapsed time was not recorded")
 	}
-
-	// 8 MiB file, 2 MiB sample: the window must start in the middle, not at 0.
 	if !strings.HasPrefix(sawRange, "bytes=3145728-") {
 		t.Errorf("read range = %q, want it to start at 3145728", sawRange)
 	}
@@ -77,6 +76,102 @@ func TestMeasureReportsRefusal(t *testing.T) {
 	n, _, err := svc.measure(context.Background(), ts.URL, 1024)
 	if err == nil {
 		t.Fatalf("measure succeeded (%d bytes) against a server that refused the range", n)
+	}
+}
+
+// Sample discovery must stop as soon as every wanted friend is covered: each
+// lookup asks every friend at once, and an unreachable one costs a timeout, so
+// scanning all 25 candidates unconditionally is the difference between a quick
+// command and one that appears to hang.
+func TestPickSamplesStopsWhenCovered(t *testing.T) {
+	movies := []database.Movie{
+		{ID: 1, Title: "First", Year: 2024},
+		{ID: 2, Title: "Second", Year: 2024},
+		{ID: 3, Title: "Third", Year: 2024},
+	}
+	want := map[string]bool{"Vader": true, "brunnur": true, "kari": true}
+
+	lookups := 0
+	find := func(title string, _ int, _ string, _ int) ([]plex.MediaMatch, error) {
+		lookups++
+		switch title {
+		case "First":
+			return []plex.MediaMatch{{ServerName: "Vader"}, {ServerName: "brunnur"}}, nil
+		case "Second":
+			return []plex.MediaMatch{{ServerName: "kari"}}, nil
+		default:
+			t.Errorf("looked up %q after every friend was already covered", title)
+			return nil, nil
+		}
+	}
+
+	samples, used := pickSamples(movies, want, find, 10)
+	if used != 2 {
+		t.Errorf("used %d lookups, want 2 (should stop once all three friends are covered)", used)
+	}
+	if len(samples) != 3 {
+		t.Errorf("got %d samples, want 3", len(samples))
+	}
+	if samples["kari"].title != "Second" {
+		t.Errorf("kari sample = %q, want Second", samples["kari"].title)
+	}
+}
+
+// Friends nobody asked about must not be sampled, and the lookup budget must be
+// honoured even when the search never covers everyone.
+func TestPickSamplesRespectsFilterAndBudget(t *testing.T) {
+	movies := []database.Movie{
+		{ID: 1, Title: "One", Year: 2024},
+		{ID: 2, Title: "Two", Year: 2024},
+		{ID: 3, Title: "Three", Year: 2024},
+	}
+
+	find := func(title string, _ int, _ string, _ int) ([]plex.MediaMatch, error) {
+		// Every movie is offered by a friend we did not ask about.
+		return []plex.MediaMatch{{ServerName: "denied"}}, nil
+	}
+	samples, used := pickSamples(movies, map[string]bool{"Vader": true}, find, 2)
+	if len(samples) != 0 {
+		t.Errorf("sampled %v, want nothing (only an unasked-for friend offers these)", samples)
+	}
+	if used != 2 {
+		t.Errorf("used %d lookups, want the budget of 2", used)
+	}
+
+	// Now make one of them available to a wanted friend, within budget.
+	find2 := func(title string, _ int, _ string, _ int) ([]plex.MediaMatch, error) {
+		if title == "Two" {
+			return []plex.MediaMatch{{ServerName: "Vader"}}, nil
+		}
+		return nil, nil
+	}
+	samples, used = pickSamples(movies, map[string]bool{"Vader": true, "kari": true}, find2, 3)
+	if len(samples) != 1 || samples["Vader"].title != "Two" {
+		t.Errorf("samples = %v, want just Vader -> Two", samples)
+	}
+	if used != 3 {
+		t.Errorf("used %d lookups, want 3 (budget exhausted: kari was never offered)", used)
+	}
+}
+
+// A failing lookup must not abort the search for the others.
+func TestPickSamplesToleratesErrors(t *testing.T) {
+	movies := []database.Movie{
+		{ID: 1, Title: "Broken", Year: 2024},
+		{ID: 2, Title: "Good", Year: 2024},
+	}
+	find := func(title string, _ int, _ string, _ int) ([]plex.MediaMatch, error) {
+		if title == "Broken" {
+			return nil, fmt.Errorf("friend timed out")
+		}
+		return []plex.MediaMatch{{ServerName: "Vader"}}, nil
+	}
+	samples, used := pickSamples(movies, map[string]bool{"Vader": true}, find, 10)
+	if len(samples) != 1 || samples["Vader"].title != "Good" {
+		t.Errorf("samples = %v, want Vader -> Good", samples)
+	}
+	if used != 2 {
+		t.Errorf("used %d lookups, want 2", used)
 	}
 }
 
