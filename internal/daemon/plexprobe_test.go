@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jokull/udl/internal/database"
 	"github.com/jokull/udl/internal/plex"
@@ -105,7 +106,7 @@ func TestPickSamplesStopsWhenCovered(t *testing.T) {
 		}
 	}
 
-	samples, used := pickSamples(movies, want, find, 10)
+	samples, used := pickSamples(movies, want, find, 10, 0)
 	if used != 2 {
 		t.Errorf("used %d lookups, want 2 (should stop once all three friends are covered)", used)
 	}
@@ -130,7 +131,7 @@ func TestPickSamplesRespectsFilterAndBudget(t *testing.T) {
 		// Every movie is offered by a friend we did not ask about.
 		return []plex.MediaMatch{{ServerName: "denied"}}, nil
 	}
-	samples, used := pickSamples(movies, map[string]bool{"Vader": true}, find, 2)
+	samples, used := pickSamples(movies, map[string]bool{"Vader": true}, find, 2, 0)
 	if len(samples) != 0 {
 		t.Errorf("sampled %v, want nothing (only an unasked-for friend offers these)", samples)
 	}
@@ -145,12 +146,34 @@ func TestPickSamplesRespectsFilterAndBudget(t *testing.T) {
 		}
 		return nil, nil
 	}
-	samples, used = pickSamples(movies, map[string]bool{"Vader": true, "kari": true}, find2, 3)
+	samples, used = pickSamples(movies, map[string]bool{"Vader": true, "kari": true}, find2, 3, 0)
 	if len(samples) != 1 || samples["Vader"].title != "Two" {
 		t.Errorf("samples = %v, want just Vader -> Two", samples)
 	}
 	if used != 3 {
 		t.Errorf("used %d lookups, want 3 (budget exhausted: kari was never offered)", used)
+	}
+}
+
+// A friend that never answers must not hold the command open: the search stops
+// once its wall-clock budget is spent, even with lookups left.
+func TestPickSamplesStopsOnDeadline(t *testing.T) {
+	movies := []database.Movie{{ID: 1, Title: "One", Year: 2024}, {ID: 2, Title: "Two", Year: 2024}}
+
+	lookups := 0
+	find := func(title string, _ int, _ string, _ int) ([]plex.MediaMatch, error) {
+		lookups++
+		return nil, nil // nothing ever covers the target
+	}
+	samples, used := pickSamples(movies, map[string]bool{"Vader": true}, find, 10, time.Nanosecond)
+	if used != 0 {
+		t.Errorf("used %d lookups, want 0 once the budget is spent", used)
+	}
+	if len(samples) != 0 {
+		t.Errorf("samples = %v, want none", samples)
+	}
+	if lookups != 0 {
+		t.Errorf("called the finder %d times, want 0", lookups)
 	}
 }
 
@@ -166,7 +189,7 @@ func TestPickSamplesToleratesErrors(t *testing.T) {
 		}
 		return []plex.MediaMatch{{ServerName: "Vader"}}, nil
 	}
-	samples, used := pickSamples(movies, map[string]bool{"Vader": true}, find, 10)
+	samples, used := pickSamples(movies, map[string]bool{"Vader": true}, find, 10, 0)
 	if len(samples) != 1 || samples["Vader"].title != "Good" {
 		t.Errorf("samples = %v, want Vader -> Good", samples)
 	}

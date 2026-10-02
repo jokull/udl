@@ -111,10 +111,15 @@ func (s *Service) PlexProbe(args *PlexProbeArgs, reply *PlexProbeReply) error {
 	return nil
 }
 
-// maxSampleLookups bounds the search for something to read. Each lookup asks
-// every friend at once, and a friend that is down costs a timeout, so this is
-// the difference between a five-second command and a five-minute one.
-const maxSampleLookups = 10
+// Bounds on the search for something to read. Each lookup asks every friend at
+// once, and a friend that is down costs a timeout on every one of them — so a
+// count alone is not enough: with one unreachable friend the search never covers
+// every target and would spend the full budget of lookups waiting. The deadline
+// is what keeps the command's runtime bounded.
+const (
+	maxSampleLookups  = 10
+	sampleSearchLimit = 45 * time.Second
+)
 
 // matchFinder resolves candidate matches for one title.
 type matchFinder func(title string, year int, imdbID string, tmdbID int) ([]plex.MediaMatch, error)
@@ -122,11 +127,15 @@ type matchFinder func(title string, year int, imdbID string, tmdbID int) ([]plex
 // pickSamples chooses one thing to read per wanted friend, stopping as soon as
 // every one of them is covered — there is no reason to keep asking once the
 // question is answered. It returns the samples and how many lookups it used.
-func pickSamples(movies []database.Movie, want map[string]bool, find matchFinder, maxLookups int) (map[string]plexProbeSample, int) {
+func pickSamples(movies []database.Movie, want map[string]bool, find matchFinder, maxLookups int, budget time.Duration) (map[string]plexProbeSample, int) {
 	out := map[string]plexProbeSample{}
 	lookups := 0
+	started := time.Now()
 	for _, m := range movies {
 		if len(out) >= len(want) || lookups >= maxLookups {
+			break
+		}
+		if budget > 0 && time.Since(started) > budget {
 			break
 		}
 		imdbID := ""
@@ -161,7 +170,7 @@ func (s *Service) probeSamples(want map[string]bool) (map[string]plexProbeSample
 	}
 	samples, lookups := pickSamples(movies, want, func(title string, year int, imdbID string, tmdbID int) ([]plex.MediaMatch, error) {
 		return s.plex.FindMovie(title, year, imdbID, tmdbID, 0)
-	}, maxSampleLookups)
+	}, maxSampleLookups, sampleSearchLimit)
 	s.log.Info("plex probe: sample search complete",
 		"friends", len(samples), "wanted", len(want), "lookups", lookups)
 	return samples, nil
