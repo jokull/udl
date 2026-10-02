@@ -106,6 +106,9 @@ with a stable developer certificate would make the identity permanent.
   `filepath.EvalSymlinks`). Never `EvalSymlinks` a path that might be a dead
   mount; resolve with readlink-only and check the mount table (`/sbin/mount`,
   which never blocks) first.
+- **A restart is not transparent to clients.** Restarting the serve daemon
+  invalidates every file handle the client holds — safe only when nothing has
+  the mount open. See "go-nfs file handles" for why, and check before doing it.
 - **autofs triggers hang the same way.** Stat'ing a path that is an autofs
   trigger makes automountd attempt the mount against whatever server it finds —
   if the server isn't up yet (the very process doing the stat), the stat blocks.
@@ -120,6 +123,19 @@ with a stable developer certificate would make the identity permanent.
   `NewCachingHandlerWithVerifierLimit(handler, 100000, 100000)`.
 - `FromHandle` iterates the whole LRU on every RPC (O(limit) per request), so
   an oversized limit costs a few ms per RPC. 100k is fine for this workload.
+- **Handles do not survive a restart.** `ToHandle` mints a random UUID per path
+  and keeps it in the handler's in-memory LRU; `FromHandle` answers anything it
+  does not recognise with `NFSStatusStale`. A restarted server therefore has an
+  empty table while clients still hold the old handles, and since these mounts
+  are `hard,nointr` an in-flight read *blocks* while the server is down and then
+  comes back ESTALE — failing whatever Plex was streaming. Consequences worth
+  remembering:
+  - Restarting a shadow is safe only when nothing has the mount open.
+    `scripts/deploy.sh status` reports the open file count per mount.
+  - Anything that must change on a running shadow has to be done from outside
+    it. The daemon bounds the shadow agents' logs by truncating them in place
+    for exactly this reason; giving an agent a flag to rotate its own log would
+    only take effect on a restart, and could not be applied safely.
 
 ## automountd (do not use)
 

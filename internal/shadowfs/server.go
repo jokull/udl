@@ -17,6 +17,12 @@ func Serve(ln net.Listener, fs billy.Filesystem) error {
 	// the union (889 items + ~150 dirs). When the LRU overflows, the oldest
 	// handles are evicted mid-walk and clients holding them get ESTALE —
 	// which made the PMS scanner silently skip new shows.
+	//
+	// Handles are random UUIDs kept only in this process's LRU, so restarting
+	// this server invalidates every handle a client already holds: the mounts
+	// are hard,nointr, so an in-flight read blocks while the server is down and
+	// then comes back ESTALE, failing whatever is streaming. Never restart a
+	// shadow that is in use — scripts/deploy.sh status reports which are.
 	cached := nfshelper.NewCachingHandlerWithVerifierLimit(handler, 100000, 100000)
 	return nfs.Serve(ln, cached)
 }

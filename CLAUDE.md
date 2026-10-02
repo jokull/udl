@@ -151,6 +151,14 @@ Traps this codebase has already fallen into, worth remembering:
 - **Never delete what you did not create.** `library prune-incomplete` only removes
   directories whose name parses as one of the daemon's own layouts, and reports anything
   else instead of removing it.
+- **Never restart a shadow that is in use.** Its NFS file handles are random UUIDs held
+  in one process's memory, so a restart turns every handle a client already holds into
+  ESTALE and whatever is streaming from that mount fails (the mounts are `hard,nointr`,
+  so the read blocks first and then errors). `udl shadow enable`/`disable` both do this;
+  `./scripts/deploy.sh status` reports each mount's open file count. For the same reason
+  the daemon bounds the shadow logs by truncating them in place — do not give a shadow
+  agent its own `--log-file`, since that could only take effect on a restart.
+  `docs/nfs-sharp-edges.md` has the mechanism.
 
 ## Conventions
 

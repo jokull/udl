@@ -479,9 +479,17 @@ var shadowUnmountCmd = &cobra.Command{
 }
 
 var shadowEnableCmd = &cobra.Command{
-	Use:          "enable [shadow]",
-	Short:        "Serve and mount a shadow at boot via a LaunchDaemon",
-	Long:         "Installs a root LaunchDaemon that serves the shadow and mounts it at the shadow's mount path when the machine boots, restarting it if it crashes. The mount survives reboots. Uses sudo for the install; remove with 'udl shadow disable <name>'.",
+	Use:   "enable [shadow]",
+	Short: "Serve and mount a shadow at boot via a LaunchAgent",
+	Long: "Installs a per-user LaunchAgent that serves the shadow and mounts it at the\n" +
+		"shadow's mount path when the machine boots, restarting it if it crashes. The\n" +
+		"mount survives reboots. Uses sudo for the install; remove with 'udl shadow\n" +
+		"disable <name>'.\n\n" +
+		"Installing or reinstalling restarts the serve daemon. Its NFS file handles\n" +
+		"live only in that process's memory, so every handle a client already holds\n" +
+		"becomes stale and anything streaming from the mount fails. Check that nothing\n" +
+		"is playing from it first ('./scripts/deploy.sh status' reports this in a\n" +
+		"checkout; docs/nfs-sharp-edges.md explains the mechanism).",
 	Args:         cobra.ExactArgs(1),
 	RunE:         runShadowEnable,
 	SilenceUsage: true,
@@ -489,7 +497,7 @@ var shadowEnableCmd = &cobra.Command{
 
 var shadowDisableCmd = &cobra.Command{
 	Use:          "disable [shadow]",
-	Short:        "Remove a shadow's LaunchDaemon and unmount it",
+	Short:        "Remove a shadow's LaunchAgent and unmount it",
 	Args:         cobra.ExactArgs(1),
 	RunE:         runShadowDisable,
 	SilenceUsage: true,
@@ -2725,7 +2733,9 @@ func runShadowUnmount(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// shadowLabel returns the LaunchDaemon label for a shadow.
+// shadowLabel returns the launchd label for a shadow. The agent is installed as
+// a per-user LaunchAgent; the label is also used to clear a legacy system-domain
+// LaunchDaemon install of the same name.
 func shadowLabel(name string) string {
 	return "com.jokull.udl-shadow-" + name
 }
