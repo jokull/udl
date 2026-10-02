@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -43,6 +44,29 @@ const (
 	DefaultKeep     = 8 << 20  // 8 MiB of history
 	DefaultInterval = 15 * time.Minute
 )
+
+// ShadowLogGlob matches the log files of the shadow agents, which the daemon
+// rotates on their behalf.
+const ShadowLogGlob = "com.jokull.udl-shadow-*.log"
+
+// ShadowLogPaths returns the shadow agents' log files in dir.
+//
+// The daemon rotates these because a shadow agent cannot bound its own log
+// without being restarted, and restarting one is not free: its NFS file handles
+// are random UUIDs held in memory, so every handle the client already has turns
+// into ESTALE and whatever Plex is streaming from that mount fails. Truncating
+// the file from outside is safe — the descriptor belongs to launchd and is
+// opened for append — so the log can be bounded without touching the server.
+func ShadowLogPaths(dir string) []string {
+	if dir == "" {
+		return nil
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, ShadowLogGlob))
+	if err != nil {
+		return nil
+	}
+	return matches
+}
 
 // Run rotates on a ticker until ctx is cancelled, and once immediately so that a
 // log that grew while the process was down is dealt with at startup.

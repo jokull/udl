@@ -7,24 +7,23 @@ import (
 	"testing"
 )
 
-// The shadow agent holds its log open through the plist redirect, so the log
-// path must be passed to the process as well — otherwise nothing rotates the
-// file and it grows without bound.
-func TestShadowPlistPassesLogFile(t *testing.T) {
-	home := "/Users/example"
-	plist := shadowPlist("com.jokull.udl-shadow-tv", "/usr/local/bin/udl", "tv", home)
-	logPath := filepath.Join(home, "Library", "Logs", "com.jokull.udl-shadow-tv.log")
+// The shadow agent's plist deliberately carries no log-file flag.
+//
+// Passing one would mean the agent rotates its own log, which only takes effect
+// on the next restart — and restarting a shadow is not free: its NFS file
+// handles are random UUIDs held in memory, so every handle Plex already holds
+// becomes ESTALE and the stream fails. The daemon rotates the shadow logs from
+// outside instead, which needs no restart at all.
+func TestShadowPlistCarriesNoLogFlag(t *testing.T) {
+	plist := shadowPlist("com.jokull.udl-shadow-tv", "/usr/local/bin/udl", "tv", "/Users/example")
+	logPath := filepath.Join("/Users/example", "Library", "Logs", "com.jokull.udl-shadow-tv.log")
 
-	if !strings.Contains(plist, "<string>--log-file</string>") {
-		t.Fatal("generated agent does not pass --log-file")
+	if strings.Contains(plist, "--log-file") {
+		t.Error("shadow plist passes --log-file, which would require restarting the mount to take effect")
 	}
-	// The flag must be followed by the same file the streams are redirected to,
-	// or the rotator would bound a file nobody writes.
-	if !strings.Contains(plist, "<string>--log-file</string>\n\t\t<string>"+logPath+"</string>") {
-		t.Errorf("--log-file is not followed by %s", logPath)
-	}
-	if n := strings.Count(plist, "<string>"+logPath+"</string>"); n != 3 {
-		t.Errorf("log path appears %d times, want 3 (flag + both redirects)", n)
+	// The streams are still redirected to the file the daemon rotates.
+	if n := strings.Count(plist, "<string>"+logPath+"</string>"); n != 2 {
+		t.Errorf("log path appears %d times, want 2 (both redirects)", n)
 	}
 }
 

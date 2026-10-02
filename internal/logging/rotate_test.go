@@ -104,3 +104,52 @@ func TestRotateMissingFileIsNotAnError(t *testing.T) {
 		t.Errorf("Rotate() = (%v, %v), want (false, nil)", rotated, err)
 	}
 }
+
+// The daemon rotates the shadow agents' logs, so it must find exactly those
+// files and nothing else in the log directory.
+func TestShadowLogPaths(t *testing.T) {
+	dir := t.TempDir()
+	want := []string{
+		filepath.Join(dir, "com.jokull.udl-shadow-dubbed.log"),
+		filepath.Join(dir, "com.jokull.udl-shadow-dubbed-tv.log"),
+		filepath.Join(dir, "com.jokull.udl-shadow-movies.log"),
+	}
+	for _, p := range want {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Things that must not be swept up.
+	for _, p := range []string{
+		filepath.Join(dir, "udl.log"),
+		filepath.Join(dir, "com.jokull.udl-shadow-dubbed.log.1"),
+		filepath.Join(dir, "other-shadow.log"),
+	} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := ShadowLogPaths(dir)
+	if len(got) != len(want) {
+		t.Fatalf("found %d files (%v), want %d", len(got), got, len(want))
+	}
+	for _, w := range want {
+		found := false
+		for _, g := range got {
+			if g == w {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s not returned", w)
+		}
+	}
+
+	if got := ShadowLogPaths(dir + "/absent"); got != nil {
+		t.Errorf("missing directory returned %v, want nothing", got)
+	}
+	if got := ShadowLogPaths(""); got != nil {
+		t.Errorf("empty directory returned %v, want nothing", got)
+	}
+}

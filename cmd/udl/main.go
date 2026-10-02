@@ -766,7 +766,6 @@ func init() {
 	shadowMountCmd.Flags().Int("cache-size", 50, "block cache size in GiB")
 	shadowMountCmd.Flags().Bool("no-tuning", false, "skip disabling Plex preview thumbnails")
 	shadowMountCmd.Flags().Bool("daemon", false, "run as a root daemon: serve only, no mount (for launchd + automount)")
-	shadowMountCmd.Flags().String("log-file", "", "Log file to keep bounded (set by the generated agent)")
 	shadowEnableCmd.Flags().String("port", "", "fixed NFS port for the serve daemon (default: first free from 2055)")
 	shadowCmd.AddCommand(shadowCreateCmd, shadowAddCmd, shadowListCmd, shadowSourcesCmd, shadowManifestCmd, shadowMountCmd, shadowUnmountCmd, shadowEnableCmd, shadowDisableCmd, shadowCoveredCmd)
 	blocklistCmd.AddCommand(blocklistClearCmd, blocklistRemoveCmd)
@@ -822,6 +821,35 @@ func main() {
 }
 
 // --- Daemon ---
+
+// rotateShadowLogs bounds the shadow agents' log files, which launchd holds open
+// on their behalf. It rotates immediately, then on the same interval as the
+// daemon's own log.
+func rotateShadowLogs(ctx context.Context, dir string, log *slog.Logger) {
+	rotate := func() {
+		for _, p := range logging.ShadowLogPaths(dir) {
+			rotated, err := (&logging.Rotator{Path: p}).Rotate()
+			switch {
+			case err != nil:
+				log.Warn("shadow log rotation failed", "path", p, "error", err)
+			case rotated:
+				log.Info("rotated shadow log", "path", p, "backup", p+".1")
+			}
+		}
+	}
+	rotate()
+
+	ticker := time.NewTicker(logging.DefaultInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rotate()
+		}
+	}
+}
 
 // defaultLogPath is where launchd redirects the daemon's output, and therefore
 // the file that must be kept from growing without bound.
@@ -886,6 +914,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		},
 	}
 	go rotator.Run(ctx)
+
+	// The shadow agents' logs are rotated from here for the same reason, and
+	// because they cannot be restarted cheaply: their NFS file handles live only
+	// in memory, so a restart turns every handle the client holds into ESTALE
+	// and drops whatever is streaming. Bounding the file from outside avoids
+	// touching them at all.
+	go rotateShadowLogs(ctx, filepath.Dir(logPath), log)
 
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -2452,13 +2487,6 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	fmt.Printf("shadow %s (%s): %d items, %s\n", def.Name, m.Type, len(m.Items), formatSize(totalSize))
 
 	daemon, _ := cmd.Flags().GetBool("daemon")
-
-	// Keep this shadow's log bounded. The agent's plist redirects stdout and
-	// stderr to the same file and holds it open, so the rotator truncates in
-	// place; see internal/logging.
-	if logPath, _ := cmd.Flags().GetString("log-file"); logPath != "" {
-		go (&logging.Rotator{Path: logPath}).Run(cmd.Context())
-	}
 	// Resolve the real mountpoint (following symlinks like media/dubbed-tv).
 	// A mount whose server died (Ctrl-C'd foreground process, crash) becomes
 	// an orphan: every stat/readdir hangs on RPC timeouts. Only the mount
@@ -2722,8 +2750,6 @@ func shadowPlist(label, exe, name, home string) string {
 		<string>mount</string>
 		<string>%s</string>
 		<string>--daemon</string>
-		<string>--log-file</string>
-		<string>%s</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
@@ -2738,7 +2764,7 @@ func shadowPlist(label, exe, name, home string) string {
 	<string>%s</string>
 </dict>
 </plist>
-`, label, exe, name, logPath, logPath, logPath)
+`, label, exe, name, logPath, logPath)
 }
 
 func runShadowEnable(cmd *cobra.Command, args []string) error {
