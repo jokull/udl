@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -137,10 +138,36 @@ func (c *BlockCache) blockKey(url string, idx int64) string {
 	return url + "#" + fmt.Sprintf("%d", idx)
 }
 
-func (c *BlockCache) blockPath(url string, idx int64) string {
+// urlHash is the directory key for a remote URL: one subtree per distinct URL.
+func urlHash(url string) string {
 	sum := sha256.Sum256([]byte(url))
-	h := hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:])
+}
+
+func (c *BlockCache) blockPath(url string, idx int64) string {
+	h := urlHash(url)
 	return filepath.Join(c.dir, h[:2], h, fmt.Sprintf("%08d.blk", idx))
+}
+
+// partialPath returns the data and sidecar paths for a block's persisted
+// partial progress. Partials live under the same cache root as complete
+// blocks, so eviction and the low-disk guard account for them too.
+func (c *BlockCache) partialPath(url string, idx int64) (data, meta string) {
+	h := urlHash(url)
+	dir := filepath.Join(c.dir, "partial", h[:2], h)
+	data = filepath.Join(dir, fmt.Sprintf("%08d.part", idx))
+	return data, data + ".json"
+}
+
+// partialMeta is the sidecar describing persisted progress for one interrupted
+// block: how many bytes are valid and the resource identity they belong to.
+type partialMeta struct {
+	URL          string `json:"url"`
+	Size         int64  `json:"size"`
+	ETag         string `json:"etag,omitempty"`
+	LastModified string `json:"last_modified,omitempty"`
+	ContentType  string `json:"content_type,omitempty"`
+	Bytes        int64  `json:"bytes"`
 }
 
 // block returns one cache block, fetching it if missing. Concurrent callers
@@ -195,20 +222,118 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 // Fill retries inside the block, so an origin that truncates responses (most
 // of Stradivarius' responses stop around 704 KiB) still yields a complete
 // block without refetching the bytes already received.
+//
+// Bytes verified by an interrupted attempt are persisted under the cache root,
+// keyed by block index and pinned to the probed resource identity; the next
+// attempt resumes from that offset instead of byte zero. A changed resource or
+// a terminal failure discards the persisted prefix, and a completed fetch
+// removes it.
 func (c *BlockCache) fetch(ctx context.Context, url string, off, size int64) ([]byte, error) {
+	idx := off / c.blockSize
 	res, err := c.resource(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("shadowfs: probe %s: %w", url, err)
 	}
 	buf := make([]byte, size)
-	n, _, err := c.fetcher.Fill(ctx, res, off, buf)
+	var start int64
+	if part := c.loadPartial(url, idx, res); part != nil {
+		start = int64(copy(buf, part))
+	}
+	n, next, err := c.fetcher.Fill(ctx, res, off+start, buf[start:])
+	got := start + int64(n)
 	if err != nil {
+		// Keep whatever verified bytes arrived so the next attempt resumes
+		// inside the block; a terminal failure has no prefix worth keeping.
+		if rangefetch.Retryable(err) {
+			if got > start {
+				c.savePartial(url, idx, next, buf[:got])
+			}
+		} else {
+			c.removePartial(url, idx)
+		}
 		return nil, fmt.Errorf("shadowfs: fetch block: %w", err)
 	}
-	if int64(n) != size {
-		return nil, fmt.Errorf("shadowfs: fetch block: %w: wanted %d bytes, got %d", rangefetch.ErrShortRead, size, n)
+	if got != size {
+		// A short body Fill could not extend because the resource ends inside
+		// this block: there is no further progress to persist.
+		if !(next.Size > 0 && off+got >= next.Size) {
+			c.savePartial(url, idx, next, buf[:got])
+		}
+		return nil, fmt.Errorf("shadowfs: fetch block: %w: wanted %d bytes, got %d", rangefetch.ErrShortRead, size, got)
 	}
+	c.removePartial(url, idx)
 	return buf, nil
+}
+
+// loadPartial returns the validated prefix of a block persisted by an earlier
+// attempt, or nil when there is none. A sidecar naming a different resource
+// version (size or validators changed) is discarded rather than appended to.
+func (c *BlockCache) loadPartial(url string, idx int64, res rangefetch.Resource) []byte {
+	dataPath, metaPath := c.partialPath(url, idx)
+	body, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil
+	}
+	var meta partialMeta
+	if err := json.Unmarshal(body, &meta); err != nil {
+		c.removePartial(url, idx)
+		return nil
+	}
+	prior := rangefetch.Resource{
+		URL:          meta.URL,
+		Size:         meta.Size,
+		ETag:         meta.ETag,
+		LastModified: meta.LastModified,
+		ContentType:  meta.ContentType,
+	}
+	if meta.Bytes <= 0 || meta.Bytes > c.blockSize || !res.SameIdentity(prior) {
+		c.removePartial(url, idx)
+		return nil
+	}
+	data, err := os.ReadFile(dataPath)
+	if err != nil || int64(len(data)) != meta.Bytes {
+		c.removePartial(url, idx)
+		return nil
+	}
+	return data
+}
+
+// savePartial persists the verified prefix of an interrupted block together
+// with the resource identity it belongs to. Both files are written atomically
+// and refused on a low-disk volume, so partials cannot fill the disk.
+func (c *BlockCache) savePartial(url string, idx int64, res rangefetch.Resource, data []byte) {
+	if len(data) == 0 || int64(len(data)) > c.blockSize {
+		return
+	}
+	dataPath, metaPath := c.partialPath(url, idx)
+	written, _ := c.write(dataPath, data)
+	if !written {
+		// The atomic write left any earlier partial (and its sidecar) intact,
+		// so keep them rather than leaving the data without its metadata.
+		return
+	}
+	body, err := json.Marshal(partialMeta{
+		URL:          res.URL,
+		Size:         res.Size,
+		ETag:         res.ETag,
+		LastModified: res.LastModified,
+		ContentType:  res.ContentType,
+		Bytes:        int64(len(data)),
+	})
+	if err != nil {
+		_ = os.Remove(dataPath)
+		return
+	}
+	if ok, _ := c.write(metaPath, body); !ok {
+		_ = os.Remove(dataPath)
+	}
+}
+
+// removePartial deletes a block's persisted partial data and sidecar.
+func (c *BlockCache) removePartial(url string, idx int64) {
+	dataPath, metaPath := c.partialPath(url, idx)
+	_ = os.Remove(dataPath)
+	_ = os.Remove(metaPath)
 }
 
 // resource returns the probed identity of url, probing at most once (and at
@@ -251,26 +376,38 @@ func (c *BlockCache) resource(ctx context.Context, url string) (rangefetch.Resou
 // non-fatal. New blocks are refused when the volume has less than minFreeBytes
 // free — the cache degrades to fetch-every-read instead of filling the disk.
 func (c *BlockCache) store(p string, data []byte) error {
+	_, err := c.write(p, data)
+	return err
+}
+
+// write atomically replaces p with data, reporting whether it landed. It is
+// refused when the volume has less than minFreeBytes free; that silent refusal
+// is what lets the cache degrade to fetch-every-read instead of filling the
+// disk. Callers that must keep a sidecar consistent use the bool.
+func (c *BlockCache) write(p string, data []byte) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-		return err
+		return false, err
 	}
 	if free, err := statfsFn(filepath.Dir(p)); err == nil && free < minFreeBytes {
 		if c.freeWarned.CompareAndSwap(false, true) {
 			fmt.Fprintf(os.Stderr, "shadowfs: refusing block cache write — volume free space below %d MiB (free=%d MiB); serving fetch-every-read\n", minFreeBytes>>20, free>>20)
 		}
-		return nil
+		return false, nil
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
 	if err != nil {
-		return err
+		return false, err
 	}
 	_, werr := tmp.Write(data)
 	cerr := tmp.Close()
 	if werr != nil || cerr != nil {
 		os.Remove(tmp.Name())
-		return nil
+		return false, nil
 	}
-	return os.Rename(tmp.Name(), p)
+	if err := os.Rename(tmp.Name(), p); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // evict deletes the least recently written blocks until the cache fits within

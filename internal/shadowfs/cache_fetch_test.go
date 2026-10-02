@@ -36,12 +36,13 @@ func (o *fetchOrigin) start(t *testing.T) string {
 func (o *fetchOrigin) handle(w http.ResponseWriter, r *http.Request) {
 	o.mu.Lock()
 	o.ranges = append(o.ranges, r.Header.Get("Range"))
+	data, noRange, cut := o.data, o.noRange, o.cut
 	o.mu.Unlock()
 
-	if o.noRange {
-		w.Header().Set("Content-Length", strconv.Itoa(len(o.data)))
+	if noRange {
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(o.data)
+		_, _ = w.Write(data)
 		return
 	}
 
@@ -49,15 +50,15 @@ func (o *fetchOrigin) handle(w http.ResponseWriter, r *http.Request) {
 	a, b, _ := strings.Cut(header, "-")
 	start, _ := strconv.ParseInt(a, 10, 64)
 	end, _ := strconv.ParseInt(b, 10, 64)
-	if end >= int64(len(o.data)) {
-		end = int64(len(o.data)) - 1
+	if end >= int64(len(data)) {
+		end = int64(len(data)) - 1
 	}
-	body := o.data[start : end+1]
+	body := data[start : end+1]
 	claimed := end
-	if o.cut > 0 && o.cut < len(body) {
-		body = body[:o.cut]
+	if cut > 0 && cut < len(body) {
+		body = body[:cut]
 	}
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, claimed, len(o.data)))
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, claimed, len(data)))
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusPartialContent)
 	_, _ = w.Write(body)
