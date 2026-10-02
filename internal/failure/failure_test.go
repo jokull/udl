@@ -63,6 +63,7 @@ func TestClassifyReason(t *testing.T) {
 		{"post-processing failed: par2 repair failed", Content},
 		{"no media files found after post-processing", Content},
 		{"unpack failed: password protected", Content},
+		{"post-processing: rar extraction failed for /Volumes/Plex/downloads/x", Content},
 		{"fetch NZB: fetch NZB: HTTP 403", Permission},
 		{"fetch NZB: HTTP 401 Unauthorized", Permission},
 		{"NNTP download: connection reset by peer", Transport},
@@ -71,6 +72,7 @@ func TestClassifyReason(t *testing.T) {
 		{"health abort: 100% segments expired", Missing},
 		{"fetch NZB: status 404", Missing},
 		{"create download dir: no space left on device", Local},
+		{"insufficient disk space: 107252 MB available, need ~116007 MB", Local},
 		{"something nobody has seen before", Unknown},
 	}
 	for _, c := range cases {

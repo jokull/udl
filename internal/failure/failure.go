@@ -105,7 +105,7 @@ func (c Class) Valid() bool {
 func ClassifyReason(reason string) Class {
 	r := strings.ToLower(reason)
 	switch {
-	case containsAny(r, "par2", "repair", "unpack", "password", "corrupt", "verification failed", "no media files", "wrong content"):
+	case containsAny(r, "par2", "repair", "unpack", "rar extraction", "extraction failed", "password", "corrupt", "verification failed", "no media files", "wrong content"):
 		return Content
 	case containsAny(r, "disk", "no space", "space left", "permission denied", "read-only", "mount", "database is closed"):
 		return Local

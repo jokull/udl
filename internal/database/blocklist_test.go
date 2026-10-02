@@ -134,10 +134,11 @@ func TestBackfillBlocklistClasses(t *testing.T) {
 	db := openBlocklistDB(t)
 
 	legacy := []struct{ release, reason string }{
-		{"plex:Stradivarius", "read: unexpected EOF"},                          // not a release at all
-		{"Movie.2025.1080p-GRP", "NNTP download: connection reset by peer"},    // transport
-		{"Movie.2025.2160p-BAD", "post-processing failed: par2 repair failed"}, // content
-		{"Movie.2025.720p-OLD", "something nobody has seen before"},            // unknown
+		{"plex:Stradivarius", "read: unexpected EOF"},                            // not a release at all
+		{"Movie.2025.1080p-GRP", "NNTP download: connection reset by peer"},      // transport
+		{"Movie.2025.2160p-BAD", "post-processing failed: par2 repair failed"},   // content
+		{"Movie.2025.720p-OLD", "something nobody has seen before"},              // unknown
+		{"Movie.2025.1080p-DISK", "insufficient disk space: 46604 MB available"}, // our own fault
 	}
 	for _, l := range legacy {
 		if _, err := db.Exec(
@@ -184,12 +185,52 @@ func TestBackfillBlocklistClasses(t *testing.T) {
 		t.Errorf("unrecognized reason = %s, want unknown", class)
 	}
 
+	// A failure of our own making must never hold a release back, whoever
+	// classified it: this row is expired on arrival, not left permanent.
+	if class, hasExpiry := classOf("Movie.2025.1080p-DISK"); class != failure.Local || !hasExpiry {
+		t.Errorf("local row = (%s, expires=%v), want (local, true)", class, hasExpiry)
+	}
+	if blocked, _ := db.IsBlocklisted("movie", 1, "Movie.2025.1080p-DISK"); blocked {
+		t.Error("a disk-space failure should not be holding a release back")
+	}
+
 	// Idempotent: a second pass changes nothing and deletes nothing.
 	if err := db.backfillBlocklistClasses(); err != nil {
 		t.Fatal(err)
 	}
-	if n, _ := db.BlocklistCount(); n != 3 {
-		t.Errorf("blocklist = %d rows after re-running the backfill, want 3", n)
+	if n, _ := db.BlocklistCount(); n != 4 {
+		t.Errorf("blocklist = %d rows after re-running the backfill, want 4", n)
+	}
+}
+
+// Rows classified by an earlier migration must be repaired too: only the second
+// pass can reach them, because the first only touches rows with no class.
+func TestBackfillExpiresAlreadyClassifiedOurOwnFault(t *testing.T) {
+	db := openBlocklistDB(t)
+
+	for _, class := range []failure.Class{failure.Local, failure.Client, failure.Transport, failure.Permission} {
+		if _, err := db.Exec(
+			`INSERT INTO blocklist (media_type, media_id, release_title, reason, failure_class, expires_at)
+			 VALUES ('movie', 1, ?, 'x', ?, NULL)`, string(class), string(class)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.backfillBlocklistClasses(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, class := range []failure.Class{failure.Local, failure.Client} {
+		if blocked, _ := db.IsBlocklisted("movie", 1, string(class)); blocked {
+			t.Errorf("%s row is still holding a release back", class)
+		}
+	}
+	// Transport and permission rows are left alone: they are waiting out a
+	// cooldown that the earlier migration set, not being held by our own fault.
+	for _, class := range []failure.Class{failure.Transport, failure.Permission} {
+		if blocked, _ := db.IsBlocklisted("movie", 1, string(class)); !blocked {
+			t.Errorf("%s row stopped blocking; the repair must not touch it", class)
+		}
 	}
 }
 

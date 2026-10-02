@@ -278,8 +278,13 @@ func (db *DB) backfillBlocklistClasses() error {
 			if createdAt.Valid {
 				base = createdAt.Time
 			}
-			if d := p.class.Cooldown(); d > 0 {
-				p.expiresAt = sql.NullString{String: base.Add(d).UTC().Format(tsLayout), Valid: true}
+			switch {
+			case p.class.BlamesUs():
+				// Our own fault never holds a release back: it is expired on
+				// arrival rather than left with no expiry at all.
+				p.expiresAt = sql.NullString{String: base.UTC().Format(tsLayout), Valid: true}
+			case p.class.Cooldown() > 0:
+				p.expiresAt = sql.NullString{String: base.Add(p.class.Cooldown()).UTC().Format(tsLayout), Valid: true}
 			}
 		}
 		work = append(work, p)
@@ -294,6 +299,16 @@ func (db *DB) backfillBlocklistClasses() error {
 			string(p.class), p.expiresAt, p.id); err != nil {
 			return err
 		}
+	}
+
+	// Rows classified by an earlier version of this migration cannot be reached
+	// by the loop above, which only touches rows with no class. Expire any held
+	// by a failure of our own making: the release was never given a fair chance,
+	// so it must be a candidate again. Idempotent — after this, no rows match.
+	if _, err := db.Exec(`UPDATE blocklist SET expires_at = COALESCE(created_at, CURRENT_TIMESTAMP)
+		WHERE failure_class IN (?, ?) AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)`,
+		string(failure.Local), string(failure.Client)); err != nil {
+		return err
 	}
 	return nil
 }
