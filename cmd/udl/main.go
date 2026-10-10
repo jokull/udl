@@ -2581,12 +2581,9 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 		serveErr <- shadowfs.Serve(ln, fs)
 	}()
 
-	if noTuning, _ := cmd.Flags().GetBool("no-tuning"); !noTuning {
-		tuneShadowPlex(cmd.Context(), def)
-	}
-
 	ctx, cancel := context.WithTimeout(cmd.Context(), 120*time.Second)
 	defer cancel()
+	mountReady := false
 	if daemon {
 		// The agent runs in the user's session, which macOS System Policy
 		// approves for mounts — unlike launchd system daemons. Mount via
@@ -2601,6 +2598,7 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 		already, _ := isMounted(real)
 		if already {
 			fmt.Printf("  already mounted at %s\n", real)
+			mountReady = true
 		} else {
 			opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,nolocks,resvport", tcpAddr.Port, tcpAddr.Port)
 			var out []byte
@@ -2623,6 +2621,7 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 				fmt.Printf("    sudo mount -o %s -t nfs 127.0.0.1:/ %s\n", opts, real)
 			} else {
 				fmt.Printf("  mounted at %s via sudo\n", real)
+				mountReady = true
 			}
 		}
 	} else {
@@ -2678,6 +2677,20 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  warning: mount reported success but %s shows %v entries — check 'mount'\n", real, len(des))
 		} else {
 			fmt.Printf("  mounted: %d entries visible at %s\n", len(des), real)
+		}
+		mountReady = true
+	}
+
+	// Mounting is the critical boot path. Plex commonly starts before the
+	// per-user shadow agents after a reboot, and its API may not answer yet.
+	// Never let optional Plex tuning delay the filesystem it is meant to
+	// protect; reconcile in the background after the mount is available and
+	// retry while Plex finishes starting.
+	if noTuning, _ := cmd.Flags().GetBool("no-tuning"); !noTuning && mountReady {
+		if plexToken() == "" {
+			fmt.Println("plex tuning skipped: no token configured")
+		} else {
+			go reconcileShadowPlex(cmd.Context(), def)
 		}
 	}
 
@@ -3082,35 +3095,54 @@ func portFree(p int) bool {
 // the owned server, scoped to the library sections this shadow is mounted at:
 // preview thumbnails, intro/credit/ad markers, and voice-activity analysis.
 // Those would otherwise stream entire shadow files from friends' servers.
-func tuneShadowPlex(ctx context.Context, def *shadow.Def) {
+func reconcileShadowPlex(ctx context.Context, def *shadow.Def) {
+	const attempts = 6
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := tuneShadowPlex(ctx, def); err == nil {
+			return
+		} else if attempt == attempts {
+			fmt.Printf("plex tuning gave up after %d attempts: %v\n", attempts, err)
+			return
+		} else {
+			delay := time.Duration(attempt*5) * time.Second
+			fmt.Printf("plex tuning not ready (attempt %d/%d): %v — retrying in %s\n", attempt, attempts, err, delay)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}
+}
+
+func tuneShadowPlex(ctx context.Context, def *shadow.Def) error {
 	token := plexToken()
 	if token == "" {
-		fmt.Println("plex tuning skipped: no token configured")
-		return
+		return fmt.Errorf("no token configured")
 	}
 	client := plex.New(token)
-	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Keep each background attempt short. At boot a slow Plex API must never
+	// hold up this NFS server or defer later retries for half a minute.
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	srv, err := client.DiscoverOwnedServer()
 	if err != nil {
-		fmt.Printf("plex tuning skipped: %v\n", err)
-		return
+		return err
 	}
 	if err := client.SetPreferences(cctx, *srv, map[string]string{"GenerateBIFBehavior": "never"}); err != nil {
-		fmt.Printf("plex tuning skipped: %v\n", err)
-		return
+		return err
 	}
 	fmt.Println("plex: preview thumbnails disabled (GenerateBIFBehavior=never)")
 
 	real, _, err := resolveMount(def.Mount)
 	if err != nil {
-		fmt.Printf("plex tuning skipped: %v\n", err)
-		return
+		return err
 	}
 	sections, err := client.LibrarySections(*srv)
 	if err != nil {
-		fmt.Printf("plex tuning skipped: %v\n", err)
-		return
+		return err
 	}
 	markerPrefs := map[string]string{
 		"enableIntroMarkerGeneration":   "0",
@@ -3130,16 +3162,16 @@ func tuneShadowPlex(ctx context.Context, def *shadow.Def) {
 				continue
 			}
 			if err := client.SetSectionPreferences(cctx, *srv, s.Key, markerPrefs); err != nil {
-				fmt.Printf("plex tuning skipped: section %s: %v\n", s.Title, err)
-				continue
+				return fmt.Errorf("section %s: %w", s.Title, err)
 			}
 			fmt.Printf("plex: intro/credit/ad/BIF/voice-activity analysis disabled on %q\n", s.Title)
 			matched++
 		}
 	}
 	if matched == 0 {
-		fmt.Println("plex tuning: no owned library section matched this shadow's mount path")
+		return fmt.Errorf("no owned library section matched shadow mount %s", real)
 	}
+	return nil
 }
 
 // plexToken returns the configured Plex token, from config or PLEX_TOKEN.
