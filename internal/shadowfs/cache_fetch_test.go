@@ -123,6 +123,30 @@ func TestBlockCacheServesValidatedBlocks(t *testing.T) {
 	}
 }
 
+func TestBlockCacheServesShortFinalBlock(t *testing.T) {
+	data := fetchTestData(2500)
+	o := &fetchOrigin{data: data}
+	url := o.start(t)
+	c := newFetchCache(t, 1024)
+
+	got, err := c.ReadAt(context.Background(), url, 2*1024, int64(len(data)-2*1024))
+	if err != nil {
+		t.Fatalf("ReadAt final block: %v", err)
+	}
+	if !bytes.Equal(got, data[2*1024:]) {
+		t.Fatal("ReadAt returned wrong final-block bytes")
+	}
+
+	// A valid short final block is complete and must be reusable from disk.
+	before := o.count(func(r string) bool { return r != "bytes=0-0" })
+	if _, err := c.ReadAt(context.Background(), url, 2*1024, int64(len(data)-2*1024)); err != nil {
+		t.Fatalf("cached final block: %v", err)
+	}
+	if after := o.count(func(r string) bool { return r != "bytes=0-0" }); after != before {
+		t.Fatalf("final block was not cached: fetches %d -> %d", before, after)
+	}
+}
+
 func TestBlockCacheRejectsTruncatedBlock(t *testing.T) {
 	data := fetchTestData(4 * 1024)
 	o := &fetchOrigin{data: data, cut: 100} // every block body is 100 bytes short

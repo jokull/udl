@@ -254,11 +254,14 @@ func (c *BlockCache) fetch(ctx context.Context, url string, off, size int64) ([]
 		return nil, fmt.Errorf("shadowfs: fetch block: %w", err)
 	}
 	if got != size {
-		// A short body Fill could not extend because the resource ends inside
-		// this block: there is no further progress to persist.
-		if !(next.Size > 0 && off+got >= next.Size) {
-			c.savePartial(url, idx, next, buf[:got])
+		// The final cache block is normally shorter than blockSize. Fill has
+		// validated the server's Content-Range and resource size, so reaching
+		// that exact EOF is a complete block, not a truncated response.
+		if next.Size > 0 && off+got == next.Size {
+			c.removePartial(url, idx)
+			return buf[:got], nil
 		}
+		c.savePartial(url, idx, next, buf[:got])
 		return nil, fmt.Errorf("shadowfs: fetch block: %w: wanted %d bytes, got %d", rangefetch.ErrShortRead, size, got)
 	}
 	c.removePartial(url, idx)
