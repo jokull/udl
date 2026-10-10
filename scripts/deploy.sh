@@ -132,7 +132,11 @@ bounded() {
     local secs="$1"
     shift
     if [[ -x /usr/bin/perl ]]; then
-        /usr/bin/perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+        # Do not inherit a locale that Perl cannot initialise. In particular,
+        # launch/agent shells can carry C.UTF-8 even though macOS does not ship
+        # that locale; Perl then exits before exec and every healthy mount is
+        # reported as unresponsive.
+        LC_ALL=C LANG=C /usr/bin/perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
         return $?
     fi
     "$@"
