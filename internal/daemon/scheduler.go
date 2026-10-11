@@ -7,12 +7,14 @@ import (
 
 	"github.com/jokull/udl/internal/seerr"
 	"github.com/jokull/udl/internal/tmdb"
+	"github.com/jokull/udl/internal/tvmaze"
 )
 
 // Scheduler runs periodic tasks for the daemon.
 type Scheduler struct {
 	svc      *Service
 	tmdb     *tmdb.Client
+	tvmaze   *tvmaze.Client
 	seerr    *seerr.Client // nil if Seerr integration is disabled
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -22,10 +24,11 @@ type Scheduler struct {
 // and plex client.
 func NewScheduler(svc *Service, tc *tmdb.Client, sc *seerr.Client) *Scheduler {
 	return &Scheduler{
-		svc:   svc,
-		tmdb:  tc,
-		seerr: sc,
-		stop:  make(chan struct{}),
+		svc:    svc,
+		tmdb:   tc,
+		tvmaze: tvmaze.New(),
+		seerr:  sc,
+		stop:   make(chan struct{}),
 	}
 }
 
@@ -203,7 +206,8 @@ func (s *Scheduler) refreshLoop(ctx context.Context) {
 	s.svc.log.Info("tmdb refresh: running initial cycle")
 	result := s.RefreshAllSeries()
 	s.svc.log.Info("tmdb refresh: initial cycle complete",
-		"checked", result.Checked, "new_episodes", result.NewEpisodes, "ended", result.Ended)
+		"checked", result.Checked, "new_episodes", result.NewEpisodes,
+		"tvmaze_dates", result.FallbackDates, "ended", result.Ended)
 
 	ticker := time.NewTicker(12 * time.Hour)
 	defer ticker.Stop()
@@ -218,16 +222,18 @@ func (s *Scheduler) refreshLoop(ctx context.Context) {
 			s.svc.log.Info("tmdb refresh: running scheduled cycle")
 			result := s.RefreshAllSeries()
 			s.svc.log.Info("tmdb refresh: scheduled cycle complete",
-				"checked", result.Checked, "new_episodes", result.NewEpisodes, "ended", result.Ended)
+				"checked", result.Checked, "new_episodes", result.NewEpisodes,
+				"tvmaze_dates", result.FallbackDates, "ended", result.Ended)
 		}
 	}
 }
 
 // RefreshResult summarizes a TMDB refresh run.
 type RefreshResult struct {
-	Checked     int
-	NewEpisodes int
-	Ended       int
+	Checked       int
+	NewEpisodes   int
+	Ended         int
+	FallbackDates int
 }
 
 // RefreshAllSeries re-fetches episode metadata from TMDB for all monitored series.
@@ -258,8 +264,33 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 			continue
 		}
 
+		// Epguides currently obtains its episode lists from TVMaze. Query that
+		// structured, unauthenticated API only when TMDB left a date blank, and
+		// match solely by stable external ID plus season/episode number.
+		if s.tvmaze != nil && hasMissingAirDates(episodes) && (series.TvdbID.Valid || series.ImdbID.Valid) {
+			tvdbID := 0
+			if series.TvdbID.Valid {
+				tvdbID = int(series.TvdbID.Int64)
+			}
+			imdbID := ""
+			if series.ImdbID.Valid {
+				imdbID = series.ImdbID.String
+			}
+			cctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			dates, fallbackErr := s.tvmaze.EpisodeDates(cctx, tvdbID, imdbID)
+			cancel()
+			if fallbackErr != nil {
+				s.svc.log.Warn("tvmaze air-date fallback unavailable", "series", series.Title, "error", fallbackErr)
+			} else {
+				for _, filled := range fillMissingAirDates(episodes, dates) {
+					result.FallbackDates++
+					s.svc.log.Info("episode air date filled", "source", "tvmaze", "series", series.Title,
+						"season", filled.Season, "episode", filled.Episode, "air_date", filled.AirDate)
+				}
+			}
+		}
+
 		for _, ep := range episodes {
-			// UpsertEpisode uses INSERT OR IGNORE, so existing episodes are skipped.
 			err := s.svc.db.UpsertEpisode(series.ID, ep.Season, ep.Episode, ep.Title, ep.AirDate)
 			if err != nil {
 				s.svc.log.Error("tmdb refresh: upsert episode", "series", series.Title,
@@ -298,6 +329,30 @@ func (s *Scheduler) RefreshAllSeries() RefreshResult {
 	}
 
 	return result
+}
+
+func hasMissingAirDates(episodes []tmdb.Episode) bool {
+	for _, ep := range episodes {
+		if ep.AirDate == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func fillMissingAirDates(episodes []tmdb.Episode, dates map[tvmaze.EpisodeKey]string) []tmdb.Episode {
+	var filled []tmdb.Episode
+	for i := range episodes {
+		if episodes[i].AirDate != "" {
+			continue
+		}
+		key := tvmaze.EpisodeKey{Season: episodes[i].Season, Episode: episodes[i].Episode}
+		if date := dates[key]; date != "" {
+			episodes[i].AirDate = date
+			filled = append(filled, episodes[i])
+		}
+	}
+	return filled
 }
 
 // seerrApproveLoop periodically auto-approves pending Seerr requests.

@@ -269,6 +269,43 @@ func TestEpisodeUniqueConstraint(t *testing.T) {
 	}
 }
 
+func TestUpsertEpisodeFillsOnlyBlankMetadata(t *testing.T) {
+	db := mustOpen(t)
+	sid, err := db.AddSeries(291431, 453660, "tt33248156", "The Celebrity Traitors", 2025, "en", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddEpisode(sid, 2, 3, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.UpsertEpisode(sid, 2, 3, "Episode 3", "2026-10-08"); err != nil {
+		t.Fatal(err)
+	}
+
+	episodes, err := db.EpisodesForSeries(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(episodes) != 1 || !episodes[0].AirDate.Valid || episodes[0].AirDate.String != "2026-10-08" {
+		t.Fatalf("blank date was not filled: %+v", episodes)
+	}
+	if !episodes[0].Title.Valid || episodes[0].Title.String != "Episode 3" {
+		t.Fatalf("blank title was not filled: %+v", episodes[0].Title)
+	}
+
+	// A later fallback disagreement must not replace established TMDB data.
+	if err := db.UpsertEpisode(sid, 2, 3, "Different title", "2026-10-09"); err != nil {
+		t.Fatal(err)
+	}
+	episodes, err = db.EpisodesForSeries(sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if episodes[0].AirDate.String != "2026-10-08" || episodes[0].Title.String != "Episode 3" {
+		t.Fatalf("non-empty metadata was overwritten: %+v", episodes[0])
+	}
+}
+
 func TestEpisodeForeignKey(t *testing.T) {
 	db := mustOpen(t)
 

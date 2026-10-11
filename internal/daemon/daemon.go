@@ -29,6 +29,7 @@ import (
 	"github.com/jokull/udl/internal/seerr"
 	"github.com/jokull/udl/internal/shadow"
 	"github.com/jokull/udl/internal/tmdb"
+	"github.com/jokull/udl/internal/tvmaze"
 	"github.com/jokull/udl/internal/web"
 )
 
@@ -417,9 +418,10 @@ type RetryDownloadReply struct {
 
 // RefreshSeriesReply contains the reply for the RefreshSeries RPC method.
 type RefreshSeriesReply struct {
-	Checked     int
-	NewEpisodes int
-	Ended       int
+	Checked       int
+	NewEpisodes   int
+	Ended         int
+	FallbackDates int
 }
 
 // --- Movie/Series info types ---
@@ -2714,13 +2716,15 @@ func (s *Service) RefreshSeries(args *Empty, reply *RefreshSeriesReply) error {
 
 	// Build a temporary scheduler with the TMDB client to reuse RefreshAllSeries.
 	sched := &Scheduler{
-		svc:  s,
-		tmdb: s.tmdb,
+		svc:    s,
+		tmdb:   s.tmdb,
+		tvmaze: tvmaze.New(),
 	}
 	result := sched.RefreshAllSeries()
 	reply.Checked = result.Checked
 	reply.NewEpisodes = result.NewEpisodes
 	reply.Ended = result.Ended
+	reply.FallbackDates = result.FallbackDates
 	return nil
 }
 

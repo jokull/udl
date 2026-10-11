@@ -1724,8 +1724,8 @@ func runTVRefresh(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("checked %d series, %d new episodes, %d marked ended\n",
-		reply.Checked, reply.NewEpisodes, reply.Ended)
+	fmt.Printf("checked %d series, %d new episodes, %d missing dates filled from TVMaze, %d marked ended\n",
+		reply.Checked, reply.NewEpisodes, reply.FallbackDates, reply.Ended)
 	return nil
 }
 

@@ -13,6 +13,8 @@ import (
 	"github.com/jokull/udl/internal/newznab"
 	"github.com/jokull/udl/internal/parser"
 	"github.com/jokull/udl/internal/quality"
+	"github.com/jokull/udl/internal/tmdb"
+	"github.com/jokull/udl/internal/tvmaze"
 )
 
 func newTestScheduler(t *testing.T) *Scheduler {
@@ -58,6 +60,33 @@ func newTestScheduler(t *testing.T) *Scheduler {
 	return &Scheduler{
 		svc:  svc,
 		stop: make(chan struct{}),
+	}
+}
+
+func TestFillMissingAirDatesMatchesExactlyAndPreservesTMDB(t *testing.T) {
+	episodes := []tmdb.Episode{
+		{Season: 2, Episode: 1, Title: "Episode 1", AirDate: "2026-10-01"},
+		{Season: 2, Episode: 3, Title: "Episode 3"},
+		{Season: 3, Episode: 3, Title: "Different season"},
+	}
+	dates := map[tvmaze.EpisodeKey]string{
+		{Season: 2, Episode: 1}: "2026-10-02", // disagreement: TMDB must win
+		{Season: 2, Episode: 3}: "2026-10-08",
+		{Season: 2, Episode: 4}: "2026-10-09", // absent from TMDB: do not invent it here
+	}
+
+	filled := fillMissingAirDates(episodes, dates)
+	if len(filled) != 1 || filled[0].Season != 2 || filled[0].Episode != 3 {
+		t.Fatalf("filled = %+v", filled)
+	}
+	if episodes[0].AirDate != "2026-10-01" {
+		t.Fatalf("TMDB date overwritten: %q", episodes[0].AirDate)
+	}
+	if episodes[1].AirDate != "2026-10-08" {
+		t.Fatalf("missing date not filled: %q", episodes[1].AirDate)
+	}
+	if episodes[2].AirDate != "" {
+		t.Fatalf("wrong season matched: %q", episodes[2].AirDate)
 	}
 }
 

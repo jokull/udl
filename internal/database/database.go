@@ -534,12 +534,22 @@ func (db *DB) AddEpisode(seriesID int64, season, episode int, title, airDate str
 	return err
 }
 
-// UpsertEpisode inserts a new episode or silently skips if it already exists.
-// Used by the refresh loop to add newly announced episodes without errors on duplicates.
+// UpsertEpisode inserts a new episode and fills metadata that was blank on an
+// existing row. Non-empty dates are never overwritten: TMDB remains primary,
+// while a fallback provider may safely repair only missing dates.
 func (db *DB) UpsertEpisode(seriesID int64, season, episode int, title, airDate string) error {
 	_, err := db.Exec(
-		`INSERT OR IGNORE INTO episodes (series_id, season, episode, title, air_date)
-		 VALUES (?, ?, ?, ?, ?)`,
+		`INSERT INTO episodes (series_id, season, episode, title, air_date)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(series_id, season, episode) DO UPDATE SET
+		   title = CASE
+		     WHEN episodes.title IS NULL OR episodes.title = '' THEN excluded.title
+		     ELSE episodes.title
+		   END,
+		   air_date = CASE
+		     WHEN episodes.air_date IS NULL OR episodes.air_date = '' THEN excluded.air_date
+		     ELSE episodes.air_date
+		   END`,
 		seriesID, season, episode, nullString(title), nullString(airDate),
 	)
 	return err
