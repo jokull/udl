@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,9 +41,20 @@ func TestLiveSelectedShadowFile(t *testing.T) {
 		t.Fatal("selected file missing or too small")
 	}
 	cache := NewBlockCache(filepath.Join(t.TempDir(), "cache"), 64<<20)
+	defer cache.Close()
 	fs := NewUnion(t.TempDir(), []shadow.Item{*item}, cache)
-	srv := serveTest(t, fs)
+	srv, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer srv.Close()
+	handler, err := NewPersistentHandler(fs, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- ServeHandler(t.Context(), srv, fs, handler) }()
+	defer func() { srv.Close(); <-done }()
 	client := clientTest(t, srv.Addr())
 	f, err := client.Open(normalizeName(name))
 	if err != nil {

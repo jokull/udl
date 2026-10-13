@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"html"
 	"log/slog"
 	"net"
 	"os"
@@ -20,6 +23,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/jokull/udl/internal/atomicfile"
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/daemon"
 	"github.com/jokull/udl/internal/database"
@@ -485,11 +489,9 @@ var shadowEnableCmd = &cobra.Command{
 		"shadow's mount path when the machine boots, restarting it if it crashes. The\n" +
 		"mount survives reboots. Uses sudo for the install; remove with 'udl shadow\n" +
 		"disable <name>'.\n\n" +
-		"Installing or reinstalling restarts the serve daemon. Its NFS file handles\n" +
-		"live only in that process's memory, so every handle a client already holds\n" +
-		"becomes stale and anything streaming from the mount fails. Check that nothing\n" +
-		"is playing from it first ('./scripts/deploy.sh status' reports this in a\n" +
-		"checkout; docs/nfs-sharp-edges.md explains the mechanism).",
+		"Repeated enable is idempotent. Reconfiguration first unmounts normally and\n" +
+		"refuses to stop a busy export. New exports persist NFS handles across process\n" +
+		"restarts; upgrading an older export requires one idle remount.",
 	Args:         cobra.ExactArgs(1),
 	RunE:         runShadowEnable,
 	SilenceUsage: true,
@@ -2434,18 +2436,11 @@ func runShadowManifest(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	path, err := shadow.ManifestPath(def.Name)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := shadow.SaveManifest(m); err != nil {
 		return err
 	}
 
@@ -2467,7 +2462,8 @@ func runShadowManifest(cmd *cobra.Command, args []string) error {
 	w.Flush()
 	fmt.Printf("candidates %d, kept %d, dupes dropped %d, failed %d, total %s\n",
 		m.Stats.Candidates, m.Stats.Kept, m.Stats.Dupes, m.Stats.Failed, formatSize(m.Stats.TotalSize))
-	fmt.Printf("manifest: %s\n", path)
+	manifestPath, _ := shadow.ManifestPath(def.Name)
+	fmt.Printf("manifest: %s\n", manifestPath)
 	return nil
 }
 
@@ -2480,6 +2476,11 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	if def == nil {
 		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
 	}
+	serveCtx, cancelServe := context.WithCancel(cmd.Context())
+	defer cancelServe()
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
 	m, err := shadow.LoadManifest(def.Name)
 	if err != nil {
 		return fmt.Errorf("manifest for %q not built — run 'udl shadow manifest %s' first: %w", def.Name, def.Name, err)
@@ -2495,6 +2496,21 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	fmt.Printf("shadow %s (%s): %d items, %s\n", def.Name, m.Type, len(m.Items), formatSize(totalSize))
 
 	daemon, _ := cmd.Flags().GetBool("daemon")
+	cacheGB, _ := cmd.Flags().GetInt("cache-size")
+	if cacheGB < 1 || cacheGB > 4096 {
+		return fmt.Errorf("cache-size must be between 1 and 4096 GiB")
+	}
+	portFlag, _ := cmd.Flags().GetString("port")
+	port := def.Port
+	if portFlag != "" && portFlag != "0" {
+		port, err = strconv.Atoi(portFlag)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid NFS port %q", portFlag)
+		}
+	}
+	if daemon && port == 0 {
+		return fmt.Errorf("daemon needs a fixed port; run 'udl shadow enable %s' first", def.Name)
+	}
 	// Resolve the real mountpoint (following symlinks like media/dubbed-tv).
 	// A mount whose server died (Ctrl-C'd foreground process, crash) becomes
 	// an orphan: every stat/readdir hangs on RPC timeouts. Only the mount
@@ -2503,25 +2519,63 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("check mount table: %w", err)
 	}
-	// The daemon never mounts (automount owns the mountpoint), so it serves
-	// even when something is already mounted there.
+	// A daemon may reconnect an existing export on the same fixed port.
 	if mounted && !daemon {
 		return fmt.Errorf("%s is already mounted — unmount it first ('udl shadow unmount %s' or 'sudo umount -f %s')", real, def.Name, real)
 	}
+	if mounted {
+		if err := requireShadowMount(real); err != nil {
+			return err
+		}
+		if port != def.Port {
+			return fmt.Errorf("cannot change the port of a mounted export; unmount it first")
+		}
+	}
+	// Bind before moving local data. Port conflicts must not change the tree.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return fmt.Errorf("shadowfs: listen: %w", err)
+	}
+	defer ln.Close()
 
 	upper := real + ".upper"
 	if def.Upper != "" {
 		upper = def.Upper
 	}
+	upper, upperMounted, err := resolveMount(upper)
+	if err != nil {
+		return err
+	}
+	if upper == "/" || upper == real || strings.HasPrefix(upper, real+"/") || strings.HasPrefix(real, upper+"/") {
+		return fmt.Errorf("resolved upper layer overlaps mount %s", real)
+	}
+	if upperMounted {
+		out, err := exec.Command("/sbin/mount").Output()
+		if err != nil {
+			return err
+		}
+		_, opts, _ := mountEntry(string(out), upper)
+		if strings.Contains(opts, "nfs") || strings.Contains(opts, "autofs") {
+			return fmt.Errorf("upper layer must be local: %s", upper)
+		}
+	}
+	if err := requireStorageVolume(real); err != nil {
+		return err
+	}
+	if err := requireStorageVolume(upper); err != nil {
+		return err
+	}
+	binding := shadowBinding{Mount: real, Upper: upper, Port: ln.Addr().(*net.TCPAddr).Port}
+	if err := checkShadowBinding(def.Name, binding, mounted); err != nil {
+		return err
+	}
 
 	// One-time move of existing local files into the upper layer so the mount
 	// point can be taken over without losing the user's own files. The upper
-	// dir is created only after the move decision so a fresh run never skips
-	// it. In daemon mode none of this runs: the mountpoint is an autofs
-	// trigger, and even stat'ing it makes automountd try to mount against a
-	// server that is not up yet — a self-inflicted hang.
+	// dir is created only after the move decision. Never inspect a mounted
+	// path; cold daemon starts also migrate local files instead of hiding them.
 	moved := false
-	if !daemon {
+	if !mounted {
 		if st, err := os.Stat(real); err == nil && st.IsDir() && !dirEmpty(real) {
 			if _, uerr := os.Stat(upper); os.IsNotExist(uerr) || (uerr == nil && dirEmpty(upper)) {
 				if uerr == nil {
@@ -2535,7 +2589,7 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 				}
 				moved = true
 			} else {
-				fmt.Printf("  note: %s still has files and %s exists — those files are hidden by the mount\n", real, upper)
+				return fmt.Errorf("both %s and %s contain files; refusing to hide local media", real, upper)
 			}
 		}
 		if err := os.MkdirAll(real, 0o755); err != nil {
@@ -2544,7 +2598,7 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	}
 	// The upper layer is a real directory in both modes: ensure it exists so
 	// the union has a home for locally downloaded files. The mountpoint
-	// itself is never touched in daemon mode (autofs/mount owns it).
+	// itself is never inspected while already mounted.
 	if err := os.MkdirAll(upper, 0o755); err != nil {
 		return err
 	}
@@ -2554,22 +2608,23 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	cacheGB, _ := cmd.Flags().GetInt("cache-size")
 	cache := shadowfs.NewBlockCache(cacheDir, int64(cacheGB)<<30)
-	fs := shadowfs.NewUnion(upper, m.Items, cache)
+	defer cache.Close()
+	dataDir, err := config.DataDir()
+	if err != nil {
+		return err
+	}
+	snapshotData, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	snapshot := fmt.Sprintf("%x", sha256.Sum256(snapshotData))
+	if err := cache.PinResources(filepath.Join(dataDir, "shadow-identities", def.Name, snapshot)); err != nil {
+		return err
+	}
+	fs := shadowfs.NewSnapshotUnion(upper, m.Items, cache, snapshot)
 	fmt.Printf("  block cache: %s (%d GiB)\n", cacheDir, cacheGB)
 
-	// Port resolution: --port flag wins, then the def's fixed port (set by
-	// 'udl shadow enable' for automount), then auto-assigned.
-	portFlag, _ := cmd.Flags().GetString("port")
-	port := portFlag
-	if port == "" && def.Port > 0 {
-		port = strconv.Itoa(def.Port)
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
-	if err != nil {
-		return fmt.Errorf("shadowfs: listen: %w", err)
-	}
 	tcpAddr := ln.Addr().(*net.TCPAddr)
 	fmt.Printf("  NFS server: 127.0.0.1:%d\n", tcpAddr.Port)
 
@@ -2577,8 +2632,15 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	// blocks on its MNT RPC until the server answers, so starting it after
 	// the mount would deadlock.
 	serveErr := make(chan error, 1)
+	handler, err := shadowfs.NewPersistentHandler(fs, filepath.Join(dataDir, "shadow-handles", def.Name))
+	if err != nil {
+		return err
+	}
+	if err := saveShadowBinding(def.Name, binding); err != nil {
+		return err
+	}
 	go func() {
-		serveErr <- shadowfs.Serve(ln, fs)
+		serveErr <- shadowfs.ServeHandler(serveCtx, ln, fs, handler)
 	}()
 
 	ctx, cancel := context.WithTimeout(cmd.Context(), 120*time.Second)
@@ -2595,7 +2657,10 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 		// each attempt is bounded and retried; a mount made by any approved
 		// process survives agent restarts, and the fallback is mounting from
 		// a terminal once.
-		already, _ := isMounted(real)
+		already, err := isMounted(real)
+		if err != nil {
+			return err
+		}
 		if already {
 			fmt.Printf("  already mounted at %s\n", real)
 			mountReady = true
@@ -2616,9 +2681,7 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 				}
 			}
 			if err != nil {
-				fmt.Printf("  mount skipped: %s\n", strings.TrimSpace(string(out)))
-				fmt.Println("  mount it once from a terminal to recover:")
-				fmt.Printf("    sudo mount -o %s -t nfs 127.0.0.1:/ %s\n", opts, real)
+				return fmt.Errorf("mount failed (launchd will retry): %s: %w", strings.TrimSpace(string(out)), err)
 			} else {
 				fmt.Printf("  mounted at %s via sudo\n", real)
 				mountReady = true
@@ -2671,12 +2734,9 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 			}
 			return fmt.Errorf("mount at %s failed (sudo): %w", real, err)
 		}
-		// Confirm the mount actually happened and the union is visible.
-		des, rerr := os.ReadDir(real)
-		if rerr != nil || len(des) == 0 {
-			fmt.Printf("  warning: mount reported success but %s shows %v entries — check 'mount'\n", real, len(des))
-		} else {
-			fmt.Printf("  mounted: %d entries visible at %s\n", len(des), real)
+		// Do not stat/readdir a possibly wedged kernel mount during startup.
+		if err := requireShadowMount(real); err != nil {
+			return err
 		}
 		mountReady = true
 	}
@@ -2690,38 +2750,45 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 		if plexToken() == "" {
 			fmt.Println("plex tuning skipped: no token configured")
 		} else {
-			go reconcileShadowPlex(cmd.Context(), def)
+			go reconcileShadowPlex(serveCtx, def)
 		}
 	}
 
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sig
-		fmt.Printf("\nunmounting %s...\n", real)
-		if daemon {
-			um := exec.Command("sudo", "-n", "umount", real)
-			um.Stdin, um.Stdout, um.Stderr = os.Stdin, os.Stdout, os.Stderr
-			_ = um.Run()
-		} else {
-			um := exec.Command("sudo", "umount", real)
-			um.Stdin, um.Stdout, um.Stderr = os.Stdin, os.Stdout, os.Stderr
-			_ = um.Run()
-		}
-		os.Exit(0)
-	}()
-
-	// Heartbeat so a long-serving mount never looks hung.
-	go func() {
-		for {
-			time.Sleep(15 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	fmt.Println("serving (persistent NFS handles enabled)")
+	for {
+		select {
+		case <-sig:
+			if daemon {
+				// Keep the mount for launchd's replacement process. Its fixed
+				// port and persisted handles allow hard-mounted clients to retry.
+				cancelServe()
+				return nil
+			}
+			if err := unmountShadow(cmd.Context(), real); err != nil {
+				fmt.Fprintf(os.Stderr, "unmount refused; continuing to serve: %v\n", err)
+				continue
+			}
+			cancelServe()
+			return nil
+		case <-cmd.Context().Done():
+			return cmd.Context().Err()
+		case err := <-serveErr:
+			return err
+		case <-ticker.C:
+			if daemon {
+				if err := requireStorageVolume(real); err != nil {
+					return err
+				}
+				if err := requireShadowMount(real); err != nil {
+					return fmt.Errorf("export mount disappeared; supervisor will retry: %w", err)
+				}
+			}
 			hits, misses, bytes := cache.Stats()
 			fmt.Printf("  serving: %s streamed, %d cache hits, %d fetches\n", formatSize(bytes), hits, misses)
 		}
-	}()
-
-	fmt.Println("serving — Ctrl-C to unmount")
-	return <-serveErr
+	}
 }
 
 func runShadowUnmount(cmd *cobra.Command, args []string) error {
@@ -2733,14 +2800,15 @@ func runShadowUnmount(cmd *cobra.Command, args []string) error {
 	if def == nil {
 		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
 	}
-	real, _, err := resolveMount(def.Mount)
+	real, mounted, err := resolveMount(def.Mount)
 	if err != nil {
 		return fmt.Errorf("check mount table: %w", err)
 	}
-	um := exec.Command("sudo", "umount", real)
-	um.Stdin, um.Stdout, um.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := um.Run(); err != nil {
-		return fmt.Errorf("unmount %s failed: %w", real, err)
+	if !mounted {
+		return nil
+	}
+	if err := unmountShadow(cmd.Context(), real); err != nil {
+		return err
 	}
 	fmt.Printf("unmounted %s\n", real)
 	return nil
@@ -2757,7 +2825,7 @@ func shadowLabel(name string) string {
 // runs in the user's session (approved by macOS System Policy for /Volumes
 // access — system-domain daemons are denied file-read-data there) with the
 // user's own HOME, so config/cache resolve naturally. KeepAlive restarts it
-// unless it exits cleanly, so crashes self-heal.
+// until it is explicitly disabled (booted out of launchd).
 func shadowPlist(label, exe, name, home string) string {
 	logPath := filepath.Join(home, "Library", "Logs", label+".log")
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -2777,20 +2845,17 @@ func shadowPlist(label, exe, name, home string) string {
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<dict>
-		<key>SuccessfulExit</key>
-		<false/>
-	</dict>
+	<true/>
 	<key>StandardOutPath</key>
 	<string>%s</string>
 	<key>StandardErrorPath</key>
 	<string>%s</string>
 </dict>
 </plist>
-`, label, exe, name, logPath, logPath)
+`, html.EscapeString(label), html.EscapeString(exe), html.EscapeString(name), html.EscapeString(logPath), html.EscapeString(logPath))
 }
 
-func runShadowEnable(cmd *cobra.Command, args []string) error {
+func runShadowEnable(cmd *cobra.Command, args []string) (retErr error) {
 	defs, err := shadow.Load()
 	if err != nil {
 		return err
@@ -2799,7 +2864,8 @@ func runShadowEnable(cmd *cobra.Command, args []string) error {
 	if def == nil {
 		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
 	}
-	if _, err := shadow.LoadManifest(def.Name); err != nil {
+	manifest, err := shadow.LoadManifest(def.Name)
+	if err != nil {
 		return fmt.Errorf("manifest for %q not built — run 'udl shadow manifest %s' first: %w", def.Name, def.Name, err)
 	}
 	exe, err := os.Executable()
@@ -2817,24 +2883,15 @@ func runShadowEnable(cmd *cobra.Command, args []string) error {
 		ex.Stdin, ex.Stdout, ex.Stderr = os.Stdin, os.Stdout, os.Stderr
 		return ex.Run()
 	}
-	// Clear any previous install first: an old system LaunchDaemon can linger
-	// as a zombie holding the NFS port, and its socket is not visible or
-	// killable from the user session until launchd reaps it.
-	_ = sudoRun("launchctl", "bootout", "system/"+label)
-	_ = sudoRun("rm", "-f", "/Library/LaunchDaemons/"+label+".plist")
-	_ = runQuiet("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), label))
-
-	// Fixed NFS port for the serve daemon: --port wins, then the def's, then
-	// the first free port from 2055. Persisted so automount and the daemon
-	// agree. The def's saved port is only reused if it is actually free now.
+	// Preserve the saved port: existing kernel mounts reconnect to that port.
 	portFlag, _ := cmd.Flags().GetString("port")
 	port := 0
 	if portFlag != "" {
 		port, err = strconv.Atoi(portFlag)
-		if err != nil {
-			return fmt.Errorf("invalid --port %q: %w", portFlag, err)
+		if err != nil || port < 1 || port > 65535 {
+			return fmt.Errorf("invalid --port %q", portFlag)
 		}
-	} else if def.Port > 0 && portFree(def.Port) {
+	} else if def.Port > 0 {
 		port = def.Port
 	}
 	if port == 0 {
@@ -2843,13 +2900,132 @@ func runShadowEnable(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("no free NFS port found in 2055-2154")
 		}
 	}
-	if def.Port != port {
-		def.Port = port
+	oldPort := def.Port
+	def.Port = port
+	if err := shadow.Validate(defs); err != nil {
+		return err
+	}
+	job := fmt.Sprintf("gui/%d/%s", os.Getuid(), label)
+	_, jobErr := exec.Command("launchctl", "print", job).Output()
+	if !portFree(port) && (jobErr != nil || port != oldPort) {
+		return fmt.Errorf("NFS port %d is in use; refusing to move this export to another port", port)
+	}
+	// A repeated enable with the same definition is harmless. Reconfiguration
+	// of a running export requires a normal unmount; busy clients keep serving.
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", label+".plist")
+	previousPlist, readErr := os.ReadFile(plistPath)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return readErr
+	}
+	generationData, err := json.Marshal(struct {
+		Def      shadow.Def
+		Manifest *shadow.Manifest
+	}{*def, manifest})
+	if err != nil {
+		return err
+	}
+	generation := fmt.Sprintf("%x", sha256.Sum256(generationData))
+	plist := []byte(strings.Replace(shadowPlist(label, exe, def.Name, home), "\t<key>RunAtLoad</key>", "\t<key>EnvironmentVariables</key>\n\t<dict><key>UDL_SHADOW_GENERATION</key><string>"+generation+"</string></dict>\n\t<key>RunAtLoad</key>", 1))
+	if string(previousPlist) == string(plist) && jobErr == nil && oldPort == port {
+		if err := runQuiet("launchctl", "kickstart", job); err != nil {
+			return err
+		}
+		fmt.Printf("%s already enabled; no restart performed\n", def.Name)
+		return nil
+	}
+	// Do legacy automount cleanup before interrupting any existing service.
+	if err := prepareLegacyShadowMaps(sudoRun); err != nil {
+		return err
+	}
+	real, mounted, err := resolveMount(def.Mount)
+	if err != nil {
+		return err
+	}
+	// A manually edited mountpoint must not abandon the previous kernel mount.
+	// Port changes performed by enable itself are safe after its idle unmount.
+	if err := checkShadowBinding(def.Name, shadowBinding{Mount: real, Port: oldPort}, false); err != nil {
+		return err
+	}
+	restartsPaused := false
+	if jobErr == nil {
+		if err := runQuiet("launchctl", "disable", job); err != nil {
+			return err
+		}
+		restartsPaused = true
+	}
+	defer func() {
+		if restartsPaused {
+			retErr = errors.Join(retErr, runQuiet("launchctl", "enable", job))
+		}
+	}()
+	if mounted {
+		if err := unmountShadow(cmd.Context(), real); err != nil {
+			return err
+		}
+	}
+	// Once the old mount has been released, a failed install must restore the
+	// prior definition/agent and attempt its mount again. Keep the original
+	// error and report any recovery failure too; never silently claim success.
+	configChanged, plistChanged, serviceStopped := false, false, false
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		if configChanged {
+			def.Port = oldPort
+			retErr = errors.Join(retErr, shadow.Save(defs))
+		}
+		if plistChanged {
+			if len(previousPlist) > 0 {
+				retErr = errors.Join(retErr, atomicfile.Write(plistPath, previousPlist, 0o600))
+			} else if err := os.Remove(plistPath); err != nil && !os.IsNotExist(err) {
+				retErr = errors.Join(retErr, err)
+			}
+		}
+		if serviceStopped {
+			_ = runQuiet("launchctl", "bootout", job)
+			if jobErr == nil && len(previousPlist) > 0 {
+				retErr = errors.Join(retErr, runQuiet("launchctl", "enable", job))
+				restartsPaused = false
+				retErr = errors.Join(retErr, runQuiet("launchctl", "bootstrap", fmt.Sprintf("gui/%d", os.Getuid()), plistPath))
+				retErr = errors.Join(retErr, runQuiet("launchctl", "kickstart", job))
+			}
+		}
+		if mounted && oldPort > 0 && jobErr == nil {
+			// The old process may never have stopped (e.g. a failed plist write).
+			// A normal mount restores the export; no force-unmount is used.
+			if already, _ := isMounted(real); !already {
+				rctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+				defer cancel()
+				opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,nolocks,resvport", oldPort, oldPort)
+				out, err := exec.CommandContext(rctx, "sudo", "-n", "mount", "-o", opts, "-t", "nfs", "127.0.0.1:/", real).CombinedOutput()
+				if err != nil {
+					if already, _ := isMounted(real); !already {
+						retErr = errors.Join(retErr, fmt.Errorf("restore prior mount: %s: %w", strings.TrimSpace(string(out)), err))
+					}
+				}
+			}
+		}
+	}()
+	if oldPort != port {
+		configChanged = true
 		if err := shadow.Save(defs); err != nil {
 			return err
 		}
 		fmt.Printf("  fixed NFS port: %d (saved to shadow.toml)\n", port)
 	}
+	plistChanged = true
+	if err := atomicfile.Write(plistPath, plist, 0o600); err != nil {
+		return err
+	}
+	_ = sudoRun("launchctl", "bootout", "system/"+label)
+	_ = sudoRun("rm", "-f", "/Library/LaunchDaemons/"+label+".plist")
+	if jobErr == nil {
+		if err := runQuiet("launchctl", "bootout", job); err != nil {
+			return err
+		}
+	}
+	serviceStopped = true
 
 	// The server is a per-user LaunchAgent: macOS System Policy denies
 	// system-domain daemons file-read-data and file-mount on /Volumes/Plex,
@@ -2857,14 +3033,6 @@ func runShadowEnable(cmd *cobra.Command, args []string) error {
 	// passwordless sudo at login. (automountd is NOT used: its NFS client
 	// cannot complete the mount handshake with a loopback server on this
 	// macOS build.)
-	if err := writeAutoMaps(nil, "", 0, sudoRun); err != nil {
-		return err
-	}
-	if err := sudoRun("automount", "-vc"); err != nil {
-		return fmt.Errorf("automount reload failed: %w", err)
-	}
-	fmt.Println("  automount map removed (agent mounts via sudo instead)")
-
 	// Per-user LaunchAgent: serves the union in the user's session (approved
 	// for /Volumes access), restarts on crash, runs at login.
 	uid := os.Getuid()
@@ -2872,13 +3040,13 @@ func runShadowEnable(cmd *cobra.Command, args []string) error {
 	if err := os.MkdirAll(agentDir, 0o755); err != nil {
 		return err
 	}
-	plistPath := filepath.Join(agentDir, label+".plist")
-	if err := os.WriteFile(plistPath, []byte(shadowPlist(label, exe, def.Name, home)), 0o644); err != nil {
-		return err
-	}
 	// The bootout above leaves the previous instance shutting down for a
 	// moment; bootstrapping the same label immediately can race it with
 	// "Input/output error". Retry briefly.
+	if err := runQuiet("launchctl", "enable", job); err != nil {
+		return err
+	}
+	restartsPaused = false
 	var bootErr error
 	for range 5 {
 		bootErr = runQuiet("launchctl", "bootstrap", fmt.Sprintf("gui/%d", uid), plistPath)
@@ -2890,11 +3058,16 @@ func runShadowEnable(cmd *cobra.Command, args []string) error {
 	if bootErr != nil {
 		return fmt.Errorf("bootstrap LaunchAgent failed: %w", bootErr)
 	}
+	var startErr error
 	for range 5 {
-		if err := runQuiet("launchctl", "kickstart", fmt.Sprintf("gui/%d/%s", uid, label)); err == nil {
+		startErr = runQuiet("launchctl", "kickstart", fmt.Sprintf("gui/%d/%s", uid, label))
+		if startErr == nil {
 			break
 		}
 		time.Sleep(1 * time.Second)
+	}
+	if startErr != nil {
+		return fmt.Errorf("start LaunchAgent: %w", startErr)
 	}
 	fmt.Printf("enabled %s — serves at login on port %d, restarts on failure\n", def.Name, port)
 	fmt.Printf("log: %s\n", filepath.Join(home, "Library", "Logs", label+".log"))
@@ -2904,7 +3077,7 @@ func runShadowEnable(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runShadowDisable(cmd *cobra.Command, args []string) error {
+func runShadowDisable(cmd *cobra.Command, args []string) (retErr error) {
 	defs, err := shadow.Load()
 	if err != nil {
 		return err
@@ -2912,6 +3085,27 @@ func runShadowDisable(cmd *cobra.Command, args []string) error {
 	def := shadow.Get(defs, args[0])
 	if def == nil {
 		return fmt.Errorf("no shadow named %q (see 'udl shadow list')", args[0])
+	}
+	job := fmt.Sprintf("gui/%d/%s", os.Getuid(), shadowLabel(def.Name))
+	_, jobErr := exec.Command("launchctl", "print", job).Output()
+	if jobErr == nil {
+		if err := runQuiet("launchctl", "disable", job); err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil {
+				retErr = errors.Join(retErr, runQuiet("launchctl", "enable", job))
+			}
+		}()
+	}
+	real, mounted, err := resolveMount(def.Mount)
+	if err != nil {
+		return err
+	}
+	if mounted {
+		if err := unmountShadow(cmd.Context(), real); err != nil {
+			return err
+		}
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -2928,19 +3122,16 @@ func runShadowDisable(cmd *cobra.Command, args []string) error {
 	}
 	// bootout sends SIGTERM; the server exits 0 (graceful). Clean both the
 	// per-user agent and any older system-daemon install.
-	_ = runQuiet("launchctl", "bootout", fmt.Sprintf("gui/%d/%s", os.Getuid(), label))
+	if jobErr == nil {
+		if err := runQuiet("launchctl", "bootout", job); err != nil {
+			return err
+		}
+	}
 	_ = sudoRun("launchctl", "bootout", "system/"+label)
 	_ = sudoRun("rm", "-f", sysPlist)
 	// Remove the automount entry (rebuild the map from the remaining defs;
 	// the disabled shadow stays in shadow.toml but its map entry must go).
-	var remaining []shadow.Def
-	for _, d := range defs {
-		if d.Name == def.Name {
-			continue
-		}
-		remaining = append(remaining, d)
-	}
-	if err := writeAutoMaps(remaining, "", 0, sudoRun); err != nil {
+	if err := writeAutoMaps(nil, "", 0, sudoRun); err != nil {
 		return err
 	}
 	if err := sudoRun("automount", "-vc"); err != nil {
@@ -3197,12 +3388,8 @@ func isMounted(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, " on "+path) {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, _, ok := mountEntry(string(out), path)
+	return ok, nil
 }
 
 // resolveMount resolves the real path for a shadow mount point and reports
@@ -3212,57 +3399,11 @@ func isMounted(path string) (bool, error) {
 // touched, and the final symlink (e.g. media/dubbed-tv -> ../dubbed-tv) is
 // only read once its resolved parent is known not to be the mount.
 func resolveMount(p string) (real string, mounted bool, err error) {
-	clean := filepath.Clean(p)
-	dir := resolveDir(filepath.Dir(clean))
-	real = filepath.Join(dir, filepath.Base(clean))
-	mounted, err = isMounted(real)
-	if err != nil || mounted {
-		return real, mounted, err
+	out, err := exec.Command("/sbin/mount").Output()
+	if err != nil {
+		return "", false, err
 	}
-	target, rerr := os.Readlink(real)
-	if rerr != nil {
-		return real, false, nil // not a symlink — nothing else to resolve
-	}
-	if filepath.IsAbs(target) {
-		real = filepath.Clean(target)
-	} else {
-		real = filepath.Clean(filepath.Join(dir, target))
-	}
-	mounted, err = isMounted(real)
-	return real, mounted, err
-}
-
-// resolveDir resolves symlinks in a directory path using only readlink on
-// each component as it is reached. It never descends into a final mount:
-// callers only pass parent directories of configured mount points.
-func resolveDir(dir string) string {
-	cur := filepath.Clean(dir)
-	for range 10 {
-		t, err := os.Readlink(cur)
-		if err == nil {
-			if filepath.IsAbs(t) {
-				cur = filepath.Clean(t)
-			} else {
-				cur = filepath.Clean(filepath.Join(filepath.Dir(cur), t))
-			}
-			continue
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return cur
-		}
-		t, err = os.Readlink(parent)
-		if err == nil {
-			if filepath.IsAbs(t) {
-				cur = filepath.Clean(filepath.Join(t, filepath.Base(cur)))
-			} else {
-				cur = filepath.Clean(filepath.Join(filepath.Dir(parent), t, filepath.Base(cur)))
-			}
-			continue
-		}
-		return cur
-	}
-	return cur
+	return resolveMountTable(p, string(out), os.Readlink)
 }
 
 // mediaTag formats a TMDB-based media identifier for CLI output.

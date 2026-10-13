@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/jokull/udl/internal/atomicfile"
 	"github.com/jokull/udl/internal/config"
 	"github.com/jokull/udl/internal/plex"
 )
@@ -57,6 +58,9 @@ func FilePath() (string, error) {
 
 // ManifestPath returns where the built manifest for a shadow is written.
 func ManifestPath(name string) (string, error) {
+	if err := ValidateName(name); err != nil {
+		return "", err
+	}
 	dir, err := config.DataDir()
 	if err != nil {
 		return "", err
@@ -87,11 +91,20 @@ func LoadManifest(name string) (*Manifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("shadow: parse manifest %s: %w", path, err)
 	}
+	if m.Name != name {
+		return nil, fmt.Errorf("shadow: manifest name does not match %q", name)
+	}
+	if err := ValidateManifest(&m); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
 // CacheDir returns where the on-disk block cache for a shadow lives.
 func CacheDir(name string) (string, error) {
+	if err := ValidateName(name); err != nil {
+		return "", err
+	}
 	cacheRoot, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
@@ -114,11 +127,14 @@ func Load() ([]Def, error) {
 		}
 		return nil, fmt.Errorf("shadow: read %s: %w", path, err)
 	}
-	return defs.Shadow, nil
+	return defs.Shadow, Validate(defs.Shadow)
 }
 
 // Save writes the shadow definitions file.
 func Save(defs []Def) error {
+	if err := Validate(defs); err != nil {
+		return err
+	}
 	path, err := FilePath()
 	if err != nil {
 		return err
@@ -129,7 +145,32 @@ func Save(defs []Def) error {
 	if err := toml.NewEncoder(&b).Encode(map[string]any{"shadow": defs}); err != nil {
 		return fmt.Errorf("shadow: encode: %w", err)
 	}
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	return atomicfile.Write(path, []byte(b.String()), 0o600)
+}
+
+// SaveManifest never replaces a usable library with a partial discovery result.
+// Tokens embedded in stream URLs stay owner-readable only.
+func SaveManifest(m *Manifest) error {
+	if err := ValidateManifest(m); err != nil {
+		return err
+	}
+	for _, s := range m.Sources {
+		if !s.OK {
+			return fmt.Errorf("shadow: source %s:%s unavailable; previous manifest retained", s.Server, s.Section)
+		}
+	}
+	if m.Stats.Failed > 0 || len(m.Items) == 0 {
+		return fmt.Errorf("shadow: incomplete/empty build; previous manifest retained (%d failed items)", m.Stats.Failed)
+	}
+	p, err := ManifestPath(m.Name)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicfile.Write(p, data, 0o600)
 }
 
 // Get returns the named definition, or nil.
@@ -450,6 +491,7 @@ func Build(ctx context.Context, client *plex.Client, def *Def) (*Manifest, error
 			case it.Type == "show" && def.Type == "show":
 				eps, err := client.SeriesEpisodes(*srv, it.RatingKey)
 				if err != nil {
+					m.Stats.Failed++
 					continue
 				}
 				for _, e := range eps {

@@ -146,7 +146,7 @@ func TestBlockCachePartialCountsTowardEviction(t *testing.T) {
 		dir:       dir,
 		blockSize: 1024,
 		maxBytes:  1, // below the partial written below
-		inflight:  make(map[string]chan struct{}),
+		inflight:  make(map[string]*blockFlight),
 		resources: make(map[string]rangefetch.Resource),
 		probing:   make(map[string]chan struct{}),
 	}

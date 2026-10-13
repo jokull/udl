@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jokull/udl/internal/atomicfile"
 	"github.com/jokull/udl/internal/rangefetch"
 )
 
@@ -35,7 +37,7 @@ type BlockCache struct {
 	fetcher   *rangefetch.Fetcher
 
 	mu       sync.Mutex
-	inflight map[string]chan struct{} // block key -> completion signal
+	inflight map[string]*blockFlight
 	writes   int
 
 	// resources caches the probed identity (size, validators) of each remote
@@ -46,6 +48,27 @@ type BlockCache struct {
 
 	hits, misses, bytesServed atomic.Int64
 	freeWarned                atomic.Bool
+	done, stopped             chan struct{}
+	closeOnce                 sync.Once
+	fetchSlots                chan struct{}
+	identityDir               string
+}
+
+// PinResources persists source validators for one immutable manifest snapshot.
+// Call before serving requests. Unlike cache blocks, these records must not be
+// evicted: an open NFS file must keep the same source identity across restarts.
+func (c *BlockCache) PinResources(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	c.identityDir = dir
+	return nil
+}
+
+type blockFlight struct {
+	done chan struct{}
+	data []byte
+	err  error
 }
 
 // statfsFn reports free bytes on the volume containing path. Swapped in
@@ -70,13 +93,16 @@ func NewBlockCache(dir string, maxBytes int64) *BlockCache {
 		maxBytes = 50 << 30
 	}
 	c := &BlockCache{
-		dir:       dir,
-		blockSize: defaultBlockSize,
-		maxBytes:  maxBytes,
-		fetcher:   rangefetch.New(&http.Client{Timeout: 120 * time.Second}),
-		inflight:  make(map[string]chan struct{}),
-		resources: make(map[string]rangefetch.Resource),
-		probing:   make(map[string]chan struct{}),
+		dir:        dir,
+		blockSize:  defaultBlockSize,
+		maxBytes:   maxBytes,
+		fetcher:    rangefetch.New(&http.Client{Timeout: 120 * time.Second}),
+		inflight:   make(map[string]*blockFlight),
+		resources:  make(map[string]rangefetch.Resource),
+		probing:    make(map[string]chan struct{}),
+		done:       make(chan struct{}),
+		stopped:    make(chan struct{}),
+		fetchSlots: make(chan struct{}, 8),
 	}
 	// Friend servers truncate responses in bursts — every response cut short
 	// for a while, then healthy again. Fill resumes inside the block, so extra
@@ -92,27 +118,69 @@ func NewBlockCache(dir string, maxBytes int64) *BlockCache {
 	// over its cap forever and could fill the disk. The first evict may be
 	// slow on a big cache, so run it off the hot path.
 	go func() {
+		defer close(c.stopped)
 		c.evict()
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
-		for range t.C {
-			c.evict()
+		for {
+			select {
+			case <-t.C:
+				c.evict()
+			case <-c.done:
+				return
+			}
 		}
 	}()
 	return c
 }
 
+// Close stops cache maintenance. The owner cancels active reads separately.
+func (c *BlockCache) Close() error {
+	c.closeOnce.Do(func() { close(c.done) })
+	<-c.stopped
+	return nil
+}
+
+// ReadAtSize pins the stream to the file size advertised by its manifest.
+func (c *BlockCache) ReadAtSize(ctx context.Context, url string, off, size, expected int64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	res, err := c.resource(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	if res.Size != expected {
+		return nil, fmt.Errorf("shadowfs: manifest size %d, source size %d: %w", expected, res.Size, rangefetch.ErrResourceChanged)
+	}
+	return c.ReadAt(ctx, url, off, size)
+}
+
 // ReadAt returns up to size bytes starting at off, serving from cache and
 // fetching missing blocks from url via HTTP Range requests.
 func (c *BlockCache) ReadAt(ctx context.Context, url string, off, size int64) ([]byte, error) {
-	if size <= 0 {
+	if off < 0 || size < 0 || size > 64<<20 || off > math.MaxInt64-size {
+		return nil, os.ErrInvalid
+	}
+	if size == 0 {
 		return []byte{}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	res, err := c.resource(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	if off >= res.Size {
+		return []byte{}, nil
+	}
+	if size > res.Size-off {
+		size = res.Size - off
 	}
 	first := off / c.blockSize
 	last := (off + size - 1) / c.blockSize
 	out := make([]byte, 0, size)
 	for b := first; b <= last; b++ {
-		block, err := c.block(ctx, url, b)
+		block, err := c.block(ctx, res, b)
 		if err != nil {
 			return nil, err
 		}
@@ -134,19 +202,16 @@ func (c *BlockCache) ReadAt(ctx context.Context, url string, off, size int64) ([
 	return out, nil
 }
 
-func (c *BlockCache) blockKey(url string, idx int64) string {
-	return url + "#" + fmt.Sprintf("%d", idx)
-}
-
 // urlHash is the directory key for a remote URL: one subtree per distinct URL.
 func urlHash(url string) string {
 	sum := sha256.Sum256([]byte(url))
 	return hex.EncodeToString(sum[:])
 }
 
-func (c *BlockCache) blockPath(url string, idx int64) string {
-	h := urlHash(url)
-	return filepath.Join(c.dir, h[:2], h, fmt.Sprintf("%08d.blk", idx))
+func (c *BlockCache) blockPath(res rangefetch.Resource, idx int64) string {
+	h := urlHash(res.URL)
+	identity := urlHash(fmt.Sprintf("%s\x00%d\x00%d\x00%s\x00%s", c.identityDir, c.blockSize, res.Size, res.ETag, res.LastModified))
+	return filepath.Join(c.dir, "v2", h[:2], h, identity, fmt.Sprintf("%08d.blk", idx))
 }
 
 // partialPath returns the data and sidecar paths for a block's persisted
@@ -154,7 +219,8 @@ func (c *BlockCache) blockPath(url string, idx int64) string {
 // blocks, so eviction and the low-disk guard account for them too.
 func (c *BlockCache) partialPath(url string, idx int64) (data, meta string) {
 	h := urlHash(url)
-	dir := filepath.Join(c.dir, "partial", h[:2], h)
+	generation := urlHash(fmt.Sprintf("%s\x00%d", c.identityDir, c.blockSize))
+	dir := filepath.Join(c.dir, "partial", h[:2], h, generation)
 	data = filepath.Join(dir, fmt.Sprintf("%08d.part", idx))
 	return data, data + ".json"
 }
@@ -162,6 +228,7 @@ func (c *BlockCache) partialPath(url string, idx int64) (data, meta string) {
 // partialMeta is the sidecar describing persisted progress for one interrupted
 // block: how many bytes are valid and the resource identity they belong to.
 type partialMeta struct {
+	BlockSize    int64  `json:"block_size"`
 	URL          string `json:"url"`
 	Size         int64  `json:"size"`
 	ETag         string `json:"etag,omitempty"`
@@ -172,30 +239,43 @@ type partialMeta struct {
 
 // block returns one cache block, fetching it if missing. Concurrent callers
 // for the same block wait for the first fetch instead of duplicating it.
-func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, error) {
-	p := c.blockPath(url, idx)
-	if data, err := os.ReadFile(p); err == nil {
+func (c *BlockCache) block(ctx context.Context, res rangefetch.Resource, idx int64) ([]byte, error) {
+	p := c.blockPath(res, idx)
+	expected := min(c.blockSize, res.Size-idx*c.blockSize)
+	if data, err := os.ReadFile(p); err == nil && int64(len(data)) == expected {
 		c.hits.Add(1)
 		return data, nil
 	}
-	key := c.blockKey(url, idx)
+	key := p
 	c.mu.Lock()
-	ch := c.inflight[key]
-	if ch == nil {
-		ch = make(chan struct{})
-		c.inflight[key] = ch
+	flight := c.inflight[key]
+	if flight == nil {
+		flight = &blockFlight{done: make(chan struct{})}
+		c.inflight[key] = flight
 		c.mu.Unlock()
 
-		data, err := c.fetch(ctx, url, idx*c.blockSize, c.blockSize)
+		// Recheck after winning the flight: another reader may have filled it
+		// between our disk read and acquiring the lock.
+		data, err := os.ReadFile(p)
+		if err != nil || int64(len(data)) != expected {
+			select {
+			case c.fetchSlots <- struct{}{}:
+				data, err = c.fetch(ctx, res.URL, idx*c.blockSize, c.blockSize)
+				<-c.fetchSlots
+			case <-ctx.Done():
+				data, err = nil, ctx.Err()
+			}
+		}
 		if err == nil {
 			_ = c.store(p, data)
 		}
 		c.mu.Lock()
+		flight.data, flight.err = data, err
 		delete(c.inflight, key)
 		c.writes++
 		doEvict := c.writes%64 == 0
 		c.mu.Unlock()
-		close(ch) // broadcast to waiters
+		close(flight.done) // publishes bytes even when disk writes are refused
 		if doEvict {
 			c.evict()
 		}
@@ -204,10 +284,9 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 	}
 	c.mu.Unlock()
 	select {
-	case <-ch:
-		// Fetch finished; the block is either on disk or the fetch failed.
+	case <-flight.done:
 		c.hits.Add(1)
-		return os.ReadFile(p)
+		return flight.data, flight.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -232,7 +311,7 @@ func (c *BlockCache) fetch(ctx context.Context, url string, off, size int64) ([]
 	idx := off / c.blockSize
 	res, err := c.resource(ctx, url)
 	if err != nil {
-		return nil, fmt.Errorf("shadowfs: probe %s: %w", url, err)
+		return nil, fmt.Errorf("shadowfs: probe: %w", err)
 	}
 	buf := make([]byte, size)
 	var start int64
@@ -289,7 +368,7 @@ func (c *BlockCache) loadPartial(url string, idx int64, res rangefetch.Resource)
 		LastModified: meta.LastModified,
 		ContentType:  meta.ContentType,
 	}
-	if meta.Bytes <= 0 || meta.Bytes > c.blockSize || !res.SameIdentity(prior) {
+	if meta.BlockSize != c.blockSize || meta.Bytes <= 0 || meta.Bytes > c.blockSize || !res.SameIdentity(prior) {
 		c.removePartial(url, idx)
 		return nil
 	}
@@ -316,6 +395,7 @@ func (c *BlockCache) savePartial(url string, idx int64, res rangefetch.Resource,
 		return
 	}
 	body, err := json.Marshal(partialMeta{
+		BlockSize:    c.blockSize,
 		URL:          res.URL,
 		Size:         res.Size,
 		ETag:         res.ETag,
@@ -362,7 +442,7 @@ func (c *BlockCache) resource(ctx context.Context, url string) (rangefetch.Resou
 		c.probing[url] = ch
 		c.mu.Unlock()
 
-		res, err := c.fetcher.Probe(ctx, url)
+		res, err := c.probePinned(ctx, url)
 
 		c.mu.Lock()
 		delete(c.probing, url)
@@ -373,6 +453,40 @@ func (c *BlockCache) resource(ctx context.Context, url string) (rangefetch.Resou
 		close(ch)
 		return res, err
 	}
+}
+
+func (c *BlockCache) probePinned(ctx context.Context, url string) (rangefetch.Resource, error) {
+	var res rangefetch.Resource
+	var pinPath string
+	if c.identityDir != "" {
+		pinPath = filepath.Join(c.identityDir, urlHash(url)+".json")
+		data, err := os.ReadFile(pinPath)
+		if err == nil {
+			if json.Unmarshal(data, &res) != nil || res.URL != url || res.Size <= 0 {
+				return res, fmt.Errorf("shadowfs: invalid source identity record; rebuild manifest")
+			}
+			return res, nil
+		}
+		if !os.IsNotExist(err) {
+			return res, err
+		}
+	}
+	var err error
+	select {
+	case c.fetchSlots <- struct{}{}:
+		res, err = c.fetcher.Probe(ctx, url)
+		<-c.fetchSlots
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	if err == nil && pinPath != "" {
+		data, marshalErr := json.Marshal(res)
+		if marshalErr != nil {
+			return res, marshalErr
+		}
+		err = atomicfile.Write(pinPath, data, 0o600)
+	}
+	return res, err
 }
 
 // store writes a block atomically (temp + rename); cache write failures are
@@ -401,6 +515,7 @@ func (c *BlockCache) write(p string, data []byte) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	defer os.Remove(tmp.Name())
 	_, werr := tmp.Write(data)
 	cerr := tmp.Close()
 	if werr != nil || cerr != nil {

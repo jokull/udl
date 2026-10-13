@@ -105,7 +105,13 @@ func (e *HTTPError) Error() string {
 // TransportError is a failure to complete the request at the network layer.
 type TransportError struct{ Err error }
 
-func (e *TransportError) Error() string { return "rangefetch: transport: " + e.Err.Error() }
+func (e *TransportError) Error() string {
+	var ue *url.Error
+	if errors.As(e.Err, &ue) {
+		return fmt.Sprintf("rangefetch: transport: %s %s: %v", ue.Op, sanitizeURL(ue.URL), ue.Err)
+	}
+	return "rangefetch: transport: " + e.Err.Error()
+}
 func (e *TransportError) Unwrap() error { return e.Err }
 
 // Retryable reports whether err is worth another attempt. Callers use it to
@@ -162,10 +168,22 @@ func (p RetryPolicy) normalized() RetryPolicy {
 	if p.Max <= 0 {
 		p.Max = 15 * time.Second
 	}
-	if p.Sleep == nil {
-		p.Sleep = time.Sleep
-	}
 	return p
+}
+
+func (p RetryPolicy) wait(ctx context.Context, attempt int) error {
+	if p.Sleep != nil {
+		p.Sleep(p.backoff(attempt))
+		return ctx.Err()
+	}
+	t := time.NewTimer(p.backoff(attempt))
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (p RetryPolicy) backoff(attempt int) time.Duration {
@@ -211,11 +229,13 @@ func (f *Fetcher) Fill(ctx context.Context, res Resource, off int64, buf []byte)
 	total := 0
 	var last error
 	for attempt := range p.Attempts {
+		if err := ctx.Err(); err != nil {
+			return total, next, err
+		}
 		if attempt > 0 {
-			if err := ctx.Err(); err != nil {
-				return total, next, last
+			if err := p.wait(ctx, attempt); err != nil {
+				return total, next, err
 			}
-			p.Sleep(p.backoff(attempt))
 		}
 		n, updated, err := f.attemptFill(ctx, next, off+int64(total), buf[total:])
 		if n > 0 {
@@ -275,6 +295,12 @@ func (f *Fetcher) attemptFill(ctx context.Context, res Resource, off int64, buf 
 		return 0, res, fmt.Errorf("rangefetch: build request: %w", err)
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+int64(len(buf))-1))
+	req.Header.Set("Accept-Encoding", "identity")
+	if res.ETag != "" && !strings.HasPrefix(res.ETag, "W/") {
+		req.Header.Set("If-Range", res.ETag)
+	} else if res.LastModified != "" {
+		req.Header.Set("If-Range", res.LastModified)
+	}
 
 	resp, err := f.Client.Do(req)
 	if err != nil {
@@ -291,10 +317,7 @@ func (f *Fetcher) attemptFill(ctx context.Context, res Resource, off int64, buf 
 		_ = resp.Body.Close()
 		return 0, res, ErrRangeIgnored
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-	}()
+	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
@@ -311,6 +334,9 @@ func (f *Fetcher) attemptFill(ctx context.Context, res Resource, off int64, buf 
 // reported as ErrShortRead *with* the bytes received, so the caller can resume
 // inside the range instead of refetching its prefix.
 func acceptPartialInto(resp *http.Response, res Resource, off int64, buf []byte) (int, Resource, error) {
+	if enc := resp.Header.Get("Content-Encoding"); enc != "" && enc != "identity" {
+		return 0, res, fmt.Errorf("%w: encoded range body", ErrRangeMismatch)
+	}
 	start, end, total, err := parseContentRange(resp.Header.Get("Content-Range"))
 	if err != nil {
 		return 0, res, fmt.Errorf("%w: %q", ErrMalformedContentRange, resp.Header.Get("Content-Range"))
@@ -327,6 +353,9 @@ func acceptPartialInto(resp *http.Response, res Resource, off int64, buf []byte)
 	if res.Size > 0 && start >= res.Size {
 		return 0, res, fmt.Errorf("%w: offset %d >= size %d", ErrRangeBeyondEOF, start, res.Size)
 	}
+	// A 206 answering If-Range may omit representation headers already known
+	// by the client. Compare validators when supplied; absence alone is not a
+	// version change (and must not discard resumable partial progress).
 	if res.ETag != "" {
 		if got := resp.Header.Get("ETag"); got != "" && got != res.ETag {
 			return 0, res, fmt.Errorf("%w: ETag %s, expected %s", ErrResourceChanged, got, res.ETag)
@@ -372,12 +401,34 @@ func acceptPartialInto(resp *http.Response, res Resource, off int64, buf []byte)
 // one-byte ranged GET (Plex part endpoints answer HEAD inconsistently, so a
 // range GET is the reliable probe).
 func (f *Fetcher) Probe(ctx context.Context, rawURL string) (Resource, error) {
+	p := f.Retry.normalized()
+	var res Resource
+	var err error
+	for attempt := range p.Attempts {
+		if err = ctx.Err(); err != nil {
+			return res, err
+		}
+		if attempt > 0 {
+			if err = p.wait(ctx, attempt); err != nil {
+				return res, err
+			}
+		}
+		res, err = f.probeOnce(ctx, rawURL)
+		if err == nil || !Retryable(err) {
+			return res, err
+		}
+	}
+	return res, err
+}
+
+func (f *Fetcher) probeOnce(ctx context.Context, rawURL string) (Resource, error) {
 	res := Resource{URL: rawURL}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return res, fmt.Errorf("rangefetch: build probe request: %w", err)
 	}
 	req.Header.Set("Range", "bytes=0-0")
+	req.Header.Set("Accept-Encoding", "identity")
 
 	resp, err := f.Client.Do(req)
 	if err != nil {
@@ -398,16 +449,19 @@ func (f *Fetcher) Probe(ctx context.Context, rawURL string) (Resource, error) {
 		}
 		return res, nil
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
-		_ = resp.Body.Close()
-	}()
+	defer resp.Body.Close()
 
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		_, _, total, perr := parseContentRange(resp.Header.Get("Content-Range"))
+		start, end, total, perr := parseContentRange(resp.Header.Get("Content-Range"))
 		if perr != nil {
 			return res, fmt.Errorf("%w: %q", ErrMalformedContentRange, resp.Header.Get("Content-Range"))
+		}
+		if start != 0 || end != 0 {
+			return res, ErrRangeMismatch
+		}
+		if _, _, err := acceptPartialInto(resp, Resource{URL: rawURL}, 0, make([]byte, 1)); err != nil {
+			return res, err
 		}
 		res.Size = total
 		if res.Size <= 0 {
@@ -445,6 +499,12 @@ func parseContentRange(v string) (start, end, total int64, err error) {
 		if total, err = strconv.ParseInt(t, 10, 64); err != nil {
 			return 0, 0, 0, err
 		}
+		if total <= 0 || end >= total {
+			return 0, 0, 0, fmt.Errorf("range outside total: %q", v)
+		}
+	}
+	if start < 0 || end < start || end-start == int64(^uint64(0)>>1) {
+		return 0, 0, 0, fmt.Errorf("invalid range: %q", v)
 	}
 	return start, end, total, nil
 }
@@ -457,5 +517,6 @@ func sanitizeURL(rawURL string) string {
 	}
 	u.RawQuery = ""
 	u.Fragment = ""
+	u.User = nil
 	return u.String()
 }
