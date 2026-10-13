@@ -18,6 +18,13 @@ archives:
   - formats:
       - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE*
+      - README*
+      - CHANGELOG*
+      - scripts/deploy.sh
+      - scripts/plex-watchdog.sh
+      - docs/nfs-sharp-edges.md
 
 # brews is deprecated but there's no replacement for CLI formula distribution.
 # homebrew_casks requires `brew install --cask` which is wrong for a CLI binary.

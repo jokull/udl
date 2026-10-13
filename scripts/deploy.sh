@@ -11,7 +11,8 @@
 #
 # So: build and sign a staging copy, then move it into place. rename(2) within
 # a filesystem is atomic, so the live path holds a valid, signed binary at every
-# instant and a restart during the deploy is harmless.
+# instant. Running shadows still need a separate, idle remount to load it;
+# activation reports those as pending instead of declaring deployment complete.
 #
 #   scripts/deploy.sh build      # build ~/bin/udl.new, print the sign command
 #   scripts/deploy.sh activate   # swap it in and restart the daemon
@@ -76,10 +77,12 @@ cmd_activate() {
 }
 
 cmd_status() {
+    local result=0
     if pgrep -f 'udl daemon' >/dev/null; then
         echo "daemon: running"
     else
         echo "daemon: NOT running"
+        result=1
     fi
 
     # Check the shadow mounts themselves, discovered from the mount table rather
@@ -92,15 +95,52 @@ cmd_status() {
             echo "shadow:  $m responsive$(in_use_note "$m")"
         else
             echo "shadow:  $m NOT RESPONDING"
+            result=1
         fi
     done < <(nfs_mounts)
     [[ $any -eq 1 ]] || echo "shadow:  no shadow mounts found"
 
     if is_adhoc "$BIN"; then
         echo "binary:  $BIN (AD-HOC — TCC grants will not persist)"
+        result=1
     else
         echo "binary:  $BIN (signed)"
     fi
+
+    shadow_versions || result=1
+    return "$result"
+}
+
+# Replacing an executable does not update processes already running it. This
+# used to leave shadows on old code for days while status said "responsive".
+# A start time before the installed binary's mtime is a conservative signal
+# that a restart is pending. Never restart here: random NFS handles cannot
+# survive it, and live clients must first release the mount.
+shadow_versions() {
+    local installed listing pid status label started epoch result=0
+    installed=$(stat -f '%m' "$BIN") || return 1
+    listing=$(launchctl list) || return 1
+    while read -r pid status label; do
+        [[ "$label" == com.jokull.udl-shadow-* ]] || continue
+        if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+            echo "agent:   $label NOT running"
+            result=1
+            continue
+        fi
+        started=$(LC_ALL=C ps -p "$pid" -o lstart=) || started=""
+        epoch=$(LC_ALL=C date -j -f '%a %b %e %T %Y' "$started" '+%s' 2>/dev/null) || epoch=""
+        if [[ ! "$epoch" =~ ^[0-9]+$ ]]; then
+            echo "agent:   $label start time unavailable; deployment not verified"
+            result=1
+        elif (( epoch < installed )); then
+            echo "agent:   $label RESTART PENDING (process predates installed binary)"
+            echo "         When idle: unmount normally, kickstart this agent, then verify a media read."
+            result=1
+        else
+            echo "agent:   $label started after installed binary"
+        fi
+    done <<< "$listing"
+    return "$result"
 }
 
 # nfs_mounts lists the shadow mounts, which are loopback NFS exports.
@@ -115,10 +155,15 @@ nfs_mounts() {
 # reading from the mount fails. Scoping lsof to the mount keeps this to a few
 # hundred milliseconds; an unscoped lsof takes tens of seconds.
 in_use_note() {
-    local n
-    n=$(bounded 8 lsof -n "$1" 2>/dev/null | tail -n +2 | wc -l | tr -d ' ')
-    n=${n:-0}
-    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    local n output result=0
+    output=$(bounded 8 lsof -n "$1" 2>&1) || result=$?
+    # lsof returns 1 with no output for no matches. Timeouts, diagnostics,
+    # and other failures do not establish that a mount is safe to restart.
+    if (( result != 0 )) && ! { (( result == 1 )) && [[ -z "$output" ]]; }; then
+        echo "  (open-file check failed; do not restart)"
+        return
+    fi
+    n=$(printf '%s\n' "$output" | tail -n +2 | wc -l | tr -d ' ')
     if [[ "$n" -gt 0 ]]; then
         echo "  ⚠ $n open file(s) — restarting this shadow would disrupt them"
     else
@@ -150,9 +195,11 @@ probe_path() {
     bounded 5 ls "$1" >/dev/null 2>&1
 }
 
-case "${1:-}" in
-    build) cmd_build ;;
-    activate) cmd_activate ;;
-    status) cmd_status ;;
-    *) usage ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        build) cmd_build ;;
+        activate) cmd_activate ;;
+        status) cmd_status ;;
+        *) usage ;;
+    esac
+fi

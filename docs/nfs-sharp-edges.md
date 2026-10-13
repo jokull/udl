@@ -96,6 +96,32 @@ with a stable developer certificate would make the identity permanent.
 
 ## Server lifecycle
 
+- **Installing a new binary does not update running shadows.** On October 12,
+  2026, Plex crashed just after a Transformers One MP4 tail read failed. The
+  movie shadow still ran its October 10 boot-time executable, predating the
+  validated final-block fix in v0.2.3. A fresh NFS server using current code
+  returned both head and tail byte-for-byte; the live mount failed ffprobe.
+  A normal idle unmount followed by `launchctl kickstart -k` loaded the fix,
+  remounted the export, and made that same ffprobe succeed. The Plex crash is
+  confirmed by its crash uploader; the exact crash instruction is not diagnosed.
+  `scripts/deploy.sh status` (also run by `activate`) now exits nonzero for
+  shadow processes older than the installed binary. A responsive directory
+  alone does not establish that a deployed read fix is running.
+  Reproduce a particular file without risking another Plex crash with:
+
+  ```sh
+  UDL_SHADOW_TEST_LIBRARY=movies \
+  UDL_SHADOW_TEST_FILE='exact virtual_path from manifest.mp4' \
+    go test -tags integration ./internal/shadowfs \
+      -run '^TestLiveSelectedShadowFile$' -v -timeout 3m
+  ```
+
+- **Plex's login item is not a crash supervisor.** `scripts/plex-watchdog.sh`
+  can run every 60 seconds from a user LaunchAgent (with `RunAtLoad`), installed
+  at a stable path outside the checkout. It uses LaunchServices to relaunch an
+  absent main process. It leaves existing processes alone, so it does not fix
+  hangs or interrupt playback. Log output records each recovery attempt.
+
 - **The server must accept connections BEFORE mount_nfs runs.** mount_nfs blocks
   on its MNT RPC until the server answers; mounting after the server starts is
   a self-deadlock that looks like a hang.
