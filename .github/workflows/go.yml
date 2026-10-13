@@ -18,3 +18,5 @@ jobs:
         run: go test ./... -count=1
       - name: Test (Race)
         run: go test -race ./... -count=1
+      - name: NFS restart lifecycle (no external services)
+        run: go test -race -tags integration ./internal/shadowfs -run '^TestNFSOpenFileSurvivesServerRestart$' -count=1 -timeout 30s

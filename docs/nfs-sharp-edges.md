@@ -94,7 +94,79 @@ with a stable developer certificate would make the identity permanent.
 - Full working option string:
   `mount -o port=N,mountport=N,vers=3,nolocks,resvport -t nfs 127.0.0.1:/ <path>`
 
-## Server lifecycle
+## Hardened lifecycle (unreleased rollup)
+
+The daemon now persists opaque NFS handles under
+`~/.config/udl/shadow-handles/<name>`, separate from the evictable byte cache.
+An unchanged export on the same port can restart and resolve clients' original
+handles. Handles include the path and file identity; a changed URL/size or a
+replaced local file is rejected as stale, not silently substituted. Root and
+directory handles survive changes to library membership. Do not delete handle
+state while clients use the export. The older random-handle implementation
+still requires **one idle unmount/remount when first upgrading**.
+
+Configuration and manifest writes use temp files, fsync, and atomic rename.
+Names, ports, mount overlap, source URLs, file sizes, normalized path collisions,
+and traversal are validated before use. Incomplete discovery leaves the prior
+manifest intact and reports failure; retry the build after the source recovers.
+Manifests contain credentials and are written with owner-only permissions.
+
+Enable validates first, preserves the saved port, and is idempotent for the same
+definition/manifest generation. Reconfiguration and disable require a normal
+unmount before stopping the service; a busy mount leaves the service running.
+Failed reconfiguration attempts to restore the previous agent and mount and
+reports recovery failures. Plist strings are XML-escaped. Missing storage volumes
+are rejected instead of creating directories where the volume should be. Path
+resolution checks every component against the mount table before readlink, so
+it never descends into an orphan NFS mount. Initial mounting migrates local
+files by a same-filesystem rename and refuses to hide a nonempty local tree.
+Persisted export bindings reject reconnecting an existing mount with a different
+port or upper directory, and reject abandoning a mounted export after editing
+its mountpoint. Disable using the old configuration before changing its binding.
+
+LaunchAgents keep running until explicitly disabled. Mount failures return an
+error so launchd retries; the heartbeat also detects a disappeared mount/volume.
+Use `shadow disable` to keep an export unmounted. A daemon restart leaves its
+kernel mount in place for reconnection. Foreground shutdown refuses to quit if
+a normal unmount fails. Optional Plex tuning remains outside mount readiness.
+
+Each streaming read has a 90-second total budget, and remote probes/fetches share
+eight concurrency slots. Source validators are pinned per manifest generation
+under `~/.config/udl/shadow-identities`, so a restart can reuse verified cached
+bytes without switching source versions. New manifest generations issue new
+remote-file handles. Retries stop promptly on cancellation and retain
+validated partial progress. Concurrent readers receive the fetched bytes even
+when disk writes are refused or eviction races the reader. Cache v2 namespaces
+include resource size, validators, and block size; cached block lengths are
+checked before use. A stale manifest size or unexpectedly short source read is
+an I/O error, never a successful EOF that can truncate playback. Maintenance
+goroutines stop when the cache closes. Transport diagnostics redact credentials.
+
+Boundaries: remote outages still prevent uncached reads after the retry budget;
+origins without validators cannot reveal same-size content replacement. A
+resource change during a running export fails closed and needs a refreshed
+manifest/restart. The new cache namespace starts cold. Stable handles do not
+remove the need to unmount before changing an export's port or mountpoint.
+
+Regression checks:
+
+```sh
+go test -race ./...
+go test -race -tags integration ./internal/shadowfs \
+  -run '^TestNFSOpenFileSurvivesServerRestart$' -count=1 -timeout 30s
+# Optional macOS kernel test; requires the normal sudo mount/umount rule:
+UDL_MOUNT_TEST=1 go test -tags integration ./cmd/udl \
+  -run '^TestMacOSShadowOpenFileRestart$' -count=1 -v -timeout 60s
+```
+
+The second check uses real NFS RPCs against two successive server instances,
+keeping the original open file handle while replacing only its connection. It
+needs no Plex account, sudo, or live mount and also runs in CI. The optional
+macOS test uses an isolated temporary mount, kills its daemon with SIGKILL,
+and verifies that the original file descriptor fetches previously uncached
+bytes after restart. It never uses the live Plex mounts.
+
+## Historical server lifecycle notes
 
 - **Installing a new binary does not update running shadows.** On October 12,
   2026, Plex crashed just after a Transformers One MP4 tail read failed. The
@@ -140,7 +212,7 @@ with a stable developer certificate would make the identity permanent.
   if the server isn't up yet (the very process doing the stat), the stat blocks.
   Serve-only daemons must never touch the mountpoint path.
 
-## go-nfs file handles
+## Legacy go-nfs file handles (before persistent handles)
 
 - The `CachingHandler` LRU must comfortably exceed the total number of paths in
   the export (items + dirs). With 889 items + ~150 dirs the default 1024 is too

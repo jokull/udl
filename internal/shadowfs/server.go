@@ -1,6 +1,7 @@
 package shadowfs
 
 import (
+	"context"
 	"net"
 
 	"github.com/go-git/go-billy/v5"
@@ -8,7 +9,23 @@ import (
 	nfshelper "github.com/willscott/go-nfs/helpers"
 )
 
-// Serve exports fs over NFSv3 on ln until the listener is closed. The mount
+// ServePersistent is the daemon's restart-safe export. Its state directory
+// must be stable across launches and must not be the block cache directory.
+func ServePersistent(ctx context.Context, ln net.Listener, fs *UnionFS, stateDir string) error {
+	handler, err := NewPersistentHandler(fs, stateDir)
+	if err != nil {
+		return err
+	}
+	return ServeHandler(ctx, ln, fs, handler)
+}
+
+func ServeHandler(ctx context.Context, ln net.Listener, fs *UnionFS, handler nfs.Handler) error {
+	fs.ctx = ctx // set before accepting requests
+	return (&nfs.Server{Handler: handler, Context: ctx}).Serve(ln)
+}
+
+// Serve exports fs with ephemeral handles, for standalone callers and tests.
+// Daemons use ServePersistent/ServeHandler instead. The mount
 // and NFS protocols are both served on the same port, so clients can mount
 // with `-o port=N,mountport=N` and skip portmap entirely.
 func Serve(ln net.Listener, fs billy.Filesystem) error {

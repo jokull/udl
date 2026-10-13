@@ -2,6 +2,7 @@ package shadowfs
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -30,11 +31,20 @@ func normalizeName(s string) string { return norm.NFD.String(s) }
 // shadow's episodes for that season. A file name present in both layers
 // resolves to the local copy (the user's own layer wins).
 type UnionFS struct {
-	upper string              // real local directory holding the user's files
-	items map[string]*Item    // virtual path ("a/b/c.ext") -> shadow item
-	dirs  map[string]struct{} // virtual directory paths
-	fetch Fetcher
-	built time.Time
+	upper    string              // real local directory holding the user's files
+	items    map[string]*Item    // virtual path ("a/b/c.ext") -> shadow item
+	dirs     map[string]struct{} // virtual directory paths
+	fetch    Fetcher
+	built    time.Time
+	ctx      context.Context
+	snapshot string
+}
+
+// NewSnapshotUnion keeps an immutable manifest generation in remote file IDs.
+func NewSnapshotUnion(upper string, items []shadow.Item, fetch Fetcher, snapshot string) *UnionFS {
+	u := NewUnion(upper, items, fetch)
+	u.snapshot = snapshot
+	return u
 }
 
 // Item is the minimal shadow manifest entry the filesystem needs.
@@ -53,6 +63,7 @@ func NewUnion(upper string, items []shadow.Item, fetch Fetcher) *UnionFS {
 		dirs:  make(map[string]struct{}),
 		fetch: fetch,
 		built: time.Now(),
+		ctx:   context.Background(),
 	}
 	for i := range items {
 		vp := normalizeName(items[i].VirtualPath)
@@ -131,6 +142,8 @@ func (u *UnionFS) OpenFile(name string, flag int, perm os.FileMode) (billy.File,
 			return nil, err
 		}
 		return &unionFile{name: name, uf: f}, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 	if _, isItem := u.items[p]; isItem {
 		return &unionFile{fs: u, item: u.items[p], name: name}, nil
@@ -147,6 +160,8 @@ func (u *UnionFS) Lstat(name string) (os.FileInfo, error) {
 	}
 	if fi, err := os.Lstat(u.upperPath(p)); err == nil {
 		return fi, nil
+	} else if !os.IsNotExist(err) {
+		return nil, err
 	}
 	if it, isItem := u.items[p]; isItem {
 		return &itemInfo{item: it, mod: u.built}, nil
@@ -177,6 +192,8 @@ func (u *UnionFS) ReadDir(name string) ([]os.FileInfo, error) {
 			}
 			entries[de.Name()] = info
 		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
 	} else if !u.isVirtualDir(p) {
 		return nil, os.ErrNotExist
 	}
@@ -293,18 +310,37 @@ func (f *unionFile) ReadAt(p []byte, off int64) (int, error) {
 	if f.uf != nil {
 		return f.uf.ReadAt(p, off)
 	}
+	if off < 0 {
+		return 0, os.ErrInvalid
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if off >= f.item.Size {
 		return 0, io.EOF
 	}
 	size := int64(len(p))
-	if off+size > f.item.Size {
+	if size > f.item.Size-off {
 		size = f.item.Size - off
 	}
-	data, err := f.fs.fetch.ReadAt(context.Background(), f.item.URL, off, size)
+	ctx, cancel := context.WithTimeout(f.fs.ctx, 90*time.Second)
+	defer cancel()
+	var data []byte
+	var err error
+	if sized, ok := f.fs.fetch.(interface {
+		ReadAtSize(context.Context, string, int64, int64, int64) ([]byte, error)
+	}); ok {
+		data, err = sized.ReadAtSize(ctx, f.item.URL, off, size, f.item.Size)
+	} else {
+		data, err = f.fs.fetch.ReadAt(ctx, f.item.URL, off, size)
+	}
 	if err != nil {
 		return 0, err
 	}
 	n := copy(p, data)
+	if int64(n) < size {
+		return n, fmt.Errorf("shadowfs: source shorter than manifest: %w", io.ErrUnexpectedEOF)
+	}
 	if int64(n) < int64(len(p)) {
 		return n, io.EOF
 	}

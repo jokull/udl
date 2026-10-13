@@ -16,7 +16,6 @@ func TestShadowPlistValid(t *testing.T) {
 		"/Users/jokull",
 		"RunAtLoad",
 		"KeepAlive",
-		"SuccessfulExit",
 	} {
 		if !strings.Contains(p, want) {
 			t.Errorf("plist missing %q", want)
