@@ -239,6 +239,16 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 	key := c.blockKey(url, idx)
 	c.mu.Lock()
 	ch := c.inflight[key]
+	if ch == nil && c.trustedLocked(url) {
+		// A leader that finished between our disk check and taking the lock
+		// stored the block before clearing inflight, so look again rather
+		// than fetching it a second time.
+		if data, err := os.ReadFile(p); err == nil {
+			c.mu.Unlock()
+			c.hits.Add(1)
+			return data, nil
+		}
+	}
 	if ch == nil {
 		ch = make(chan struct{})
 		c.inflight[key] = ch
@@ -503,6 +513,13 @@ func (c *BlockCache) trusted(ctx context.Context, url string) bool {
 	}
 	_, serr := os.Stat(c.identityPath(url))
 	return serr == nil
+}
+
+// trustedLocked is trusted for callers holding c.mu, limited to the case that
+// needs no probe: an identity this process already verified.
+func (c *BlockCache) trustedLocked(url string) bool {
+	_, ok := c.resources[url]
+	return ok
 }
 
 // revalidate drops a stale identity for url and probes it again. Concurrent
