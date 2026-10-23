@@ -188,7 +188,7 @@ Because a restart breaks every stream, a shadow absorbs change in place:
   refuses to drop more than 30% of the manifest (`--force` overrides).
 - **Seeing it.** Each agent logs failed reads (timestamped, per path, token
   redacted) and writes `~/.config/udl/shadow/<name>.health` every 30 s;
-  `udl status` and `udl doctor` read it. `udl doctor` also samples four URLs
+  `udl status` and `udl doctor` read it. `udl doctor` also samples three URLs
   per friend and reports files that no longer match the manifest.
 
 ## automountd (do not use)

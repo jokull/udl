@@ -135,15 +135,31 @@ func (s *Service) shadowChecks() []HealthCheck {
 				Status:  "warning",
 				Message: fmt.Sprintf("last rebuild %s ago failed: %s", roundAgo(now.Sub(r.At)), r.Err),
 			})
-		} else if m, err := shadow.LoadManifest(def.Name); err == nil && now.Sub(m.BuiltAt) > shadowManifestStale {
+		} else if built := servedManifestBuiltAt(def.Name); !built.IsZero() && now.Sub(built) > shadowManifestStale {
+			// The agent's report says which manifest it serves; parsing every
+			// manifest on each status call would cost megabytes per poll.
 			checks = append(checks, HealthCheck{
 				Name:    "shadow-manifest:" + def.Name,
 				Status:  "warning",
-				Message: fmt.Sprintf("manifest built %s ago — new and removed titles are not being picked up", roundAgo(now.Sub(m.BuiltAt))),
+				Message: fmt.Sprintf("serving a manifest built %s ago — new and removed titles are not being picked up", roundAgo(now.Sub(built))),
 			})
 		}
 	}
 	return checks
+}
+
+// servedManifestBuiltAt is the build time of the manifest the agent serves,
+// or zero when it has no report.
+func servedManifestBuiltAt(name string) time.Time {
+	path, err := shadow.ReportPath(name)
+	if err != nil {
+		return time.Time{}
+	}
+	r, err := shadowfs.ReadReport(path)
+	if err != nil {
+		return time.Time{}
+	}
+	return r.ManifestBuiltAt
 }
 
 // shadowCheck judges one agent's report.
@@ -204,8 +220,12 @@ func (s *Service) doctorShadowSources() []DoctorFinding {
 	if err != nil {
 		return nil
 	}
-	const perSource = 4
-	fetcher := rangefetch.New(&http.Client{Timeout: 15 * time.Second})
+	// Bounded so a dead friend cannot stall the doctor RPC, which has no
+	// deadline of its own.
+	const perSource = 3
+	fetcher := rangefetch.New(&http.Client{Timeout: 8 * time.Second})
+	canaryCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
 	var findings []DoctorFinding
 	for i := range defs {
 		def := &defs[i]
@@ -229,10 +249,11 @@ func (s *Service) doctorShadowSources() []DoctorFinding {
 				o := outcome{source: src}
 				for _, j := range rand.Perm(len(items))[:min(perSource, len(items))] {
 					it := items[j]
+					if canaryCtx.Err() != nil {
+						break
+					}
 					o.sampled++
-					ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-					res, err := fetcher.Probe(ctx, it.URL)
-					cancel()
+					res, err := fetcher.Probe(canaryCtx, it.URL)
 					var he *rangefetch.HTTPError
 					switch {
 					case err == nil && res.Size != it.Size:
