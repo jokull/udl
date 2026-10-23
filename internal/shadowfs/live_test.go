@@ -84,7 +84,7 @@ func TestLiveNFS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
-	direct, err := cache.fetch(t.Context(), movieURL, 0, 4096)
+	direct, _, err := cache.fetch(t.Context(), movieURL, 0, 4096)
 	if err != nil {
 		t.Fatalf("direct fetch: %v", err)
 	}

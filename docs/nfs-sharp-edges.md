@@ -163,6 +163,34 @@ with a stable developer certificate would make the identity permanent.
     for exactly this reason; giving an agent a flag to rotate its own log would
     only take effect on a restart, and could not be applied safely.
 
+## Changing things under a running shadow
+
+Because a restart breaks every stream, a shadow absorbs change in place:
+
+- **A friend's file changes validators** (Plex touches Last-Modified during a
+  rescan; same bytes, same size). The cache used to keep the first probed
+  identity for the life of the process, so every later uncached read of that
+  file failed validation and reached Plex as EIO — a spinner with nothing in
+  the log (2026-10-23, Honey Boy from kari). Now a validator mismatch drops
+  the identity, re-probes once, purges that URL's cached blocks and refetches.
+  Blocks on disk are pinned to an identity (`identity.json` beside them), so
+  a restart cannot serve old-version blocks either; blocks with no pin are
+  discarded on first use.
+- **A friend's file is replaced** (different size). That is a different
+  file: reads fail as `manifest-stale` until the manifest is rebuilt.
+- **New or removed titles.** The daemon rebuilds every manifest every 6 h
+  (first run 10 min after start); `udl shadow manifest <name>` does it now,
+  `--dry-run` shows the diff. Each agent polls its manifest file every minute
+  and swaps the item set in place (go-nfs opens by path on every READ, so no
+  handle goes stale), then asks Plex for a partial scan of the mount. A path
+  read in the last 15 minutes keeps its current source until the stream goes
+  quiet. A rebuild carries over items from friends that were unreachable and
+  refuses to drop more than 30% of the manifest (`--force` overrides).
+- **Seeing it.** Each agent logs failed reads (timestamped, per path, token
+  redacted) and writes `~/.config/udl/shadow/<name>.health` every 30 s;
+  `udl status` and `udl doctor` read it. `udl doctor` also samples four URLs
+  per friend and reports files that no longer match the manifest.
+
 ## automountd (do not use)
 
 `auto_master`/`auto_udl` direct maps look like the clean answer (System

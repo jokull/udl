@@ -770,6 +770,8 @@ func init() {
 	shadowCreateCmd.Flags().String("mount", "", "local path the Plex library points at")
 	shadowCreateCmd.Flags().StringSlice("prefer", nil, "resolution preference, highest first (e.g. 4k,1080,720)")
 	shadowManifestCmd.Flags().Bool("json", false, "Print the full manifest as JSON")
+	shadowManifestCmd.Flags().Bool("force", false, "Write the manifest even if it lost more than 30% of its items")
+	shadowManifestCmd.Flags().Bool("dry-run", false, "Build and compare with the current manifest without writing it")
 	shadowMountCmd.Flags().String("port", "", "NFS port (default: auto-assigned)")
 	shadowMountCmd.Flags().Int("cache-size", 50, "block cache size in GiB")
 	shadowMountCmd.Flags().Bool("no-tuning", false, "skip disabling Plex preview thumbnails")
@@ -2429,27 +2431,44 @@ func runShadowManifest(cmd *cobra.Command, args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	m, err := shadow.Build(ctx, plex.New(token), def)
-	if err != nil {
-		return err
+	force, _ := cmd.Flags().GetBool("force")
+	var m *shadow.Manifest
+	var rep shadow.RebuildReport
+	if dry, _ := cmd.Flags().GetBool("dry-run"); dry {
+		m, err = shadow.Build(ctx, plex.New(token), def)
+		if err != nil {
+			return err
+		}
+		prev, _ := shadow.LoadManifest(def.Name)
+		rep = shadow.Merge(prev, m)
+		if shadow.Shrank(rep) {
+			fmt.Printf("would REFUSE: %d → %d items\n", rep.Previous, rep.Items)
+		}
+		for _, p := range rep.Added {
+			fmt.Printf("  + %s\n", p)
+		}
+		for _, p := range rep.Removed {
+			fmt.Printf("  - %s\n", p)
+		}
+		for _, p := range rep.Changed {
+			fmt.Printf("  ~ %s\n", p)
+		}
+	} else {
+		m, rep, err = shadow.Rebuild(ctx, plex.New(token), def, force)
+		if err != nil {
+			return err
+		}
 	}
-
 	path, err := shadow.ManifestPath(def.Name)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		return err
-	}
 
 	if jsonOut, _ := cmd.Flags().GetBool("json"); jsonOut {
+		data, err := json.MarshalIndent(m, "", "  ")
+		if err != nil {
+			return err
+		}
 		fmt.Println(string(data))
 		return nil
 	}
@@ -2467,7 +2486,15 @@ func runShadowManifest(cmd *cobra.Command, args []string) error {
 	w.Flush()
 	fmt.Printf("candidates %d, kept %d, dupes dropped %d, failed %d, total %s\n",
 		m.Stats.Candidates, m.Stats.Kept, m.Stats.Dupes, m.Stats.Failed, formatSize(m.Stats.TotalSize))
-	fmt.Printf("manifest: %s\n", path)
+	fmt.Printf("changes: +%d added, -%d removed, ~%d changed, %d carried over from unreachable sources\n",
+		len(rep.Added), len(rep.Removed), len(rep.Changed), rep.Carried)
+	if dry, _ := cmd.Flags().GetBool("dry-run"); dry {
+		fmt.Printf("manifest: %s (dry run, not written)\n", path)
+	} else if rep.Written {
+		fmt.Printf("manifest: %s (a running shadow reloads it within a minute)\n", path)
+	} else {
+		fmt.Printf("manifest: %s (unchanged)\n", path)
+	}
 	return nil
 }
 
@@ -2557,6 +2584,7 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	cacheGB, _ := cmd.Flags().GetInt("cache-size")
 	cache := shadowfs.NewBlockCache(cacheDir, int64(cacheGB)<<30)
 	fs := shadowfs.NewUnion(upper, m.Items, cache)
+	fs.Health = shadowfs.NewHealth(os.Stdout)
 	fmt.Printf("  block cache: %s (%d GiB)\n", cacheDir, cacheGB)
 
 	// Port resolution: --port flag wins, then the def's fixed port (set by
@@ -2711,14 +2739,8 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 		os.Exit(0)
 	}()
 
-	// Heartbeat so a long-serving mount never looks hung.
-	go func() {
-		for {
-			time.Sleep(15 * time.Second)
-			hits, misses, bytes := cache.Stats()
-			fmt.Printf("  serving: %s streamed, %d cache hits, %d fetches\n", formatSize(bytes), hits, misses)
-		}
-	}()
+	// Heartbeat, health report, and manifest hot-reload.
+	go newShadowAgent(def, fs, cache, m).run(cmd.Context())
 
 	fmt.Println("serving — Ctrl-C to unmount")
 	return <-serveErr

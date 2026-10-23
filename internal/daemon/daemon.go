@@ -44,6 +44,8 @@ type Service struct {
 	llmCLI   string      // path to codex or claude CLI, empty if unavailable
 	log      *slog.Logger
 
+	shadowRebuilds shadowRebuildState
+
 	batchSearchMu      sync.Mutex
 	batchSearchRunning bool
 
@@ -1447,6 +1449,7 @@ func (s *Service) Status(args *Empty, reply *StatusReply) error {
 	if s.dl != nil {
 		reply.Checks = s.dl.HealthChecks()
 	}
+	reply.Checks = append(reply.Checks, s.shadowChecks()...)
 	if n, err := s.db.FailedMediaCount24h(); err == nil {
 		reply.FailedCount = n
 	}

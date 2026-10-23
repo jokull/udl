@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -44,7 +45,18 @@ type BlockCache struct {
 	resources map[string]rangefetch.Resource
 	probing   map[string]chan struct{}
 
+	// expected holds the size the manifest promised for each URL. A source
+	// that now reports a different size is a different file: serving it
+	// under the manifest's size would hand Plex a truncated or spliced
+	// stream, so those reads fail until the manifest is rebuilt.
+	expected map[string]int64
+
+	// failed remembers a recent failed probe per URL so a source that is down
+	// costs one probe per window rather than one per NFS read.
+	failed map[string]probeFailure
+
 	hits, misses, bytesServed atomic.Int64
+	revalidations             atomic.Int64
 	freeWarned                atomic.Bool
 }
 
@@ -60,6 +72,25 @@ const minFreeBytes = 1 << 30 // 1 GiB
 func (c *BlockCache) Stats() (hits, misses, bytes int64) {
 	return c.hits.Load(), c.misses.Load(), c.bytesServed.Load()
 }
+
+// Revalidations counts how often a source changed its validators under a
+// running shadow and the cache re-probed and recovered instead of failing.
+func (c *BlockCache) Revalidations() int64 { return c.revalidations.Load() }
+
+// ExpectSize records the size the manifest promises for url. NewUnion calls it
+// for every item so the cache can refuse a source whose file has been replaced.
+func (c *BlockCache) ExpectSize(url string, size int64) {
+	if size <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.expected[url] = size
+	c.mu.Unlock()
+}
+
+// ErrManifestStale means a source now serves a different file (a different
+// size) than the manifest recorded. Only rebuilding the manifest fixes it.
+var ErrManifestStale = errors.New("shadowfs: source file differs from manifest")
 
 const defaultBlockSize = 2 << 20 // 2 MiB
 
@@ -77,6 +108,8 @@ func NewBlockCache(dir string, maxBytes int64) *BlockCache {
 		inflight:  make(map[string]chan struct{}),
 		resources: make(map[string]rangefetch.Resource),
 		probing:   make(map[string]chan struct{}),
+		expected:  make(map[string]int64),
+		failed:    make(map[string]probeFailure),
 	}
 	// Friend servers truncate responses in bursts — every response cut short
 	// for a while, then healthy again. Fill resumes inside the block, so extra
@@ -145,8 +178,21 @@ func urlHash(url string) string {
 }
 
 func (c *BlockCache) blockPath(url string, idx int64) string {
+	return filepath.Join(c.blockDir(url), fmt.Sprintf("%08d.blk", idx))
+}
+
+// blockDir holds every complete block of one URL, plus its identity pin.
+func (c *BlockCache) blockDir(url string) string {
 	h := urlHash(url)
-	return filepath.Join(c.dir, h[:2], h, fmt.Sprintf("%08d.blk", idx))
+	return filepath.Join(c.dir, h[:2], h)
+}
+
+// identityFile pins a URL's cached blocks to the resource version they were
+// fetched from. It lives beside the blocks and is never evicted on its own.
+const identityFile = "identity.json"
+
+func (c *BlockCache) identityPath(url string) string {
+	return filepath.Join(c.blockDir(url), identityFile)
 }
 
 // partialPath returns the data and sidecar paths for a block's persisted
@@ -170,13 +216,25 @@ type partialMeta struct {
 	Bytes        int64  `json:"bytes"`
 }
 
+func (m partialMeta) resource() rangefetch.Resource {
+	return rangefetch.Resource{
+		URL:          m.URL,
+		Size:         m.Size,
+		ETag:         m.ETag,
+		LastModified: m.LastModified,
+		ContentType:  m.ContentType,
+	}
+}
+
 // block returns one cache block, fetching it if missing. Concurrent callers
 // for the same block wait for the first fetch instead of duplicating it.
 func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, error) {
 	p := c.blockPath(url, idx)
-	if data, err := os.ReadFile(p); err == nil {
-		c.hits.Add(1)
-		return data, nil
+	if c.trusted(ctx, url) {
+		if data, err := os.ReadFile(p); err == nil {
+			c.hits.Add(1)
+			return data, nil
+		}
 	}
 	key := c.blockKey(url, idx)
 	c.mu.Lock()
@@ -186,8 +244,12 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 		c.inflight[key] = ch
 		c.mu.Unlock()
 
-		data, err := c.fetch(ctx, url, idx*c.blockSize, c.blockSize)
-		if err == nil {
+		data, used, err := c.fetch(ctx, url, idx*c.blockSize, c.blockSize)
+		if err == nil && c.current(url, used) {
+			// A block fetched against a version that was revalidated away
+			// mid-flight is still served to this reader (it was verified
+			// against the version it asked for) but never cached under the
+			// new version's pin.
 			_ = c.store(p, data)
 		}
 		c.mu.Lock()
@@ -205,9 +267,17 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 	c.mu.Unlock()
 	select {
 	case <-ch:
-		// Fetch finished; the block is either on disk or the fetch failed.
-		c.hits.Add(1)
-		return os.ReadFile(p)
+		// Fetch finished; the block is either on disk or the fetch failed (or
+		// was not cached). Fetch it ourselves rather than failing on a
+		// missing file: a waiter must never turn someone else's failed or
+		// uncacheable fetch into an I/O error of its own.
+		if data, err := os.ReadFile(p); err == nil {
+			c.hits.Add(1)
+			return data, nil
+		}
+		data, _, err := c.fetch(ctx, url, idx*c.blockSize, c.blockSize)
+		c.misses.Add(1)
+		return data, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -228,12 +298,35 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 // attempt resumes from that offset instead of byte zero. A changed resource or
 // a terminal failure discards the persisted prefix, and a completed fetch
 // removes it.
-func (c *BlockCache) fetch(ctx context.Context, url string, off, size int64) ([]byte, error) {
-	idx := off / c.blockSize
+//
+// A source whose validators change under a running shadow (Plex touching the
+// file during a rescan or metadata refresh) is re-probed once: the stale
+// identity is dropped, its cached blocks purged, and the block fetched against
+// the new version. Without this the probed identity was cached for the life of
+// the process and every later read of that file failed with EIO.
+//
+// The returned Resource is the version the bytes were verified against.
+func (c *BlockCache) fetch(ctx context.Context, url string, off, size int64) ([]byte, rangefetch.Resource, error) {
 	res, err := c.resource(ctx, url)
 	if err != nil {
-		return nil, fmt.Errorf("shadowfs: probe %s: %w", url, err)
+		return nil, res, fmt.Errorf("shadowfs: probe: %w", err)
 	}
+	data, err := c.fetchWith(ctx, url, res, off, size)
+	if !errors.Is(err, rangefetch.ErrResourceChanged) {
+		return data, res, err
+	}
+	fresh, perr := c.revalidate(ctx, url, res)
+	if perr != nil {
+		return nil, res, fmt.Errorf("shadowfs: revalidate after %v: %w", err, perr)
+	}
+	c.revalidations.Add(1)
+	data, err = c.fetchWith(ctx, url, fresh, off, size)
+	return data, fresh, err
+}
+
+// fetchWith fetches one block against a known resource version.
+func (c *BlockCache) fetchWith(ctx context.Context, url string, res rangefetch.Resource, off, size int64) ([]byte, error) {
+	idx := off / c.blockSize
 	buf := make([]byte, size)
 	var start int64
 	if part := c.loadPartial(url, idx, res); part != nil {
@@ -282,14 +375,7 @@ func (c *BlockCache) loadPartial(url string, idx int64, res rangefetch.Resource)
 		c.removePartial(url, idx)
 		return nil
 	}
-	prior := rangefetch.Resource{
-		URL:          meta.URL,
-		Size:         meta.Size,
-		ETag:         meta.ETag,
-		LastModified: meta.LastModified,
-		ContentType:  meta.ContentType,
-	}
-	if meta.Bytes <= 0 || meta.Bytes > c.blockSize || !res.SameIdentity(prior) {
+	if meta.Bytes <= 0 || meta.Bytes > c.blockSize || !res.SameIdentity(meta.resource()) {
 		c.removePartial(url, idx)
 		return nil
 	}
@@ -340,14 +426,18 @@ func (c *BlockCache) removePartial(url string, idx int64) {
 }
 
 // resource returns the probed identity of url, probing at most once (and at
-// most once concurrently) per URL. A failed probe is not cached: the next
-// reader retries it.
+// most once concurrently) per URL. A failed probe is remembered for
+// probeFailureTTL and then retried by the next reader.
 func (c *BlockCache) resource(ctx context.Context, url string) (rangefetch.Resource, error) {
 	for {
 		c.mu.Lock()
 		if res, ok := c.resources[url]; ok {
 			c.mu.Unlock()
 			return res, nil
+		}
+		if f, ok := c.failed[url]; ok && time.Since(f.at) < probeFailureTTL {
+			c.mu.Unlock()
+			return rangefetch.Resource{URL: url}, f.err
 		}
 		if ch, ok := c.probing[url]; ok {
 			c.mu.Unlock()
@@ -363,16 +453,110 @@ func (c *BlockCache) resource(ctx context.Context, url string) (rangefetch.Resou
 		c.mu.Unlock()
 
 		res, err := c.fetcher.Probe(ctx, url)
+		if err == nil {
+			c.mu.Lock()
+			want := c.expected[url]
+			c.mu.Unlock()
+			if want > 0 && res.Size > 0 && res.Size != want {
+				err = fmt.Errorf("%w: manifest size %d, source size %d", ErrManifestStale, want, res.Size)
+			}
+		}
+		if err == nil {
+			c.pinIdentity(url, res)
+		}
 
 		c.mu.Lock()
 		delete(c.probing, url)
 		if err == nil {
 			c.resources[url] = res
+			delete(c.failed, url)
+		} else if ctx.Err() == nil {
+			// A cancelled reader says nothing about the source.
+			c.failed[url] = probeFailure{err: err, at: time.Now()}
 		}
 		c.mu.Unlock()
 		close(ch)
 		return res, err
 	}
+}
+
+// probeFailureTTL is how long a failed probe is answered from memory.
+const probeFailureTTL = 30 * time.Second
+
+type probeFailure struct {
+	err error
+	at  time.Time
+}
+
+// trusted reports whether url's cached blocks may be served. The first read of
+// a URL in this process probes it, which pins (or purges) the blocks on disk.
+// If the source cannot be reached, blocks pinned by an earlier run are still
+// served — the cache keeps playback going through a friend's outage — but a
+// source known to serve a different file never is.
+func (c *BlockCache) trusted(ctx context.Context, url string) bool {
+	_, err := c.resource(ctx, url)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, ErrManifestStale) {
+		return false
+	}
+	_, serr := os.Stat(c.identityPath(url))
+	return serr == nil
+}
+
+// revalidate drops a stale identity for url and probes it again. Concurrent
+// readers that hit the same change share one re-probe: only the caller still
+// holding the stale version clears it, the rest find the fresh one cached.
+func (c *BlockCache) revalidate(ctx context.Context, url string, stale rangefetch.Resource) (rangefetch.Resource, error) {
+	c.mu.Lock()
+	if cur, ok := c.resources[url]; ok && cur == stale {
+		delete(c.resources, url)
+	}
+	c.mu.Unlock()
+	return c.resource(ctx, url)
+}
+
+// current reports whether res is still the identity the cache holds for url.
+func (c *BlockCache) current(url string, res rangefetch.Resource) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cur, ok := c.resources[url]
+	return ok && cur == res
+}
+
+// pinIdentity ties url's on-disk blocks to res. Blocks are trusted only when
+// the pin on disk names the same version: a different pin (the source changed
+// while we were down or since the blocks were cached) or no pin at all (blocks
+// written by a build that did not pin) purges them first. Without this a
+// restart would serve old-version blocks next to new-version fetches.
+func (c *BlockCache) pinIdentity(url string, res rangefetch.Resource) {
+	p := c.identityPath(url)
+	if body, err := os.ReadFile(p); err == nil {
+		var prior partialMeta
+		if json.Unmarshal(body, &prior) == nil && res.SameIdentity(prior.resource()) {
+			return
+		}
+	}
+	c.purge(url)
+	body, err := json.Marshal(partialMeta{
+		URL:          res.URL,
+		Size:         res.Size,
+		ETag:         res.ETag,
+		LastModified: res.LastModified,
+		ContentType:  res.ContentType,
+	})
+	if err != nil {
+		return
+	}
+	_, _ = c.write(p, body)
+}
+
+// purge removes every cached block and persisted partial for url.
+func (c *BlockCache) purge(url string) {
+	_ = os.RemoveAll(c.blockDir(url))
+	h := urlHash(url)
+	_ = os.RemoveAll(filepath.Join(c.dir, "partial", h[:2], h))
 }
 
 // store writes a block atomically (temp + rename); cache write failures are
@@ -419,7 +603,7 @@ func (c *BlockCache) evict() {
 	var total int64
 	var files []string
 	_ = filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil || d.IsDir() || d.Name() == identityFile {
 			return nil
 		}
 		if info, err := d.Info(); err == nil {

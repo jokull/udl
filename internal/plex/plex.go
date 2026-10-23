@@ -588,6 +588,28 @@ func (c *Client) SetSectionPreferences(ctx context.Context, srv Server, sectionK
 	return c.putPrefs(ctx, srv, "/library/sections/"+sectionKey+"/prefs", prefs)
 }
 
+// RefreshSectionPath asks the server to scan one path of a library section (a
+// partial scan). Shadow mounts are NFS, where Plex's filesystem watcher sees
+// nothing, so a reloaded shadow has to ask.
+func (c *Client) RefreshSectionPath(ctx context.Context, srv Server, sectionKey, dir string) error {
+	q := url.Values{}
+	q.Set("path", dir)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URI+"/library/sections/"+sectionKey+"/refresh?"+q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	c.setServerHeaders(req, srv.AccessToken)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("plex: refresh section %s: %w", sectionKey, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("plex: refresh section %s: status %d", sectionKey, resp.StatusCode)
+	}
+	return nil
+}
+
 func (c *Client) putPrefs(ctx context.Context, srv Server, path string, prefs map[string]string) error {
 	q := url.Values{}
 	for k, v := range prefs {

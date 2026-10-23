@@ -64,6 +64,16 @@ func ManifestPath(name string) (string, error) {
 	return filepath.Join(dir, "shadow", name+".json"), nil
 }
 
+// ReportPath returns where a running shadow agent writes its health report.
+// It is not a .json file so nothing globbing manifests picks it up.
+func ReportPath(name string) (string, error) {
+	dir, err := config.DataDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "shadow", name+".health"), nil
+}
+
 // ManifestDir returns the directory holding all built shadow manifests.
 func ManifestDir() (string, error) {
 	dir, err := config.DataDir()
@@ -189,6 +199,10 @@ type Manifest struct {
 	Sources []SourceStatus `json:"sources"`
 	Stats   Stats          `json:"stats"`
 	Items   []Item         `json:"items"`
+
+	// failedKeys are item keys whose detail lookup failed during this build:
+	// the friend still lists them, we just could not judge them this time.
+	failedKeys map[string]bool
 }
 
 // candidate is a raw item from one source section before judging.
@@ -487,9 +501,11 @@ func Build(ctx context.Context, client *plex.Client, def *Def) (*Manifest, error
 	// Judge: collect every candidate's best part, then dedupe by
 	// normalized title + year and pick the best copy per group.
 	var judged []*Item
+	m.failedKeys = make(map[string]bool)
 	for _, r := range results {
 		if r.err != nil || r.detail == nil {
 			m.Stats.Failed++
+			m.failedKeys[itemKey(&r.cand)] = true
 			continue
 		}
 		it, ok := judgeItem(r.cand, r.detail)

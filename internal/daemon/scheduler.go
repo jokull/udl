@@ -37,6 +37,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 	go s.episodeSearchLoop(ctx)
 	go s.searchLoop(ctx)
 	go s.refreshLoop(ctx)
+	go s.shadowRebuildLoop(ctx)
 	if s.seerr != nil {
 		go s.seerrApproveLoop(ctx)
 	}

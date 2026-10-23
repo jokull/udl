@@ -52,6 +52,15 @@ func (s *Service) Doctor(args *Empty, reply *DoctorReply) error {
 		}
 	}
 
+	for _, c := range s.shadowChecks() {
+		reply.Findings = append(reply.Findings, DoctorFinding{
+			Name:    c.Name,
+			Status:  c.Status,
+			Message: c.Message,
+			Hint:    hintForCheck(c.Name, c.Status),
+		})
+	}
+	reply.Findings = append(reply.Findings, s.doctorShadowSources()...)
 	reply.Findings = append(reply.Findings, s.doctorParked()...)
 	reply.Findings = append(reply.Findings, s.doctorPartials()...)
 	reply.Findings = append(reply.Findings, s.doctorCoolingServers()...)
@@ -101,6 +110,10 @@ func hintForCheck(name, status string) string {
 		return "the friend's server may be down; ranking already deprioritises it"
 	case strings.HasPrefix(name, "disk:"):
 		return "free space, or prune stale downloads with 'udl library prune-incomplete --execute'"
+	case strings.HasPrefix(name, "shadow-manifest:"):
+		return "'udl shadow manifest " + strings.TrimPrefix(name, "shadow-manifest:") + "' rebuilds it; the running agent reloads it in place"
+	case strings.HasPrefix(name, "shadow:"):
+		return "details in ~/Library/Logs/" + "com.jokull.udl-shadow-" + strings.TrimPrefix(name, "shadow:") + ".log; './scripts/deploy.sh status' shows open files before any restart"
 	case name == "par2":
 		return "brew install par2 — without it, damaged downloads cannot be repaired"
 	}
