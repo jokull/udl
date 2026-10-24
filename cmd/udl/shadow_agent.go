@@ -99,8 +99,8 @@ func (a *shadowAgent) run(ctx context.Context) {
 			// filled the log with identical rows and carried no time, so a
 			// stall could not be dated.
 			hits, misses, bytes := a.cache.Stats()
-			line := fmt.Sprintf("serving: %s streamed, %d cache hits, %d fetches, %d revalidations, %d read errors, %d items",
-				formatSize(bytes), hits, misses, a.cache.Revalidations(), a.fs.Health.Errors(), a.fs.Len())
+			line := fmt.Sprintf("serving: %s streamed, %d cache hits, %d fetches, %d prefetched, %d slow reads, %d revalidations, %d read errors, %d items",
+				formatSize(bytes), hits, misses, a.cache.Prefetched(), a.cache.SlowReads(), a.cache.Revalidations(), a.fs.Health.Errors(), a.fs.Len())
 			if line != lastLine || now.Sub(lastBeat) >= heartbeatQuiet {
 				fmt.Printf("%s %s\n", now.UTC().Format(time.RFC3339), line)
 				lastLine, lastBeat = line, now
@@ -227,6 +227,8 @@ func (a *shadowAgent) writeReport() {
 		CacheHits:       hits,
 		Fetches:         misses,
 		Revalidations:   a.cache.Revalidations(),
+		Prefetched:      a.cache.Prefetched(),
+		SlowReads:       a.cache.SlowReads(),
 		ReadErrors:      a.fs.Health.Errors(),
 		ErrorsByClass:   byClass,
 		Recent:          recent,

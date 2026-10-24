@@ -25,6 +25,8 @@ type Report struct {
 	CacheHits       int64            `json:"cache_hits"`
 	Fetches         int64            `json:"fetches"`
 	Revalidations   int64            `json:"revalidations"`
+	Prefetched      int64            `json:"prefetched"`
+	SlowReads       int64            `json:"slow_reads"`
 	ReadErrors      int64            `json:"read_errors"`
 	ErrorsByClass   map[string]int64 `json:"errors_by_class,omitempty"`
 	Recent          []ReadFailure    `json:"recent,omitempty"`

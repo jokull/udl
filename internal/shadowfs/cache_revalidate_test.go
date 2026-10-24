@@ -92,6 +92,8 @@ func newTestCache(t *testing.T, dir string) *BlockCache {
 	c := NewBlockCache(dir, 1<<30)
 	c.blockSize = 64 << 10
 	c.fetcher.Retry.Sleep = func(time.Duration) {}
+	// These tests count requests; read-ahead has its own tests.
+	c.raMax = 0
 	return c
 }
 

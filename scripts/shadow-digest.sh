@@ -71,6 +71,14 @@ for log in "$LOGS"/com.jokull.udl-shadow-*.log; do
             | awk '{print $2}' | sort | uniq -c | sed 's/^/      /'
         grep "read failed" <<<"$recent" | tail -3 | cut -c1-220 | sed 's/^/      /'
     fi
+    # A slow read is a reader that waited >2s for one block: what a player
+    # feels as a spinner. Read-ahead should hide friend stalls, so any that
+    # reach a reader are worth a look.
+    slow="$(grep -c "slow read:" <<<"$recent")"
+    if (( slow > 0 )); then
+        flag "$name: $slow slow-read log lines (a reader waited >2s for a block)"
+        grep "slow read:" <<<"$recent" | tail -3 | cut -c1-200 | sed 's/^/      /'
+    fi
     grep -E "reload failed|reload skipped|health report not written" <<<"$recent" | tail -2 \
         | sed 's/^/    ! /' | grep . && flag "$name: reload or report trouble"
 done

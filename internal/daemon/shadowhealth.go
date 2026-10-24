@@ -210,6 +210,9 @@ func shadowCheck(def *shadow.Def, now time.Time) HealthCheck {
 			Message: fmt.Sprintf("manifest reload failed (still serving %d items): %s", r.Items, r.LastReloadError)}
 	}
 	msg := fmt.Sprintf("%d items · %s streamed · %d revalidated", r.Items, humanGB(r.BytesServed), r.Revalidations)
+	if r.SlowReads > 0 {
+		msg += fmt.Sprintf(" · %d slow reads", r.SlowReads)
+	}
 	if r.Remounts > 0 {
 		msg += fmt.Sprintf(" · %d remounts", r.Remounts)
 	}

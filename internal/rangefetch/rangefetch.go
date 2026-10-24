@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -88,6 +89,10 @@ var (
 	// ErrSizeMismatch means the materialized file does not have exactly the
 	// expected byte count (checked before a transfer is declared complete).
 	ErrSizeMismatch = errors.New("rangefetch: final size mismatch")
+	// ErrStalled means an attempt received no bytes for Fetcher.IdleTimeout.
+	// It is reported as a retryable *TransportError carrying the bytes that
+	// did arrive, so Fill resumes on a fresh connection.
+	ErrStalled = errors.New("rangefetch: transfer stalled")
 )
 
 // HTTPError is a non-2xx response. 429 and 5xx are retryable; other statuses
@@ -180,6 +185,11 @@ func (p RetryPolicy) backoff(attempt int) time.Duration {
 type Fetcher struct {
 	Client *http.Client
 	Retry  RetryPolicy
+	// IdleTimeout aborts an attempt that receives no bytes (headers or body)
+	// for this long; zero disables it. The client's overall Timeout only
+	// bounds a whole request, so without this a friend connection that goes
+	// silent mid-body holds a streaming read for the full client timeout.
+	IdleTimeout time.Duration
 }
 
 // New returns a Fetcher using client (a default client when nil).
@@ -270,6 +280,22 @@ func (f *Fetcher) Get(ctx context.Context, res Resource, off, length int64) ([]b
 }
 
 func (f *Fetcher) attemptFill(ctx context.Context, res Resource, off int64, buf []byte) (int, Resource, error) {
+	var w *watchdog
+	if f.IdleTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel() // runs after the body is drained and closed
+		w = newWatchdog(f.IdleTimeout, cancel)
+		defer w.stop()
+	}
+	n, next, err := f.attemptFillCtx(ctx, w, res, off, buf)
+	if err != nil && w.fired() {
+		err = &TransportError{Err: fmt.Errorf("%w: no bytes for %s", ErrStalled, f.IdleTimeout)}
+	}
+	return n, next, err
+}
+
+func (f *Fetcher) attemptFillCtx(ctx context.Context, w *watchdog, res Resource, off int64, buf []byte) (int, Resource, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, res.URL, nil)
 	if err != nil {
 		return 0, res, fmt.Errorf("rangefetch: build request: %w", err)
@@ -279,6 +305,10 @@ func (f *Fetcher) attemptFill(ctx context.Context, res Resource, off int64, buf 
 	resp, err := f.Client.Do(req)
 	if err != nil {
 		return 0, res, &TransportError{Err: err}
+	}
+	if w != nil {
+		w.kick()
+		resp.Body = &progressBody{ReadCloser: resp.Body, w: w}
 	}
 
 	if resp.StatusCode == http.StatusOK {
@@ -304,6 +334,44 @@ func (f *Fetcher) attemptFill(ctx context.Context, res Resource, off int64, buf 
 	default:
 		return 0, res, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, URL: res.URL}
 	}
+}
+
+// watchdog cancels an attempt when kick has not been called for idle.
+type watchdog struct {
+	idle    time.Duration
+	timer   *time.Timer
+	tripped atomic.Bool
+}
+
+func newWatchdog(idle time.Duration, cancel context.CancelFunc) *watchdog {
+	w := &watchdog{idle: idle}
+	w.timer = time.AfterFunc(idle, func() {
+		w.tripped.Store(true)
+		cancel()
+	})
+	return w
+}
+
+// kick records progress, pushing the deadline out by another idle period.
+func (w *watchdog) kick() { w.timer.Reset(w.idle) }
+
+func (w *watchdog) stop() { w.timer.Stop() }
+
+// fired reports whether the watchdog cancelled the attempt. Nil-safe.
+func (w *watchdog) fired() bool { return w != nil && w.tripped.Load() }
+
+// progressBody kicks the watchdog whenever body bytes arrive.
+type progressBody struct {
+	io.ReadCloser
+	w *watchdog
+}
+
+func (b *progressBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.w.kick()
+	}
+	return n, err
 }
 
 // acceptPartialInto validates a 206 response against the requested range and

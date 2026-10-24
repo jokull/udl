@@ -191,6 +191,27 @@ Because a restart breaks every stream, a shadow absorbs change in place:
   `udl status` and `udl doctor` read it. `udl doctor` also samples three URLs
   per friend and reports files that no longer match the manifest.
 
+## Streaming stalls from friend servers
+
+A friend's server can go silent mid-response with the connection still open.
+On 2026-10-24 one 2 MiB block of Anchorman hung for about a minute (only the
+120 s client timeout would have ended it). Blocks were fetched only when Plex
+asked for them, so the player hit the stall directly: spinner at 4:50, with
+zero read errors logged.
+
+- `rangefetch.Fetcher.IdleTimeout` (5 s in the shadow cache) abandons an
+  attempt with no bytes arriving; `Fill` resumes inside the block on a new
+  connection.
+- The cache reads ahead of sequential readers: after two blocks in order the
+  window grows to 32 blocks (64 MiB, ~12 s of a 40 Mbit/s remux), up to 4
+  fetches in parallel. Scattered reads (scanners, seeks) prefetch nothing.
+- Eviction runs in the background, never inside a read.
+- A read that waits >2 s for a block is a `slow read`: counted in the report
+  and `udl status`, logged (rate-limited), and flagged by
+  `scripts/shadow-digest.sh`.
+- `TestLiveStreamPaced` (`-tags integration`) plays a real item paced with a
+  simulated player buffer and fails on any rebuffer.
+
 ## automountd (do not use)
 
 `auto_master`/`auto_udl` direct maps look like the clean answer (System

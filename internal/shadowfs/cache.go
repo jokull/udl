@@ -55,9 +55,30 @@ type BlockCache struct {
 	// costs one probe per window rather than one per NFS read.
 	failed map[string]probeFailure
 
+	// streams tracks the read position of each URL being read so sequential
+	// playback can be fetched ahead of the reader (see readahead). Guarded
+	// by mu; nil disables read-ahead.
+	streams map[string]*stream
+	// raMax caps the read-ahead window in blocks; zero disables it.
+	raMax int64
+	// raSlots bounds concurrent read-ahead fetches across all streams.
+	raSlots chan struct{}
+
 	hits, misses, bytesServed atomic.Int64
 	revalidations             atomic.Int64
+	prefetched                atomic.Int64
+	slowReads                 atomic.Int64
+	slowLogged                atomic.Int64 // unix nanos of the last slow-read log line
 	freeWarned                atomic.Bool
+	evicting                  atomic.Bool
+}
+
+// stream is the read-ahead state of one URL.
+type stream struct {
+	last  int64 // highest block index read
+	run   int64 // blocks advanced sequentially since the last seek
+	ahead int64 // highest block index already scheduled for read-ahead
+	used  time.Time
 }
 
 // statfsFn reports free bytes on the volume containing path. Swapped in
@@ -72,6 +93,17 @@ const minFreeBytes = 1 << 30 // 1 GiB
 func (c *BlockCache) Stats() (hits, misses, bytes int64) {
 	return c.hits.Load(), c.misses.Load(), c.bytesServed.Load()
 }
+
+// Prefetched counts blocks fetched ahead of a sequential reader.
+func (c *BlockCache) Prefetched() int64 { return c.prefetched.Load() }
+
+// SlowReads counts reads that waited longer than slowRead for a block — the
+// stalls a player feels. Read-ahead should keep this near zero.
+func (c *BlockCache) SlowReads() int64 { return c.slowReads.Load() }
+
+// slowRead is how long a reader may wait for one block before it counts as a
+// stall. A Plex client buffers more than this, but a run of them is a spinner.
+const slowRead = 2 * time.Second
 
 // Revalidations counts how often a source changed its validators under a
 // running shadow and the cache re-probed and recovered instead of failing.
@@ -94,6 +126,32 @@ var ErrManifestStale = errors.New("shadowfs: source file differs from manifest")
 
 const defaultBlockSize = 2 << 20 // 2 MiB
 
+// Read-ahead keeps a sequential reader ahead of the network. A friend's
+// server can go silent for seconds mid-response; reading only the block Plex
+// asks for put every such stall straight into the player as a spinner.
+const (
+	// readaheadBlocks is the full window: 64 MiB, about 12 s of a 40 Mbit/s
+	// remux, enough to cover a stall plus the fetcher's retries.
+	readaheadBlocks = 32
+	// readaheadParallel bounds concurrent read-ahead fetches, which also
+	// lifts throughput on friends whose single connections are slow.
+	readaheadParallel = 4
+	// readaheadMinRun is how many blocks a reader must advance sequentially
+	// before read-ahead starts, so scanners and seeks stay cheap.
+	readaheadMinRun = 2
+	// readaheadSlack lets a reader re-read slightly behind its position (the
+	// NFS client reorders reads) without counting as a seek.
+	readaheadSlack = 4
+	// maxStreams bounds the per-URL read-ahead state kept in memory.
+	maxStreams = 64
+)
+
+// stallTimeout abandons a block fetch attempt that receives no bytes for this
+// long; Fill then resumes on a new connection. It was the 120 s client
+// timeout, which turned one silent friend connection into a minute-long
+// stall in Plex.
+const stallTimeout = 5 * time.Second
+
 // NewBlockCache creates a cache rooted at dir (created lazily), capped at
 // maxBytes. A non-positive maxBytes defaults to 50 GiB.
 func NewBlockCache(dir string, maxBytes int64) *BlockCache {
@@ -110,7 +168,11 @@ func NewBlockCache(dir string, maxBytes int64) *BlockCache {
 		probing:   make(map[string]chan struct{}),
 		expected:  make(map[string]int64),
 		failed:    make(map[string]probeFailure),
+		streams:   make(map[string]*stream),
+		raMax:     readaheadBlocks,
+		raSlots:   make(chan struct{}, readaheadParallel),
 	}
+	c.fetcher.IdleTimeout = stallTimeout
 	// Friend servers truncate responses in bursts — every response cut short
 	// for a while, then healthy again. Fill resumes inside the block, so extra
 	// attempts cost only a request and let a read survive a burst that ends
@@ -125,11 +187,11 @@ func NewBlockCache(dir string, maxBytes int64) *BlockCache {
 	// over its cap forever and could fill the disk. The first evict may be
 	// slow on a big cache, so run it off the hot path.
 	go func() {
-		c.evict()
+		c.evictExclusive()
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
 		for range t.C {
-			c.evict()
+			c.evictExclusive()
 		}
 	}()
 	return c
@@ -143,9 +205,14 @@ func (c *BlockCache) ReadAt(ctx context.Context, url string, off, size int64) ([
 	}
 	first := off / c.blockSize
 	last := (off + size - 1) / c.blockSize
+	c.readahead(url, first, last)
 	out := make([]byte, 0, size)
 	for b := first; b <= last; b++ {
+		started := time.Now()
 		block, err := c.block(ctx, url, b)
+		if waited := time.Since(started); waited > slowRead {
+			c.noteSlowRead(url, b, waited, err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -269,7 +336,9 @@ func (c *BlockCache) block(ctx context.Context, url string, idx int64) ([]byte, 
 		c.mu.Unlock()
 		close(ch) // broadcast to waiters
 		if doEvict {
-			c.evict()
+			// Off the read path: a walk of a large cache used to delay the
+			// read that happened to trigger it.
+			go c.evictExclusive()
 		}
 		c.misses.Add(1)
 		return data, err
@@ -614,39 +683,161 @@ func (c *BlockCache) write(p string, data []byte) (bool, error) {
 	return true, nil
 }
 
+// noteSlowRead counts a stalled read and logs it at most every 10 seconds.
+func (c *BlockCache) noteSlowRead(url string, idx int64, waited time.Duration, err error) {
+	c.slowReads.Add(1)
+	now := time.Now().UnixNano()
+	last := c.slowLogged.Load()
+	if now-last < int64(10*time.Second) || !c.slowLogged.CompareAndSwap(last, now) {
+		return
+	}
+	outcome := "ok"
+	if err != nil {
+		outcome = Redact(err.Error())
+	}
+	fmt.Fprintf(os.Stderr, "%s shadowfs: slow read: block %d of %s waited %s (%s)\n",
+		time.Now().UTC().Format(time.RFC3339), idx, urlHash(url)[:12], waited.Round(time.Millisecond), outcome)
+}
+
+// readahead schedules background fetches of the blocks after [first, last]
+// when url is being read sequentially. The window grows with the length of the
+// sequential run, so a scanner reading a header or a seek costs nothing extra
+// while steady playback ends up readaheadBlocks ahead of the player.
+func (c *BlockCache) readahead(url string, first, last int64) {
+	from, to := c.planReadahead(url, first, last)
+	for idx := from; idx <= to; idx++ {
+		go c.prefetch(url, idx)
+	}
+}
+
+// planReadahead updates url's stream state for a read of blocks [first, last]
+// and returns the block range to fetch ahead (empty when from > to).
+func (c *BlockCache) planReadahead(url string, first, last int64) (from, to int64) {
+	if c.raMax <= 0 || c.streams == nil {
+		return 1, 0
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	s := c.streams[url]
+	if s == nil {
+		c.pruneStreamsLocked(now)
+		s = &stream{last: first - 1, ahead: last}
+		c.streams[url] = s
+	}
+	s.used = now
+	if first >= s.last-readaheadSlack && first <= s.last+1 {
+		if last > s.last {
+			s.run += last - s.last
+		}
+	} else {
+		// A seek: restart the run and the window from the new position.
+		s.run = 0
+		s.ahead = last
+	}
+	s.last = max(s.last, last)
+	if s.run < readaheadMinRun {
+		return 1, 0
+	}
+	// Without a known size the window could run past the end of the file;
+	// the size is known once the first block's probe has finished.
+	size := c.sizeLocked(url)
+	if size <= 0 {
+		return 1, 0
+	}
+	window := min(max(s.run, readaheadMinRun*2), c.raMax)
+	to = min(last+window, (size-1)/c.blockSize)
+	from = max(s.ahead, last) + 1
+	if from <= to {
+		s.ahead = to
+	}
+	return from, to
+}
+
+// sizeLocked is url's known total size: the probed one, else the manifest's.
+func (c *BlockCache) sizeLocked(url string) int64 {
+	if res, ok := c.resources[url]; ok && res.Size > 0 {
+		return res.Size
+	}
+	return c.expected[url]
+}
+
+// pruneStreamsLocked drops idle stream state once the table is full.
+func (c *BlockCache) pruneStreamsLocked(now time.Time) {
+	if len(c.streams) < maxStreams {
+		return
+	}
+	var oldest string
+	for u, s := range c.streams {
+		if now.Sub(s.used) > 10*time.Minute {
+			delete(c.streams, u)
+			continue
+		}
+		if oldest == "" || s.used.Before(c.streams[oldest].used) {
+			oldest = u
+		}
+	}
+	if len(c.streams) >= maxStreams && oldest != "" {
+		delete(c.streams, oldest)
+	}
+}
+
+// prefetch warms one block in the background. It shares the single-flight
+// path with readers, so a player that catches up joins the fetch already in
+// progress. Failures are dropped: the reader fetches the block itself.
+func (c *BlockCache) prefetch(url string, idx int64) {
+	c.raSlots <- struct{}{}
+	defer func() { <-c.raSlots }()
+	ctx := context.Background()
+	if c.trusted(ctx, url) {
+		if _, err := os.Stat(c.blockPath(url, idx)); err == nil {
+			return
+		}
+	}
+	if _, err := c.block(ctx, url, idx); err == nil {
+		c.prefetched.Add(1)
+	}
+}
+
+// evictExclusive runs evict unless another eviction is already running.
+func (c *BlockCache) evictExclusive() {
+	if !c.evicting.CompareAndSwap(false, true) {
+		return
+	}
+	defer c.evicting.Store(false)
+	c.evict()
+}
+
 // evict deletes the least recently written blocks until the cache fits within
-// maxBytes. Called periodically, never on the read hot path.
+// maxBytes. Called periodically and in the background, never on the read path.
 func (c *BlockCache) evict() {
+	type entry struct {
+		path string
+		size int64
+		mod  time.Time
+	}
 	var total int64
-	var files []string
+	var files []entry
 	_ = filepath.WalkDir(c.dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || d.Name() == identityFile {
 			return nil
 		}
 		if info, err := d.Info(); err == nil {
 			total += info.Size()
-			files = append(files, path)
+			files = append(files, entry{path, info.Size(), info.ModTime()})
 		}
 		return nil
 	})
 	if total <= c.maxBytes {
 		return
 	}
-	sort.Slice(files, func(i, j int) bool {
-		mi, errI := os.Stat(files[i])
-		mj, errJ := os.Stat(files[j])
-		if errI != nil || errJ != nil {
-			return false
-		}
-		return mi.ModTime().Before(mj.ModTime())
-	})
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
 	for _, f := range files {
 		if total <= c.maxBytes {
 			break
 		}
-		if info, err := os.Stat(f); err == nil {
-			total -= info.Size()
-			_ = os.Remove(f)
+		if os.Remove(f.path) == nil {
+			total -= f.size
 		}
 	}
 }

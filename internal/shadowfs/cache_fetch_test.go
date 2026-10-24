@@ -91,6 +91,8 @@ func newFetchCache(t *testing.T, blockSize int64) *BlockCache {
 	// Production backoff is irrelevant to these assertions and would add
 	// seconds per test.
 	c.fetcher.Retry.Sleep = func(time.Duration) {}
+	// These tests count requests; read-ahead has its own tests.
+	c.raMax = 0
 	return c
 }
 
