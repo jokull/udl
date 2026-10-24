@@ -15,6 +15,8 @@ LOGS="$HOME/Library/Logs"
 UDL="${UDL_BIN:-$HOME/bin/udl}"
 SINCE="$(date -u -v-"${HOURS}"H +%Y-%m-%dT%H:%M:%S)"
 problems=0
+# Friend-outage read failures per shadow tolerated before flagging.
+FRIEND_FAIL_LIMIT="${FRIEND_FAIL_LIMIT:-20}"
 flag() { echo "  ✗ $*"; problems=$((problems + 1)); }
 
 # Bound every external call: a hung mount or daemon must not hang the digest.
@@ -54,8 +56,17 @@ for log in "$LOGS"/com.jokull.udl-shadow-*.log; do
     if (( age_h < HOURS )); then
         flag "$name: agent restarted within the window (up ${age_h}h) — crash or manual restart?"
     fi
+    # A friend's server being down (HTTP 5xx, connection failures) is not
+    # ours to fix, so a few of those are reported but not flagged. Anything
+    # else — a stale manifest, a changed file that did not recover, a denied
+    # token — is ours, and so is a friend outage big enough to be noticed.
+    ours="$(grep "read failed" <<<"$recent" | grep -vcE "read failed \[(http|transport)\]")"
+    if (( ours > 0 || fails > FRIEND_FAIL_LIMIT )); then
+        flag "$name: $fails failed reads ($ours not explained by a friend outage)"
+    elif (( fails > 0 )); then
+        echo "    $fails failed reads, all friend outages (http/transport) — not flagged"
+    fi
     if (( fails > 0 )); then
-        flag "$name: $fails failed reads"
         grep "read failed" <<<"$recent" | sed -E 's/^([^ ]+) shadowfs: read failed /\1 /' \
             | awk '{print $2}' | sort | uniq -c | sed 's/^/      /'
         grep "read failed" <<<"$recent" | tail -3 | cut -c1-220 | sed 's/^/      /'
