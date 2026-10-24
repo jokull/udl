@@ -28,6 +28,12 @@ type Report struct {
 	ReadErrors      int64            `json:"read_errors"`
 	ErrorsByClass   map[string]int64 `json:"errors_by_class,omitempty"`
 	Recent          []ReadFailure    `json:"recent,omitempty"`
+
+	// The agent's own client-side check of its mount (daemon mode only).
+	MountChecked bool   `json:"mount_checked"`
+	MountOK      bool   `json:"mount_ok"`
+	MountError   string `json:"mount_error,omitempty"`
+	Remounts     int    `json:"remounts"`
 }
 
 // ReportEvery is how often a serving agent rewrites its report.

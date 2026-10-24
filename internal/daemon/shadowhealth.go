@@ -178,6 +178,10 @@ func shadowCheck(def *shadow.Def, now time.Time) HealthCheck {
 		return HealthCheck{Name: name, Status: "error",
 			Message: fmt.Sprintf("agent (pid %d) has not reported for %s — hung or gone; reads from this mount will block", r.PID, roundAgo(age))}
 	}
+	if r.MountChecked && !r.MountOK {
+		return HealthCheck{Name: name, Status: "error",
+			Message: fmt.Sprintf("mount is not working from the client side (Plex sees nothing): %s — the agent remounts after two failed checks (%d remounts so far)", r.MountError, r.Remounts)}
+	}
 	var recent []shadowfs.ReadFailure
 	for _, f := range r.Recent {
 		if now.Sub(f.Time) <= shadowErrorWindow {
@@ -206,6 +210,9 @@ func shadowCheck(def *shadow.Def, now time.Time) HealthCheck {
 			Message: fmt.Sprintf("manifest reload failed (still serving %d items): %s", r.Items, r.LastReloadError)}
 	}
 	msg := fmt.Sprintf("%d items · %s streamed · %d revalidated", r.Items, humanGB(r.BytesServed), r.Revalidations)
+	if r.Remounts > 0 {
+		msg += fmt.Sprintf(" · %d remounts", r.Remounts)
+	}
 	if r.Deferred > 0 {
 		msg += fmt.Sprintf(" · %d changes waiting for streams to finish", r.Deferred)
 	}

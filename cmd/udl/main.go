@@ -2623,34 +2623,25 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 		// each attempt is bounded and retried; a mount made by any approved
 		// process survives agent restarts, and the fallback is mounting from
 		// a terminal once.
-		already, _ := isMounted(real)
-		if already {
-			fmt.Printf("  already mounted at %s\n", real)
-			mountReady = true
+		// A mount already in place belongs to an earlier server process:
+		// this one just bound the shadow's port, so no other server is
+		// running. Its file handles lived in that process's memory, so the
+		// kernel's root handle is unknown here and every lookup fails —
+		// reusing it left all three shadows dead after a restart
+		// (2026-10-24). Replace it.
+		if already, _ := isMounted(real); already {
+			fmt.Printf("  replacing stale mount at %s (left by a previous server)\n", real)
+			if out, err := unmountShadow(cmd.Context(), real); err != nil {
+				fmt.Printf("  stale unmount failed: %v %s\n", err, out)
+			}
+		}
+		if err := mountShadow(cmd.Context(), real, tcpAddr.Port); err != nil {
+			fmt.Printf("  mount skipped: %v\n", err)
+			fmt.Println("  mount it once from a terminal to recover:")
+			fmt.Printf("    sudo mount -o %s -t nfs 127.0.0.1:/ %s\n", shadowMountOpts(tcpAddr.Port), real)
 		} else {
-			opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,nolocks,resvport", tcpAddr.Port, tcpAddr.Port)
-			var out []byte
-			var err error
-			for range 3 {
-				mctx, mcancel := context.WithTimeout(cmd.Context(), 20*time.Second)
-				mnt := exec.CommandContext(mctx, "sudo", "-n", "mount", "-o", opts, "-t", "nfs", "127.0.0.1:/", real)
-				out, err = mnt.CombinedOutput()
-				mcancel()
-				if err == nil {
-					break
-				}
-				if mctx.Err() != nil {
-					fmt.Printf("  mount attempt stalled (%s) — retrying\n", strings.TrimSpace(string(out)))
-				}
-			}
-			if err != nil {
-				fmt.Printf("  mount skipped: %s\n", strings.TrimSpace(string(out)))
-				fmt.Println("  mount it once from a terminal to recover:")
-				fmt.Printf("    sudo mount -o %s -t nfs 127.0.0.1:/ %s\n", opts, real)
-			} else {
-				fmt.Printf("  mounted at %s via sudo\n", real)
-				mountReady = true
-			}
+			fmt.Printf("  mounted at %s via sudo\n", real)
+			mountReady = true
 		}
 	} else {
 		opts := fmt.Sprintf("port=%d,mountport=%d,vers=3,nolocks,resvport", tcpAddr.Port, tcpAddr.Port)
@@ -2740,7 +2731,11 @@ func runShadowMount(cmd *cobra.Command, args []string) error {
 	}()
 
 	// Heartbeat, health report, and manifest hot-reload.
-	go newShadowAgent(def, fs, cache, m).run(cmd.Context())
+	agent := newShadowAgent(def, fs, cache, m)
+	if daemon {
+		agent.mountPath, agent.port = real, tcpAddr.Port
+	}
+	go agent.run(cmd.Context())
 
 	fmt.Println("serving — Ctrl-C to unmount")
 	return <-serveErr

@@ -27,6 +27,13 @@ status="$(bounded 20 "$UDL" status 2>&1)" || flag "udl status failed: ${status%%
 echo "$status" | grep -E "shadow" | sed 's/^ */  /'
 echo "$status" | grep -qE "^ *[✗!] shadow:" && flag "an agent reports trouble (see above)"
 
+# Check each mount from the client side, independent of what the agents
+# report: an agent can be alive while the kernel's mount is dead.
+echo "mounts:"
+mounts="$(bounded 60 "$(dirname "$0")/deploy.sh" status 2>&1 | grep '^shadow:')"
+echo "$mounts" | sed 's/^shadow: */  /'
+grep -q "NOT RESPONDING" <<<"$mounts" && flag "a shadow mount is not responding"
+
 echo "agents:"
 for log in "$LOGS"/com.jokull.udl-shadow-*.log; do
     name="${log##*udl-shadow-}"; name="${name%.log}"

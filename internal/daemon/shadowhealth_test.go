@@ -43,6 +43,13 @@ func TestShadowCheck(t *testing.T) {
 		t.Fatalf("recent failure: %+v", c)
 	}
 
+	// The 2026-10-24 outage: agent alive and reporting, mount dead.
+	writeTestReport(t, &shadowfs.Report{Name: "movies", UpdatedAt: now, Items: 10,
+		MountChecked: true, MountOK: false, MountError: "readdirent: stale NFS file handle"})
+	if c := shadowCheck(def, now); c.Status != "error" || !strings.Contains(c.Message, "stale NFS file handle") {
+		t.Fatalf("dead mount: %+v", c)
+	}
+
 	writeTestReport(t, &shadowfs.Report{Name: "movies", UpdatedAt: now, Items: 10, Revalidations: 3, Recent: []shadowfs.ReadFailure{
 		{Time: now.Add(-time.Hour), Path: "Old.mkv", Class: "transport"},
 	}})
